@@ -180,6 +180,7 @@ fn parse_face_name(data: &[u8]) -> Result<FaceName> {
         alt_name,
         panose,
         default_name,
+        type_info: None,
         tail: r.take_rest().to_vec(),
     })
 }
@@ -210,6 +211,13 @@ fn parse_char_shape(data: &[u8]) -> Result<CharShape> {
     let underline_color = r.read_u32()?;
     let shade_color = r.read_u32()?;
     let shadow_color = r.read_u32()?;
+    // 5.0.2.1+ tail 선두 = 글자 테두리/배경 ID (tail 자체는 그대로 보존)
+    let tail = r.take_rest().to_vec();
+    let border_fill_id = if tail.len() >= 2 {
+        u16::from_le_bytes([tail[0], tail[1]])
+    } else {
+        0
+    };
 
     Ok(CharShape {
         face_ids,
@@ -224,7 +232,8 @@ fn parse_char_shape(data: &[u8]) -> Result<CharShape> {
         underline_color,
         shade_color,
         shadow_color,
-        tail: r.take_rest().to_vec(),
+        border_fill_id,
+        tail,
     })
 }
 
@@ -244,6 +253,14 @@ fn parse_para_shape(data: &[u8]) -> Result<ParaShape> {
     for v in &mut border_offsets {
         *v = r.read_u16()? as i16;
     }
+    // 줄간격: 종류는 attr1 bits 0~1, 값은 5.0.2.5+ tail(attr2+attr3+줄간격) 또는 구버전 필드
+    let tail = r.take_rest().to_vec();
+    let line_spacing_type = (attr1 & 0x3) as u8;
+    let line_spacing = if tail.len() >= 12 {
+        i32::from_le_bytes([tail[8], tail[9], tail[10], tail[11]])
+    } else {
+        line_spacing_old
+    };
     Ok(ParaShape {
         attr1,
         indent,
@@ -256,7 +273,9 @@ fn parse_para_shape(data: &[u8]) -> Result<ParaShape> {
         numbering_id,
         border_fill_id,
         border_offsets,
-        tail: r.take_rest().to_vec(),
+        line_spacing_type,
+        line_spacing,
+        tail,
     })
 }
 

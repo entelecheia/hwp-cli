@@ -91,11 +91,22 @@ fn write_fontfaces(out: &mut String, header: &DocHeader) {
             fonts.len()
         );
         for (i, f) in fonts.iter().enumerate() {
-            let _ = write!(
-                out,
-                r##"<hh:font id="{i}" face="{}" type="TTF" isEmbedded="0"/>"##,
-                esc(&f.name)
-            );
+            match &f.type_info {
+                Some(attrs) => {
+                    let _ = write!(
+                        out,
+                        r##"<hh:font id="{i}" face="{}" type="TTF" isEmbedded="0"><hh:typeInfo{attrs}/></hh:font>"##,
+                        esc(&f.name)
+                    );
+                }
+                None => {
+                    let _ = write!(
+                        out,
+                        r##"<hh:font id="{i}" face="{}" type="TTF" isEmbedded="0"/>"##,
+                        esc(&f.name)
+                    );
+                }
+            }
         }
         out.push_str("</hh:fontface>");
     }
@@ -180,12 +191,19 @@ fn write_char_properties(out: &mut String, header: &DocHeader) {
     };
     for i in 0..count {
         let cs = shapes.get(i).copied().unwrap_or(&default_cs);
+        let bf_ref = if cs.border_fill_id > 0 {
+            cs.border_fill_id
+        } else {
+            2
+        };
         let _ = write!(
             out,
-            r##"<hh:charPr id="{i}" height="{}" textColor="{}" shadeColor="{}" useFontSpace="0" useKerning="0" symMark="NONE" borderFillIDRef="2">"##,
+            r##"<hh:charPr id="{i}" height="{}" textColor="{}" shadeColor="{}" useFontSpace="{}" useKerning="{}" symMark="NONE" borderFillIDRef="{bf_ref}">"##,
             cs.base_size,
             color_attr(cs.text_color),
             color_attr(cs.shade_color),
+            (cs.attr >> 25) & 1,
+            (cs.attr >> 30) & 1,
         );
         let _ = write!(
             out,
@@ -286,9 +304,20 @@ fn write_para_properties(out: &mut String, header: &DocHeader) {
             _ => "JUSTIFY",
         };
         let tab_ref = (ps.tab_def_id as usize).min(tab_count - 1);
+        let ls_type = match ps.line_spacing_type {
+            1 => "FIXED",
+            2 => "BETWEEN_LINES",
+            3 => "AT_LEAST",
+            _ => "PERCENT",
+        };
+        let ls_value = if ps.line_spacing > 0 {
+            ps.line_spacing
+        } else {
+            160
+        };
         let _ = write!(
             out,
-            r##"<hh:paraPr id="{i}" tabPrIDRef="{tab_ref}" condense="0" fontLineHeight="0" snapToGrid="1" suppressLineNumbers="0" checked="0" textDir="LTR"><hh:align horizontal="{align}" vertical="BASELINE"/><hh:heading type="NONE" idRef="0" level="0"/><hh:breakSetting breakLatinWord="KEEP_WORD" breakNonLatinWord="BREAK_WORD" widowOrphan="0" keepWithNext="0" keepLines="0" pageBreakBefore="0" lineWrap="BREAK"/><hh:autoSpacing eAsianEng="0" eAsianNum="0"/><hh:margin><hc:intent value="{}" unit="HWPUNIT"/><hc:left value="{}" unit="HWPUNIT"/><hc:right value="{}" unit="HWPUNIT"/><hc:prev value="{}" unit="HWPUNIT"/><hc:next value="{}" unit="HWPUNIT"/></hh:margin><hh:lineSpacing type="PERCENT" value="160" unit="HWPUNIT"/><hh:border borderFillIDRef="2" offsetLeft="0" offsetRight="0" offsetTop="0" offsetBottom="0" connect="0" ignoreMargin="0"/></hh:paraPr>"##,
+            r##"<hh:paraPr id="{i}" tabPrIDRef="{tab_ref}" condense="0" fontLineHeight="0" snapToGrid="1" suppressLineNumbers="0" checked="0" textDir="LTR"><hh:align horizontal="{align}" vertical="BASELINE"/><hh:heading type="NONE" idRef="0" level="0"/><hh:breakSetting breakLatinWord="KEEP_WORD" breakNonLatinWord="BREAK_WORD" widowOrphan="0" keepWithNext="0" keepLines="0" pageBreakBefore="0" lineWrap="BREAK"/><hh:autoSpacing eAsianEng="0" eAsianNum="0"/><hh:margin><hc:intent value="{}" unit="HWPUNIT"/><hc:left value="{}" unit="HWPUNIT"/><hc:right value="{}" unit="HWPUNIT"/><hc:prev value="{}" unit="HWPUNIT"/><hc:next value="{}" unit="HWPUNIT"/></hh:margin><hh:lineSpacing type="{ls_type}" value="{ls_value}" unit="HWPUNIT"/><hh:border borderFillIDRef="2" offsetLeft="0" offsetRight="0" offsetTop="0" offsetBottom="0" connect="0" ignoreMargin="0"/></hh:paraPr>"##,
             ps.indent, ps.margin_left, ps.margin_right, ps.spacing_top, ps.spacing_bottom,
         );
     }
