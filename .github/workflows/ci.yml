@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: 한국어 폰트 설치 (렌더링 테스트용)
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

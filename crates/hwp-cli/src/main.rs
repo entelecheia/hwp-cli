@@ -120,7 +120,12 @@ fn main() -> anyhow::Result<()> {
             to,
             strict,
         } => commands::convert::run(&input, &output, to, strict),
-        Cmd::Render { .. } => anyhow::bail!("`hwp render`는 아직 구현되지 않았습니다 (M3 예정)"),
+        Cmd::Render {
+            input,
+            output,
+            pages,
+            dpi,
+        } => commands::render::run(&input, &output, &pages, dpi),
         Cmd::New { .. } => anyhow::bail!("`hwp new`는 아직 구현되지 않았습니다 (M4 예정)"),
     }
 }

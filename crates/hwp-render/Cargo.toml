@@ -8,3 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 hwp-model = { workspace = true }
+tiny-skia = { workspace = true }
+rustybuzz = { workspace = true }
+fontdb = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hwp5 = { workspace = true }
+hwpx = { workspace = true }
