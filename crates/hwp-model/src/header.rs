@@ -48,6 +48,9 @@ pub struct FaceName {
     pub panose: Option<[u8; 10]>,
     /// 기본 글꼴 이름 (attr bit5)
     pub default_name: Option<String>,
+    /// OWPML typeInfo 요소 원문 (hwpx 왕복 보존용)
+    #[serde(default)]
+    pub type_info: Option<String>,
     #[serde(with = "hex_bytes")]
     pub tail: Vec<u8>,
 }
@@ -75,6 +78,9 @@ pub struct CharShape {
     pub underline_color: u32,
     pub shade_color: u32,
     pub shadow_color: u32,
+    /// 글자 테두리/배경 참조 (1-기반, 0 = 미지정)
+    #[serde(default)]
+    pub border_fill_id: u16,
     /// 버전별 추가 필드 (테두리채움 ID 5.0.2.1+, 취소선 색 5.0.3.0+)
     #[serde(with = "hex_bytes")]
     pub tail: Vec<u8>,
@@ -122,6 +128,12 @@ pub struct ParaShape {
     pub border_fill_id: u16,
     /// 테두리 여백 (좌/우/위/아래)
     pub border_offsets: [i16; 4],
+    /// 줄간격 종류 (0 비율%, 1 고정, 2 여백만, 3 최소) — OWPML lineSpacing
+    #[serde(default)]
+    pub line_spacing_type: u8,
+    /// 줄간격 값 (0 = 미지정 → 쓰기 시 160%)
+    #[serde(default)]
+    pub line_spacing: i32,
     /// 속성2/속성3/줄간격(5.0.2.5+) 등
     #[serde(with = "hex_bytes")]
     pub tail: Vec<u8>,

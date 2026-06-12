@@ -117,6 +117,13 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                         }
                     }
                     b"charPr" => {
+                        let mut attr_bits = 0u32;
+                        if attr(e, "useFontSpace").as_deref() == Some("1") {
+                            attr_bits |= 1 << 25;
+                        }
+                        if attr(e, "useKerning").as_deref() == Some("1") {
+                            attr_bits |= 1 << 30;
+                        }
                         let cs = CharShape {
                             base_size: attr_i32(e, "height").unwrap_or(1000),
                             text_color: attr(e, "textColor").map_or(0, |c| parse_color(&c)),
@@ -124,6 +131,8 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                                 .map_or(0xFFFF_FFFF, |c| parse_color(&c)),
                             ratios: [100; LANG_COUNT],
                             rel_sizes: [100; LANG_COUNT],
+                            attr: attr_bits,
+                            border_fill_id: attr_u16(e, "borderFillIDRef").unwrap_or(0),
                             ..CharShape::default()
                         };
                         if empty {
@@ -142,6 +151,22 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                             .enumerate()
                             {
                                 cs.face_ids[i] = attr_u16(e, name).unwrap_or(0);
+                            }
+                        }
+                    }
+                    b"ratio" | b"spacing" | b"relSz" | b"offset" => {
+                        if let Some(cs) = &mut current_char {
+                            let names = [
+                                "hangul", "latin", "hanja", "japanese", "other", "symbol", "user",
+                            ];
+                            for (i, n) in names.iter().enumerate() {
+                                let Some(v) = attr_i32(e, n) else { continue };
+                                match e.local_name().as_ref() {
+                                    b"ratio" => cs.ratios[i] = v.clamp(1, 255) as u8,
+                                    b"spacing" => cs.spacings[i] = v.clamp(-128, 127) as i8,
+                                    b"relSz" => cs.rel_sizes[i] = v.clamp(1, 255) as u8,
+                                    _ => cs.offsets[i] = v.clamp(-128, 127) as i8,
+                                }
                             }
                         }
                     }
@@ -189,6 +214,44 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                             && let Some(h) = attr(e, "horizontal")
                         {
                             ps.attr1 |= alignment_code(&h) << 2;
+                        }
+                    }
+                    b"intent" | b"left" | b"right" | b"prev" | b"next" => {
+                        if let Some(ps) = &mut current_para
+                            && let Some(v) = attr_i32(e, "value")
+                        {
+                            match e.local_name().as_ref() {
+                                b"intent" => ps.indent = v,
+                                b"left" => ps.margin_left = v,
+                                b"right" => ps.margin_right = v,
+                                b"prev" => ps.spacing_top = v,
+                                _ => ps.spacing_bottom = v,
+                            }
+                        }
+                    }
+                    b"lineSpacing" => {
+                        if let Some(ps) = &mut current_para {
+                            ps.line_spacing_type = match attr(e, "type").as_deref() {
+                                Some("FIXED") => 1,
+                                Some("BETWEEN_LINES") => 2,
+                                Some("AT_LEAST") => 3,
+                                _ => 0, // PERCENT
+                            };
+                            ps.line_spacing = attr_i32(e, "value").unwrap_or(160);
+                        }
+                    }
+                    b"typeInfo" => {
+                        if let Some(slot) = current_lang
+                            && let Some(font) = header.fonts[slot].last_mut()
+                        {
+                            let mut attrs = String::new();
+                            for a in e.attributes().flatten() {
+                                let k = String::from_utf8_lossy(a.key.local_name().as_ref())
+                                    .into_owned();
+                                let v = String::from_utf8_lossy(&a.value).into_owned();
+                                attrs.push_str(&format!(r#" {k}="{v}""#));
+                            }
+                            font.type_info = Some(attrs);
                         }
                     }
                     b"borderFill" => {
