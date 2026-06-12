@@ -32,6 +32,26 @@ pub struct ShapedRun {
     pub text: String,
 }
 
+impl ShapedRun {
+    /// 글리프 [start, end) 구간으로 부분 런을 만든다 (줄바꿈용).
+    /// CJK는 1글자=1글리프라 안전하다. 라틴 합자 분리는 허용 오차.
+    pub fn slice(&self, start: usize, end: usize) -> ShapedRun {
+        let glyphs: Vec<Glyph> = self.glyphs[start..end].to_vec();
+        let width_pt = glyphs.iter().map(|g| g.x_advance).sum();
+        ShapedRun {
+            font: self.font.clone(),
+            size_pt: self.size_pt,
+            x_scale: self.x_scale,
+            color: self.color,
+            bold: self.bold,
+            italic: self.italic,
+            glyphs,
+            width_pt,
+            text: String::new(), // 부분 런의 원문 추적은 PDF 백엔드(M7)에서
+        }
+    }
+}
+
 /// 인라인 항목: 글리프 런 또는 고정 폭 진행(탭).
 pub enum InlineItem {
     Run(ShapedRun),
