@@ -91,6 +91,9 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
     let mut current_char: Option<CharShape> = None;
     let mut current_para: Option<ParaShape> = None;
     let mut current_border: Option<BorderFill> = None;
+    // hp:switch의 case/default 중복 — 첫 분기(신형 한글이 읽는 값)만 취한다
+    let mut para_margin_done = false;
+    let mut para_ls_done = false;
 
     loop {
         let event = reader.read_event().map_err(|e| HwpxError::Xml {
@@ -203,6 +206,8 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                     }
                     b"paraPr" => {
                         current_para = Some(ParaShape::default());
+                        para_margin_done = false;
+                        para_ls_done = false;
                         if empty {
                             header
                                 .para_shapes
@@ -218,6 +223,7 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                     }
                     b"intent" | b"left" | b"right" | b"prev" | b"next" => {
                         if let Some(ps) = &mut current_para
+                            && !para_margin_done
                             && let Some(v) = attr_i32(e, "value")
                         {
                             match e.local_name().as_ref() {
@@ -230,7 +236,10 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                         }
                     }
                     b"lineSpacing" => {
-                        if let Some(ps) = &mut current_para {
+                        if let Some(ps) = &mut current_para
+                            && !para_ls_done
+                        {
+                            para_ls_done = true;
                             ps.line_spacing_type = match attr(e, "type").as_deref() {
                                 Some("FIXED") => 1,
                                 Some("BETWEEN_LINES") => 2,
@@ -302,6 +311,11 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
             }
             Event::End(ref e) => match e.local_name().as_ref() {
                 b"fontface" => current_lang = None,
+                b"margin" => {
+                    if current_para.is_some() {
+                        para_margin_done = true;
+                    }
+                }
                 b"charPr" => {
                     if let Some(cs) = current_char.take() {
                         header.char_shapes.push(cs);
