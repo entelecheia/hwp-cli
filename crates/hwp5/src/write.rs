@@ -74,8 +74,15 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
     );
     let prv_text: Vec<u8> = preview.encode_utf16().flat_map(u16::to_le_bytes).collect();
 
-    // CFB 조립
-    let mut cfb = cfb::create(path)?;
+    // CFB 조립 — 반드시 버전 3 (512B 섹터): 한글은 V4(4096B)를
+    // "손상된 파일"로 판정한다 (실기 게이트 실측)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    let mut cfb = cfb::CompoundFile::create_with_version(cfb::Version::V3, file)?;
     cfb.create_new_stream("/FileHeader")?
         .write_all(&header.serialize())?;
     cfb.create_new_stream("/DocInfo")?
@@ -115,7 +122,20 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
             bin_written
         ));
     }
-    // 요약 정보: pyhwp 등이 존재를 요구한다 (U1 실측) — 빈 속성 집합
+    // 보조 스트림: 한글 저장 파일에 항상 존재 (부재 시 손상 판정 위험)
+    cfb.create_storage("/DocOptions")?;
+    cfb.create_new_stream("/DocOptions/_LinkDoc")?
+        .write_all(&[0u8; 524])?;
+    cfb.create_storage("/Scripts")?;
+    // JScriptVersion: 해제 시 01 00 00 00 00 00 00 00 (표본값)
+    cfb.create_new_stream("/Scripts/JScriptVersion")?
+        .write_all(&compress(&[1, 0, 0, 0, 0, 0, 0, 0]))?;
+    // DefaultJScript: 해제 시 16×00 + FF FF FF FF (표본값)
+    let mut default_jscript = vec![0u8; 16];
+    default_jscript.extend_from_slice(&[0xFF; 4]);
+    cfb.create_new_stream("/Scripts/DefaultJScript")?
+        .write_all(&compress(&default_jscript))?;
+    // 요약 정보 (표본과 동일한 14개 속성 구조, 값은 비움)
     cfb.create_new_stream("/\u{5}HwpSummaryInformation")?
         .write_all(&hwp_summary_information())?;
     cfb.create_new_stream("/PrvText")?.write_all(&prv_text)?;
@@ -229,6 +249,63 @@ fn hwp_summary_information() -> Vec<u8> {
         0x60, 0xB6, 0xA2, 0x9F, 0x61, 0x10, 0xD4, 0x11, 0xB4, 0xC6, 0x00, 0x60, 0x97, 0xC0, 0x9D,
         0x8C,
     ];
+    // 표본(한글 빈 문서)과 동일한 PID 순서/타입 — 값은 비움
+    enum Val<'a> {
+        Str(&'a str),
+        FileTime,
+        I4,
+        Null,
+    }
+    let props: [(u32, Val); 14] = [
+        (0x02, Val::Str("")),        // 제목
+        (0x03, Val::Str("")),        // 주제
+        (0x04, Val::Str("")),        // 지은이
+        (0x14, Val::Str("")),        // 날짜 문자열
+        (0x05, Val::Str("")),        // 키워드
+        (0x06, Val::Str("")),        // 설명
+        (0x08, Val::Str("")),        // 마지막 저장자
+        (0x09, Val::Str("hwp-cli")), // 프로그램
+        (0x0C, Val::FileTime),
+        (0x0D, Val::FileTime),
+        (0x0B, Val::FileTime),
+        (0x0E, Val::I4),
+        (0x15, Val::I4),
+        (0x00, Val::Null),
+    ];
+
+    // 섹션 본문: ID/오프셋 표 + 값들
+    let mut values = ByteWriter::new();
+    let table_size = 8 + props.len() * 8;
+    let mut offsets = Vec::with_capacity(props.len());
+    for (_, val) in &props {
+        offsets.push(table_size + values.len());
+        match val {
+            Val::Str(text) => {
+                values.write_u32(31); // VT_LPWSTR
+                let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
+                values.write_u32(units.len() as u32);
+                for u in &units {
+                    values.write_u16(*u);
+                }
+                while !values.len().is_multiple_of(4) {
+                    values.write_u8(0);
+                }
+            }
+            Val::FileTime => {
+                values.write_u32(64); // VT_FILETIME
+                values.write_u32(0);
+                values.write_u32(0);
+            }
+            Val::I4 => {
+                values.write_u32(3); // VT_I4
+                values.write_u32(0);
+            }
+            Val::Null => values.write_u32(1), // VT_NULL
+        }
+    }
+    let values = values.into_bytes();
+    let section_size = table_size + values.len();
+
     let mut w = ByteWriter::new();
     w.write_u16(0xFFFE); // byte order
     w.write_u16(0); // format
@@ -237,8 +314,13 @@ fn hwp_summary_information() -> Vec<u8> {
     w.write_u32(1); // 섹션 수
     w.write_bytes(&HWP_FMTID); // FMTID
     w.write_u32(48); // 섹션 오프셋
-    w.write_u32(8); // 섹션 크기 (헤더만)
-    w.write_u32(0); // 속성 수
+    w.write_u32(section_size as u32);
+    w.write_u32(props.len() as u32);
+    for ((pid, _), off) in props.iter().zip(&offsets) {
+        w.write_u32(*pid);
+        w.write_u32(*off as u32);
+    }
+    w.write_bytes(&values);
     w.into_bytes()
 }
 
