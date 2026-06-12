@@ -202,6 +202,26 @@ fn write_paragraph(
         flush_text(out, &mut text_buf);
         out.push_str("</hp:run>");
     }
+    // 줄 배치 정보 보존 (왕복 시 페이지 분할·위치 충실도)
+    if !para.line_segs.is_empty() {
+        out.push_str("<hp:linesegarray>");
+        for seg in &para.line_segs {
+            let _ = write!(
+                out,
+                r##"<hp:lineseg textpos="{}" vertpos="{}" vertsize="{}" textheight="{}" baseline="{}" spacing="{}" horzpos="{}" horzsize="{}" flags="{}"/>"##,
+                seg.text_start,
+                seg.v_pos,
+                seg.line_height,
+                seg.text_height,
+                seg.baseline_gap,
+                seg.line_spacing,
+                seg.col_start,
+                seg.seg_width,
+                seg.flags,
+            );
+        }
+        out.push_str("</hp:linesegarray>");
+    }
     if !emitted_any_run {
         // 빈 문단도 런 하나는 가져야 한다 (기준 표본 패턴)
         let _ = write!(

@@ -63,6 +63,8 @@ pub fn layout_document(
         let body_top = (page_def.margin_top.0 + page_def.margin_header.0) as f32 / 100.0;
         let body_width =
             (page_def.width.0 - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
+        // 본문 영역 하한 (넘침 분할 기준)
+        let body_bottom = h - (page_def.margin_bottom.0 + page_def.margin_footer.0) as f32 / 100.0;
 
         let mut page = PageList {
             width_pt: w,
@@ -108,6 +110,23 @@ pub fn layout_document(
                     ) && ![*b"cold", *b"head", *b"foot"].contains(&c.ctrl_id())
                 })
                 .count();
+
+            // 본문 넘침: 직전 콘텐츠가 본문 하한을 지났으면 새 페이지
+            // (lineseg 없는 생성 문서의 기본 페이지네이션)
+            if content_bottom > body_bottom && paras_on_page > 0 {
+                furniture.render(doc, store, &mut page, warnings);
+                pages.push(std::mem::replace(
+                    &mut page,
+                    PageList {
+                        width_pt: w,
+                        height_pt: h,
+                        items: Vec::new(),
+                    },
+                ));
+                content_bottom = body_top;
+                prev_v_pos = -1;
+                paras_on_page = 0;
+            }
 
             // 쪽 나누기 (PARA_HEADER break_type bit2 / hp:p pageBreak)
             // — 글상자만 있어 items가 비어도 문단을 거쳤으면 분할한다
