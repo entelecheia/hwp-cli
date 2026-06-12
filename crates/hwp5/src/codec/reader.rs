@@ -71,6 +71,26 @@ impl<'a> ByteReader<'a> {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect())
     }
+
+    pub fn read_i8(&mut self) -> Result<i8> {
+        Ok(self.read_u8()? as i8)
+    }
+
+    /// HWP 문자열: WORD 길이 + UTF-16LE 문자들.
+    pub fn read_hwp_string(&mut self) -> Result<String> {
+        let len = self.read_u16()? as usize;
+        let units = self.read_wchars(len)?;
+        Ok(String::from_utf16_lossy(&units))
+    }
+
+    /// u16 배열을 고정 크기로 읽는다.
+    pub fn read_u16_array<const N: usize>(&mut self) -> Result<[u16; N]> {
+        let mut out = [0u16; N];
+        for slot in &mut out {
+            *slot = self.read_u16()?;
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

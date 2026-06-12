@@ -113,10 +113,13 @@ fn main() -> anyhow::Result<()> {
             preview: true,
             ..
         } => commands::cat::preview(&file),
+        Cmd::Cat {
+            file,
+            format: TextFormat::Plain,
+            ..
+        } => commands::cat::run(&file),
         Cmd::Cat { .. } => {
-            anyhow::bail!(
-                "`hwp cat` 본문 추출은 아직 구현되지 않았습니다 (M1 예정, --preview는 사용 가능)"
-            )
+            anyhow::bail!("`hwp cat`의 markdown/json 출력은 아직 구현되지 않았습니다 (M2 예정)")
         }
         Cmd::Convert { .. } => anyhow::bail!("`hwp convert`는 아직 구현되지 않았습니다 (M2 예정)"),
         Cmd::Render { .. } => anyhow::bail!("`hwp render`는 아직 구현되지 않았습니다 (M3 예정)"),

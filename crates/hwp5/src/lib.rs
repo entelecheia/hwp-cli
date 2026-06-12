@@ -14,12 +14,16 @@
 //! - [`codec`] — 바이트 커서(reader/writer)와 raw deflate 압축
 //! - [`record`] — 레코드 헤더 코덱, 평면 스트림 ↔ 트리 변환
 
+pub mod body_text;
 pub mod codec;
 pub mod container;
+pub mod doc_info;
 pub mod error;
 pub mod file_header;
+pub mod read;
 pub mod record;
 
 pub use container::Hwp5Container;
 pub use error::Hwp5Error;
 pub use file_header::FileHeader;
+pub use read::{ReadResult, read_document};

@@ -1,0 +1,5 @@
+---
+source: crates/hwp5/tests/extract.rs
+expression: result.document.plain_text()
+---
+Hello World!
