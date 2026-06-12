@@ -443,7 +443,7 @@ fn parse_table_record(data: &[u8], table: &mut Table) -> Result<()> {
 fn parse_cell_header(data: &[u8]) -> Result<Cell> {
     let mut r = ByteReader::new(data);
     let _para_count = r.read_i32()?;
-    let _attr = r.read_u32()?;
+    let list_attr = r.read_u32()?;
     let col = r.read_u16()?;
     let row = r.read_u16()?;
     let col_span = r.read_u16()?;
@@ -453,6 +453,7 @@ fn parse_cell_header(data: &[u8]) -> Result<Cell> {
     let margins = r.read_u16_array::<4>()?;
     let border_fill = hwp_model::BorderFillId(r.read_u16()?);
     Ok(Cell {
+        list_attr,
         col,
         row,
         col_span,

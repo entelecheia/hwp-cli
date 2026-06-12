@@ -22,7 +22,13 @@ pub struct DocHeader {
     pub bullets: Vec<RawEntry>,
     pub para_shapes: Vec<ParaShape>,
     pub styles: Vec<Style>,
-    /// DocInfo 수준의 미해석 레코드 (DOC_DATA, 호환 설정 등)
+    /// ID_MAPPINGS 원본 카운트 배열 (버전별 길이 보존 — 쓰기 시 유도값과 대조)
+    #[serde(default)]
+    pub id_mappings_counts: Vec<u32>,
+    /// ID_MAPPINGS 자식 중 미해석 레코드 (메모 모양 등 — 위치: 테이블들 뒤)
+    #[serde(default)]
+    pub id_extras: Vec<OpaqueRecord>,
+    /// DocInfo 최상위 수준의 미해석 레코드 (DOC_DATA, 호환 설정 등)
     pub extras: Vec<OpaqueRecord>,
 }
 

@@ -36,7 +36,8 @@ pub fn run(
             }
         }
         ConvertFormat::Hwp => {
-            anyhow::bail!("hwp 쓰기는 아직 구현되지 않았습니다 (M6 예정)")
+            let doc = load_document(input)?;
+            write_hwp(&doc, output)?;
         }
     }
     eprintln!("변환 완료: {} → {}", input.display(), output.display());
@@ -58,4 +59,23 @@ fn infer_format(output: &Path) -> anyhow::Result<ConvertFormat> {
             anyhow::bail!("출력 포맷을 추론할 수 없습니다 (확장자: {other:?}) — --to로 지정하세요")
         }
     }
+}
+
+/// hwp 바이너리 저장 (1쪽 렌더를 PrvImage로 동봉).
+pub fn write_hwp(doc: &hwp_model::Document, output: &std::path::Path) -> anyhow::Result<()> {
+    let prv_image = hwp_render::render_document(
+        doc,
+        &hwp_render::RenderOptions {
+            dpi: 48.0,
+            ..Default::default()
+        },
+    )
+    .ok()
+    .and_then(|out| out.pages.first().and_then(|p| p.encode_png().ok()));
+
+    let warnings = hwp5::write_document(doc, output, &hwp5::WriteOptions { prv_image })?;
+    for w in &warnings {
+        eprintln!("경고: {w}");
+    }
+    Ok(())
 }

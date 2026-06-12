@@ -42,6 +42,7 @@ pub fn parse_doc_info(roots: &[RecordNode]) -> (DocHeader, Vec<String>) {
                 for (i, slot) in font_counts.iter_mut().enumerate() {
                     *slot = counts.get(1 + i).copied().unwrap_or(0);
                 }
+                header.id_mappings_counts = counts.clone();
                 // 자식 레코드들이 실제 테이블 항목
                 for child in &node.children {
                     parse_id_mapping_child(
@@ -127,7 +128,7 @@ fn parse_id_mapping_child(
                 header.extras.push(to_opaque(node));
             }
         },
-        _ => header.extras.push(to_opaque(node)),
+        _ => header.id_extras.push(to_opaque(node)),
     }
 }
 

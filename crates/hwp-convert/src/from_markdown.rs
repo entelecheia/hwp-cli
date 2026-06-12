@@ -130,6 +130,8 @@ pub fn from_markdown(md: &str) -> Document {
     if b.paragraphs.is_empty() {
         b.paragraphs.push(Paragraph::default());
     }
+    // 첫 문단에 구역/단 정의 주입 — hwp5/한글 호환의 전제 조건
+    inject_section_controls(&mut b.paragraphs[0]);
     Document {
         meta: DocMeta {
             source_format: "markdown".to_string(),
@@ -307,6 +309,85 @@ fn heading_level(level: HeadingLevel) -> u16 {
     }
 }
 
+/// 첫 문단 앞에 secd/cold 확장 컨트롤을 삽입한다 (16 WCHAR 시프트 포함).
+fn inject_section_controls(para: &mut Paragraph) {
+    use hwp_model::{Control, GenericControl, HwpUnit, PageDef, SectionDef};
+    if para
+        .controls
+        .iter()
+        .any(|c| matches!(c, Control::SectionDef(_)))
+    {
+        return;
+    }
+    // 기존 참조들 시프트
+    for ch in &mut para.chars {
+        if let HwpChar::ExtCtrl {
+            ctrl_index: Some(i),
+            ..
+        } = ch
+        {
+            *i += 2;
+        }
+    }
+    for (pos, _) in &mut para.char_shape_runs {
+        *pos += 16;
+    }
+    for seg in &mut para.line_segs {
+        seg.text_start += 16;
+    }
+    let first_shape = para
+        .char_shape_runs
+        .first()
+        .map_or(CharShapeId(0), |(_, id)| *id);
+    if para.char_shape_runs.first().map(|(p, _)| *p) != Some(0) {
+        para.char_shape_runs.insert(0, (0, first_shape));
+    }
+
+    let page = PageDef {
+        width: HwpUnit(59528),
+        height: HwpUnit(84186),
+        margin_left: HwpUnit(8504),
+        margin_right: HwpUnit(8504),
+        margin_top: HwpUnit(5668),
+        margin_bottom: HwpUnit(4252),
+        margin_header: HwpUnit(4252),
+        margin_footer: HwpUnit(4252),
+        gutter: HwpUnit(0),
+        attr: 0,
+    };
+    para.controls.insert(
+        0,
+        Control::SectionDef(SectionDef {
+            data: Vec::new(),
+            page: Some(page),
+            extras: Vec::new(),
+        }),
+    );
+    para.controls.insert(
+        1,
+        Control::Generic(GenericControl {
+            ctrl_id: *b"cold",
+            data: Vec::new(),
+            paragraph_lists: Vec::new(),
+            extras: Vec::new(),
+        }),
+    );
+    let ext = |ctrl_id: [u8; 4], idx: u32| {
+        let mut payload = vec![0u8; 12];
+        let mut rev = ctrl_id;
+        rev.reverse();
+        payload[..4].copy_from_slice(&rev);
+        HwpChar::ExtCtrl {
+            code: 2,
+            ctrl_id,
+            payload,
+            ctrl_index: Some(idx),
+        }
+    };
+    para.chars.insert(0, ext(*b"secd", 0));
+    para.chars.insert(1, ext(*b"cold", 1));
+}
+
 /// 수집한 표를 앵커 문단(확장 컨트롤 1개)으로 만든다.
 fn table_paragraph(tb: TableBuilder) -> Paragraph {
     let rows = tb.rows.len().max(1);
@@ -318,6 +399,7 @@ fn table_paragraph(tb: TableBuilder) -> Paragraph {
     for (r, row) in tb.rows.iter().enumerate() {
         for c in 0..cols {
             cells.push(Cell {
+                list_attr: 0,
                 col: c as u16,
                 row: r as u16,
                 col_span: 1,

@@ -414,6 +414,7 @@ fn parse_cell(
     warnings: &mut Vec<String>,
 ) -> Result<Cell> {
     let mut cell = Cell {
+        list_attr: 0,
         col: 0,
         row: 0,
         col_span: 1,

@@ -112,6 +112,9 @@ pub struct Table {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cell {
+    /// LIST_HEADER 속성 비트 (hwp5 왕복 보존)
+    #[serde(default)]
+    pub list_attr: u32,
     pub col: u16,
     pub row: u16,
     pub col_span: u16,
