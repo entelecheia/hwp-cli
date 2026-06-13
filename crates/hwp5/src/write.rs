@@ -11,7 +11,7 @@ use std::path::Path;
 
 use hwp_model::{
     BorderLine, Cell, CharShape, Control, Document, FaceName, HwpChar, LANG_COUNT, OpaqueRecord,
-    ParaShape, Paragraph, Picture, Section, SectionDef, Style, Table,
+    ParaShape, Paragraph, Picture, RawEntry, Section, SectionDef, Style, Table,
 };
 
 use crate::codec::{ByteWriter, compress};
@@ -54,11 +54,22 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
     // 레코드 스트림 구성
     let doc_info_nodes = emit_doc_info(doc, &mut warnings);
     let doc_info = RecordNode::serialize_forest(&doc_info_nodes);
+    // PARA_HEADER 꼬리 게이트: 5.0.3.2 이상은 '변경추적 병합 문단여부' UINT16이
+    // 필수다(스펙 표 58, 전체 길이 24B). 합성 문단(tail 비어 있음)에만 적용해
+    // 24B를 맞춘다. 22B만 쓰면 한글이 버전-레이아웃 불일치로 '손상/변조' 경고
+    // (sample_m6 5.1.0.1·halla 5.1.1.0 실증). pre-5.0.3.2(work_report 5.0.2.4)는
+    // 22B가 정답이므로 게이트 false.
+    let add_tracking_tail = parse_version(&doc.meta.source_version).to_u32() >= 0x05_00_03_02;
     let sections: Vec<Vec<u8>> = doc
         .sections
         .iter()
         .map(|s| {
-            RecordNode::serialize_forest(&emit_section(s, opts.preserve_linesegs, &mut warnings))
+            RecordNode::serialize_forest(&emit_section(
+                s,
+                opts.preserve_linesegs,
+                add_tracking_tail,
+                &mut warnings,
+            ))
         })
         .collect();
 
@@ -261,6 +272,54 @@ const DEFAULT_COLD_DATA: [u8; 12] = [
     0x04, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
+/// secd 자식: 각주 모양(FOOTNOTE_SHAPE, 28B) — hello_world 표본 실측.
+const DEFAULT_FOOTNOTE_SHAPE: [u8; 28] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x00, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0x52, 0x03, 0x37, 0x02, 0x1b, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// secd 자식: 미주 모양(FOOTNOTE_SHAPE 태그 공유, 28B) — hello_world 표본 실측.
+const DEFAULT_ENDNOTE_SHAPE: [u8; 28] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x00, 0x01, 0x00, 0xf8, 0x2f, 0xe0, 0x00,
+    0x52, 0x03, 0x37, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// secd 자식: 쪽 테두리/배경(PAGE_BORDER_FILL, 14B) BOTH/EVEN/ODD 3종 —
+/// hello_world 표본 실측. 끝 2B=borderFillID=1(합성 DocInfo에 항상 존재).
+const DEFAULT_PAGE_BORDER_FILLS: [[u8; 14]; 3] = [
+    [
+        0xc1, 0xf9, 0x78, 0x09, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x01, 0x00,
+    ],
+    [
+        0x81, 0x0b, 0x1b, 0x27, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x01, 0x00,
+    ],
+    [
+        0x01, 0x00, 0x00, 0x00, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x01, 0x00,
+    ],
+];
+
+/// 기본 번호 정의(NUMBERING) 페이로드 (226B — 5.1.0.1 표본 hello_world와 바이트 동일).
+/// 문단 머리 7수준(^1.~^7) + 시작번호 7개 + 5.1.x 확장 3수준. PARA_SHAPE가
+/// numbering_id=0 을 참조하므로 테이블이 비면 dangling reference가 되어 한글이
+/// '손상/변조'로 거부한다 — 합성/hwpx 출신 안전망의 기본값.
+const DEFAULT_NUMBERING_DATA: [u8; 226] = [
+    0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0xff, 0xff, 0xff, 0xff, 0x03, 0x00, 0x5e, 0x00,
+    0x31, 0x00, 0x2e, 0x00, 0x0c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0x03, 0x00, 0x5e, 0x00, 0x32, 0x00, 0x2e, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x03, 0x00, 0x5e, 0x00, 0x33, 0x00, 0x29, 0x00, 0x0c, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x32, 0x00, 0xff, 0xff, 0xff, 0xff, 0x03, 0x00, 0x5e, 0x00, 0x34, 0x00, 0x29, 0x00,
+    0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0xff, 0xff, 0xff, 0xff, 0x04, 0x00, 0x28, 0x00,
+    0x5e, 0x00, 0x35, 0x00, 0x29, 0x00, 0x0c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0xff, 0xff,
+    0xff, 0xff, 0x04, 0x00, 0x28, 0x00, 0x5e, 0x00, 0x36, 0x00, 0x29, 0x00, 0x2c, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x32, 0x00, 0xff, 0xff, 0xff, 0xff, 0x02, 0x00, 0x5e, 0x00, 0x37, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x32, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x32, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x00, 0x00,
+];
+
 /// 최소 유효 `\x05HwpSummaryInformation` (OLE 속성 집합, 속성 0개).
 /// 헤더 상수는 한글 저장 표본 실측값 — FMTID 9FA2B660-1061-11D4-B4C6-006097C09D8C.
 fn hwp_summary_information() -> Vec<u8> {
@@ -273,7 +332,7 @@ fn hwp_summary_information() -> Vec<u8> {
         Str(&'a str),
         FileTime,
         I4,
-        Null,
+        Dictionary,
     }
     let props: [(u32, Val); 14] = [
         (0x02, Val::Str("")),        // 제목
@@ -289,7 +348,10 @@ fn hwp_summary_information() -> Vec<u8> {
         (0x0B, Val::FileTime),
         (0x0E, Val::I4),
         (0x15, Val::I4),
-        (0x00, Val::Null),
+        // PID 0 = PID_DICTIONARY (MS-OLEPS 2.17): VT_NULL이 아니라 사전 구조여야 한다.
+        // 한글 표본(hello_world)은 항목 1개 사전(id=0 → 빈 이름). VT_NULL을 쓰면
+        // pyhwp 등이 count=1 사전으로 읽고 항목을 기대하다 EOF(절단)로 거부한다.
+        (0x00, Val::Dictionary),
     ];
 
     // 섹션 본문: ID/오프셋 표 + 값들
@@ -319,7 +381,15 @@ fn hwp_summary_information() -> Vec<u8> {
                 values.write_u32(3); // VT_I4
                 values.write_u32(0);
             }
-            Val::Null => values.write_u32(1), // VT_NULL
+            Val::Dictionary => {
+                // MS-OLEPS Dictionary: 항목 수 + DictionaryEntry(id + 이름 길이 + 이름).
+                // 표본 hello_world와 바이트 동일(13B, 패딩 없음 — 마지막 속성):
+                // 항목 1개, id=0, 이름 1바이트(널 종단자).
+                values.write_u32(1); // 사전 항목 수
+                values.write_u32(0); // DictionaryEntry.id
+                values.write_u32(1); // 이름 길이(바이트)
+                values.write_u8(0); // 이름: 빈 문자열(널 종단자)
+            }
         }
     }
     let values = values.into_bytes();
@@ -384,6 +454,41 @@ fn emit_doc_info(doc: &Document, _warnings: &mut Vec<String>) -> Vec<RecordNode>
     let h = &doc.header;
     let mut roots = Vec::new();
 
+    // 안전망: 합성(md)·hwpx 출신 문서는 tab_defs/numberings를 비운 채 온다.
+    // 그러나 모든 PARA_SHAPE는 tab_def_id=0·numbering_id=0 을 참조하므로
+    // 테이블이 비면 ID 0 이 가리킬 레코드가 없어 dangling reference가 되고
+    // 한글이 '손상/변조'로 거부한다(halla.hwp 실증: hwpx 출신은 from_markdown
+    // 을 거치지 않아 default_header 수정만으로는 커버 불가). 정상 표본
+    // (hello_world 5.1.0.1)은 예외 없이 TAB_DEF≥1·NUMBERING=1 을 가진다 —
+    // 그 바이트를 그대로 기본값으로 주입한다(값 복제). emit 루프와 ID_MAPPINGS
+    // 카운트가 동일 Vec를 참조하므로 둘은 항상 정합한다.
+    let tab_defs_owned: Vec<RawEntry> = if h.tab_defs.is_empty() {
+        vec![
+            RawEntry {
+                data: vec![0, 0, 0, 0, 0, 0, 0, 0],
+                children: Vec::new(),
+            },
+            RawEntry {
+                data: vec![1, 0, 0, 0, 0, 0, 0, 0],
+                children: Vec::new(),
+            },
+            RawEntry {
+                data: vec![2, 0, 0, 0, 0, 0, 0, 0],
+                children: Vec::new(),
+            },
+        ]
+    } else {
+        h.tab_defs.clone()
+    };
+    let numberings_owned: Vec<RawEntry> = if h.numberings.is_empty() {
+        vec![RawEntry {
+            data: DEFAULT_NUMBERING_DATA.to_vec(),
+            children: Vec::new(),
+        }]
+    } else {
+        h.numberings.clone()
+    };
+
     // DOCUMENT_PROPERTIES — 구역 수는 실제 섹션 수에서 유도
     let mut w = ByteWriter::new();
     w.write_u16(doc.sections.len().max(1) as u16);
@@ -407,8 +512,8 @@ fn emit_doc_info(doc: &Document, _warnings: &mut Vec<String>) -> Vec<RecordNode>
     }
     counts.push(h.border_fills.len() as u32);
     counts.push(h.char_shapes.len() as u32);
-    counts.push(h.tab_defs.len() as u32);
-    counts.push(h.numberings.len() as u32);
+    counts.push(tab_defs_owned.len() as u32);
+    counts.push(numberings_owned.len() as u32);
     counts.push(h.bullets.len() as u32);
     counts.push(h.para_shapes.len() as u32);
     counts.push(h.styles.len() as u32);
@@ -459,14 +564,14 @@ fn emit_doc_info(doc: &Document, _warnings: &mut Vec<String>) -> Vec<RecordNode>
     for cs in &h.char_shapes {
         children.push(emit_char_shape(cs));
     }
-    for t in &h.tab_defs {
+    for t in &tab_defs_owned {
         children.push(RecordNode {
             tag: tag::TAB_DEF,
             data: t.data.clone(),
             children: t.children.iter().map(opaque_to_node).collect(),
         });
     }
-    for n in &h.numberings {
+    for n in &numberings_owned {
         children.push(RecordNode {
             tag: tag::NUMBERING,
             data: n.data.clone(),
@@ -643,7 +748,11 @@ fn emit_para_shape(ps: &ParaShape) -> RecordNode {
         w.write_u16(v as u16);
     }
     if ps.tail.is_empty() {
-        // hwpx/md 출신: 5.0.2.5+ 필수 필드 충전 (속성2/속성3/줄간격)
+        // hwpx/md 출신: 5.1.0.1 규격 충전 (속성2/속성3/줄간격 + 후행 4B).
+        // 정상 5.1.0.1 표본(hello_world)의 PARA_SHAPE는 58B이며 tail 16B =
+        // 속성2(4)+속성3(4)+줄간격(4)+후행(4). 후행 4B를 누락하면(54B) 한글이
+        // 무결성 위반으로 '손상/변조' 경고를 띄운다. 합성 문서는 항상
+        // 5.1.0.1로 선언되므로(parse_version 기본값) 58B가 정답.
         w.write_u32(0);
         w.write_u32(0);
         w.write_u32(if ps.line_spacing > 0 {
@@ -651,6 +760,7 @@ fn emit_para_shape(ps: &ParaShape) -> RecordNode {
         } else {
             160
         });
+        w.write_u32(0); // 후행 4B — 5.1.0.1 표본 hello_world와 동일 (00 00 00 00)
     } else {
         w.write_bytes(&ps.tail);
     }
@@ -687,12 +797,13 @@ fn emit_style(st: &Style) -> RecordNode {
 fn emit_section(
     section: &Section,
     preserve_linesegs: bool,
+    add_tracking_tail: bool,
     warnings: &mut Vec<String>,
 ) -> Vec<RecordNode> {
     let mut roots: Vec<RecordNode> = section
         .paragraphs
         .iter()
-        .map(|p| emit_paragraph(p, preserve_linesegs, warnings))
+        .map(|p| emit_paragraph(p, preserve_linesegs, add_tracking_tail, warnings))
         .collect();
     roots.extend(section.extras.iter().map(opaque_to_node));
     roots
@@ -701,6 +812,7 @@ fn emit_section(
 fn emit_paragraph(
     para: &Paragraph,
     preserve_linesegs: bool,
+    add_tracking_tail: bool,
     warnings: &mut Vec<String>,
 ) -> RecordNode {
     // PARA_HEADER
@@ -750,7 +862,18 @@ fn emit_paragraph(
     };
     w.write_u16(seg_count as u16);
     w.write_u32(para.header.instance_id);
-    w.write_bytes(&para.header.tail);
+    if para.header.tail.is_empty() {
+        // 합성 문단: 선언 버전이 5.0.3.2 이상이면 '변경추적 병합 문단여부'
+        // UINT16(=0)을 붙여 24B를 맞춘다(스펙 표 58). 정상 5.1.0.1 표본
+        // hello_world의 PARA_HEADER 꼬리(00 00)와 동일. 누락 시(22B) 한글이
+        // 버전-레이아웃 불일치로 '손상/변조' 경고.
+        if add_tracking_tail {
+            w.write_u16(0);
+        }
+    } else {
+        // hwp5 왕복: 꼬리(버전별 추가 필드)를 그대로 보존한다.
+        w.write_bytes(&para.header.tail);
+    }
 
     let mut children = Vec::new();
     if !para.chars.is_empty() {
@@ -793,7 +916,12 @@ fn emit_paragraph(
     }
     children.extend(para.extras.iter().map(opaque_to_node));
     for control in &para.controls {
-        children.push(emit_control(control, preserve_linesegs, warnings));
+        children.push(emit_control(
+            control,
+            preserve_linesegs,
+            add_tracking_tail,
+            warnings,
+        ));
     }
 
     RecordNode {
@@ -835,11 +963,12 @@ fn reversed(id: [u8; 4]) -> [u8; 4] {
 fn emit_control(
     control: &Control,
     preserve_linesegs: bool,
+    add_tracking_tail: bool,
     warnings: &mut Vec<String>,
 ) -> RecordNode {
     match control {
         Control::SectionDef(def) => emit_section_def(def),
-        Control::Table(table) => emit_table(table, preserve_linesegs),
+        Control::Table(table) => emit_table(table, preserve_linesegs, add_tracking_tail),
         Control::Picture(pic) => emit_picture(pic, warnings),
         Control::Generic(g) => {
             let mut w = ByteWriter::new();
@@ -866,7 +995,12 @@ fn emit_control(
                     children: Vec::new(),
                 });
                 for p in &list.paragraphs {
-                    children.push(emit_paragraph(p, preserve_linesegs, warnings));
+                    children.push(emit_paragraph(
+                        p,
+                        preserve_linesegs,
+                        add_tracking_tail,
+                        warnings,
+                    ));
                 }
             }
             if !g.extras.is_empty() && !g.paragraph_lists.is_empty() {
@@ -912,7 +1046,28 @@ fn emit_section_def(def: &SectionDef) -> RecordNode {
             children: Vec::new(),
         });
     }
-    children.extend(def.extras.iter().map(opaque_to_node));
+    if def.extras.is_empty() {
+        // 합성 문서(md/hwpx 출신): secd 필수 자식을 5.1.0.1 표본(hello_world)
+        // 바이트로 보충한다. 한글은 구역 정의 아래 각주/미주 모양과 쪽
+        // 테두리 3종(BOTH/EVEN/ODD)을 기대하며, PAGE_DEF만 있으면 '손상/변조'
+        // 판정. PAGE_BORDER_FILL 끝 2B=borderFillID=1(항상 존재).
+        for shape in [&DEFAULT_FOOTNOTE_SHAPE, &DEFAULT_ENDNOTE_SHAPE] {
+            children.push(RecordNode {
+                tag: tag::FOOTNOTE_SHAPE,
+                data: shape.to_vec(),
+                children: Vec::new(),
+            });
+        }
+        for bf in &DEFAULT_PAGE_BORDER_FILLS {
+            children.push(RecordNode {
+                tag: tag::PAGE_BORDER_FILL,
+                data: bf.to_vec(),
+                children: Vec::new(),
+            });
+        }
+    } else {
+        children.extend(def.extras.iter().map(opaque_to_node));
+    }
     RecordNode {
         tag: tag::CTRL_HEADER,
         data: w.into_bytes(),
@@ -920,7 +1075,7 @@ fn emit_section_def(def: &SectionDef) -> RecordNode {
     }
 }
 
-fn emit_table(table: &Table, preserve_linesegs: bool) -> RecordNode {
+fn emit_table(table: &Table, preserve_linesegs: bool, add_tracking_tail: bool) -> RecordNode {
     let mut w = ByteWriter::new();
     w.write_bytes(b" lbt");
     if table.common_data.is_empty() {
@@ -978,7 +1133,12 @@ fn emit_table(table: &Table, preserve_linesegs: bool) -> RecordNode {
     for cell in &table.cells {
         children.push(emit_cell_header(cell));
         for p in &cell.paragraphs {
-            children.push(emit_paragraph(p, preserve_linesegs, &mut cell_warnings));
+            children.push(emit_paragraph(
+                p,
+                preserve_linesegs,
+                add_tracking_tail,
+                &mut cell_warnings,
+            ));
         }
     }
     children.extend(table.extras.iter().map(opaque_to_node));

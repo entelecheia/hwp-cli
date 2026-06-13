@@ -16,3 +16,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 insta = { workspace = true }
+hwp-convert = { workspace = true }
