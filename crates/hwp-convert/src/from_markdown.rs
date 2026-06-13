@@ -32,6 +32,11 @@ pub fn default_header() -> hwp_model::DocHeader {
     for slot in 0..LANG_COUNT {
         header.fonts[slot] = vec![FaceName {
             name: "함초롬바탕".to_string(),
+            // 한글 무결성 검사는 글꼴 대체를 위해 기본 글꼴 이름(attr bit5, 0x20)을 기대한다.
+            // 정상 표본 hello_world.hwp 의 '함초롬바탕'은 default_name="HCR Batang", attr=0x21.
+            // attr 하위 0x01 = 글꼴 유형 TTF(표 20). emit_face_name 이 0x20 비트를 자동 OR 한다.
+            attr: 0x01,
+            default_name: Some("HCR Batang".to_string()),
             ..FaceName::default()
         }];
     }
@@ -58,6 +63,25 @@ pub fn default_header() -> hwp_model::DocHeader {
         cs(1200, true, false),  // 7 H4
         cs(1100, true, false),  // 8 H5
         cs(1100, true, false),  // 9 H6
+    ];
+
+    // 탭 정의 — 한글 기본 좌/중/우 자동 탭 3개. 정상 표본(hello_world 등
+    // 5.1.0.1)은 전부 이 3개를 가지며, 모든 PARA_SHAPE가 tab_def_id=0 을
+    // 참조한다. 비우면 dangling reference가 되어 한글이 '손상/변조'로 거부.
+    // 각 8바이트: 속성 u32(0/1/2) + count i16=0 + 예약 u16 (spec 표36, count=0→8B).
+    header.tab_defs = vec![
+        hwp_model::RawEntry {
+            data: vec![0, 0, 0, 0, 0, 0, 0, 0],
+            children: Vec::new(),
+        },
+        hwp_model::RawEntry {
+            data: vec![1, 0, 0, 0, 0, 0, 0, 0],
+            children: Vec::new(),
+        },
+        hwp_model::RawEntry {
+            data: vec![2, 0, 0, 0, 0, 0, 0, 0],
+            children: Vec::new(),
+        },
     ];
 
     // 0 본문(양쪽), 1 헤딩(왼쪽 + 위 간격)

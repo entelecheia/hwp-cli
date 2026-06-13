@@ -580,6 +580,7 @@ version = "0.1.0"
 dependencies = [
  "cfb",
  "flate2",
+ "hwp-convert",
  "hwp-model",
  "insta",
  "proptest",
