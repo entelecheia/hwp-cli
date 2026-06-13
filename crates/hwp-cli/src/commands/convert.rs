@@ -69,16 +69,44 @@ fn infer_format(output: &Path) -> anyhow::Result<ConvertFormat> {
 }
 
 /// hwp 바이너리 저장 (1쪽 렌더를 PrvImage로 동봉).
+///
+/// 합성 문서(md/hwpx 출신)는 줄 배치(PARA_LINE_SEG)가 없으면 5.1.x 한글이
+/// 본문을 못 그린다(검은 바/빈 내용/손상). 폰트 셰이핑으로 정확한 줄바꿈을
+/// 계산해 IR에 채운 뒤 쓴다 — 한글과 동일한 함초롬바탕 폰트가 필요하다
+/// (HWP_FONT_DIR 환경변수 또는 프로젝트 `fonts/`).
 pub fn write_hwp(
     doc: &hwp_model::Document,
     output: &std::path::Path,
     preserve_layout: bool,
 ) -> anyhow::Result<()> {
+    let font_dir = std::path::PathBuf::from(
+        std::env::var("HWP_FONT_DIR").unwrap_or_else(|_| "fonts".into()),
+    );
+    let synthesize = doc.meta.source_format != "hwp5";
+
+    // 합성 경로: 정확한 줄 배치를 폰트 셰이핑으로 계산해 IR에 채운다.
+    // 무수정 왕복(--preserve-layout)은 원본 줄 배치를 그대로 보존한다.
+    let owned;
+    let doc = if synthesize && !preserve_layout {
+        let mut d = doc.clone();
+        let mut store = hwp_render::FontStore::new();
+        store.load_dir(&font_dir);
+        let mut warns = Vec::new();
+        hwp_render::lineseg::synthesize_linesegs(&mut d, &mut store, &mut warns);
+        for w in &warns {
+            eprintln!("경고: {w}");
+        }
+        owned = d;
+        &owned
+    } else {
+        doc
+    };
+
     let prv_image = hwp_render::render_document(
         doc,
         &hwp_render::RenderOptions {
             dpi: 48.0,
-            ..Default::default()
+            font_dirs: vec![font_dir],
         },
     )
     .ok()

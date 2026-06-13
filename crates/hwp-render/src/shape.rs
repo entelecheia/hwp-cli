@@ -36,6 +36,8 @@ pub struct ShapedRun {
     pub glyphs: Vec<Glyph>,
     pub width_pt: f32,
     pub text: String,
+    /// 이 런의 첫 글자 WCHAR 위치 (줄바꿈 시 글리프→WCHAR 매핑용 — lineseg 합성).
+    pub start_wchar: u32,
 }
 
 impl ShapedRun {
@@ -57,6 +59,7 @@ impl ShapedRun {
             glyphs,
             width_pt,
             text: String::new(), // 부분 런의 원문 추적은 PDF 백엔드(M7)에서
+            start_wchar: self.start_wchar + start as u32, // CJK 1글자=1글리프 가정
         }
     }
 }
@@ -108,6 +111,7 @@ pub fn shape_range(
         shape_id: u16,
         lang: usize,
         text: String,
+        start: u32,
     }
     let mut pieces: Vec<Piece> = Vec::new();
     let mut items: Vec<(usize, InlineItem)> = Vec::new(); // (pieces 삽입 위치, 탭)
@@ -129,6 +133,7 @@ pub fn shape_range(
                             shape_id,
                             lang,
                             text: c.to_string(),
+                            start: pos,
                         }),
                     }
                 }
@@ -139,6 +144,7 @@ pub fn shape_range(
                         shape_id: shape_id_at(para, pos + 8),
                         lang: 0,
                         text: String::new(),
+                        start: pos + 8,
                     });
                 }
                 _ => {} // 컨트롤은 v1 렌더 제외
@@ -163,7 +169,7 @@ pub fn shape_range(
             continue;
         }
         let shape = doc.header.char_shapes.get(piece.shape_id as usize);
-        match shape_piece(store, doc, shape, piece.lang, &piece.text) {
+        match shape_piece(store, doc, shape, piece.lang, &piece.text, piece.start) {
             Some(run) => out.push(InlineItem::Run(run)),
             None => warnings.push(format!("셰이핑 실패: {:?}", piece.text)),
         }
@@ -180,6 +186,7 @@ fn shape_piece(
     shape: Option<&CharShape>,
     lang: usize,
     text: &str,
+    start_wchar: u32,
 ) -> Option<ShapedRun> {
     let default_shape = CharShape::default();
     let cs = shape.unwrap_or(&default_shape);
@@ -229,5 +236,6 @@ fn shape_piece(
         glyphs,
         width_pt: width,
         text: text.to_string(),
+        start_wchar,
     })
 }

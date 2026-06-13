@@ -10,8 +10,8 @@ use std::io::Write as _;
 use std::path::Path;
 
 use hwp_model::{
-    BorderLine, Cell, CharShape, Control, Document, FaceName, HwpChar, LANG_COUNT, LineSeg,
-    OpaqueRecord, ParaShape, Paragraph, Picture, RawEntry, Section, SectionDef, Style, Table,
+    BorderLine, Cell, CharShape, Control, Document, FaceName, HwpChar, LANG_COUNT, OpaqueRecord,
+    ParaShape, Paragraph, Picture, RawEntry, Section, SectionDef, Style, Table,
 };
 
 use crate::codec::{ByteWriter, compress};
@@ -51,7 +51,9 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
         // '손상'으로 판정한다(실기 13차 확정 — bit31 클리어 시 전부 손상,
         // work_rt 5.0.2.4는 재계산하나 5.1.x 정품은 본문 문단 lineseg 100% 보유).
         if synthesize {
-            synthesize_linesegs(&mut d);
+            // 줄 배치(PARA_LINE_SEG)는 hwp-cli가 hwp-render의 폰트 셰이핑으로
+            // 정확히 계산해 IR(para.line_segs)에 미리 채운다(hwp5는 hwp-render를
+            // 역참조할 수 없으므로). 여기서는 채워진 줄 배치를 방출만 한다.
             // hwpx 경유 변환은 ParaShape.attr1(한글 줄나눔·줄격자 비트)·
             // line_spacing_old·border_fill_id 와 구역 첫 문단 break_type=0x03 을
             // 왕복에서 잃는다(hwpx writer/reader가 직렬화/복원하지 않음). 합성
@@ -212,69 +214,6 @@ fn assign_instance_ids(roots: &mut [RecordNode], counter: &mut u32) {
         }
         assign_instance_ids(&mut node.children, counter);
     }
-}
-
-/// 합성 문서(md/hwpx)에 줄 배치(PARA_LINE_SEG)를 합성한다.
-/// 5.1.x 한글은 본문 문단에 줄 배치 캐시가 없으면 글자를 0높이로 그려
-/// '검은 바'/'빈 내용'으로 표시한다(13차 실기 확정). 정품 5.1.x는 본문
-/// 문단 lineseg 100% 보유. 현재는 문단당 1줄(단일 seg) — 한 줄에 들어가는
-/// 문단은 정확하고, 여러 줄 문단은 세로 위치가 근사된다(후속: 폰트 셰이핑).
-fn synthesize_linesegs(doc: &mut Document) {
-    let char_shapes = doc.header.char_shapes.clone();
-    for section in &mut doc.sections {
-        let body_width = section
-            .section_def()
-            .and_then(|sd| sd.page.as_ref())
-            .map_or(42520, |pg| pg.width.0 - pg.margin_left.0 - pg.margin_right.0);
-        let mut v_pos = 0i32;
-        for para in &mut section.paragraphs {
-            synth_para_lineseg(para, &char_shapes, body_width, &mut v_pos);
-            // 표 셀 안 문단도 줄 배치가 필요하다(정품 셀 문단 lineseg 보유).
-            for control in &mut para.controls {
-                if let Control::Table(t) = control {
-                    for cell in &mut t.cells {
-                        let cw =
-                            (cell.width.0 - i32::from(cell.margins[0]) - i32::from(cell.margins[1]))
-                                .max(1);
-                        let mut cell_v = 0i32;
-                        for cp in &mut cell.paragraphs {
-                            synth_para_lineseg(cp, &char_shapes, cw, &mut cell_v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// 문단에 단일 줄 배치를 합성하고 세로 커서(v_pos)를 진행시킨다.
-/// 정품 가나다 실측 공식: line_height=text_height=글자크기(base_size),
-/// baseline_gap=base×0.85, line_spacing=base×0.6(줄간격 160%), seg_width=본문폭,
-/// flags=0x00060000(페이지/컬럼 첫 줄).
-fn synth_para_lineseg(
-    para: &mut Paragraph,
-    char_shapes: &[CharShape],
-    body_width: i32,
-    v_pos: &mut i32,
-) {
-    let base = para
-        .char_shape_runs
-        .first()
-        .and_then(|(_, id)| char_shapes.get(id.0 as usize))
-        .map_or(1000, |cs| if cs.base_size > 0 { cs.base_size } else { 1000 });
-    let line_spacing = base * 60 / 100;
-    para.line_segs = vec![LineSeg {
-        text_start: 0,
-        v_pos: *v_pos,
-        line_height: base,
-        text_height: base,
-        baseline_gap: base * 85 / 100,
-        line_spacing,
-        col_start: 0,
-        seg_width: body_width.max(1),
-        flags: 0x0006_0000,
-    }];
-    *v_pos += base + line_spacing;
 }
 
 /// 합성(md/hwpx 출신) 문서의 ParaShape에 정상 표본 기준값을 보정 주입한다.

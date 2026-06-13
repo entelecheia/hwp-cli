@@ -11,6 +11,7 @@ pub mod display;
 pub mod error;
 pub mod fonts;
 pub mod layout;
+pub mod lineseg;
 pub mod png;
 pub mod shape;
 pub mod svg;
