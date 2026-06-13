@@ -621,6 +621,34 @@ fn emit_doc_info(doc: &Document, _warnings: &mut Vec<String>) -> Vec<RecordNode>
         data: w.into_bytes(),
         children,
     });
+
+    // 5.1.x 합성 문서는 COMPATIBLE_DOCUMENT 서브트리가 필수. 정품(가나다.hwp
+    // 5.1.1.0, hello_world 5.1.0.1)은 모두 보유하나 구버전(work_report 5.0.2.4)은
+    // 면제. 누락 시 한글이 '손상/변조'로 거부. hwp5 원본 왕복은 h.extras로
+    // 보존되므로(아래 extend), 합성 경로이고 원본에 없을 때만 추가.
+    let synth = doc.meta.source_format != "hwp5";
+    let has_compat = h.extras.iter().any(|r| r.tag == tag::COMPATIBLE_DOCUMENT);
+    if synth && !has_compat {
+        let mut trackchange = vec![0u8; 1032];
+        trackchange[0] = 0x38; // 표본(가나다/hello_world) 실측: 선두 0x38, 나머지 0
+        roots.push(RecordNode {
+            tag: tag::COMPATIBLE_DOCUMENT,
+            data: vec![0u8; 4], // 대상 프로그램 0
+            children: vec![
+                RecordNode {
+                    tag: tag::LAYOUT_COMPATIBILITY,
+                    data: vec![0u8; 20],
+                    children: Vec::new(),
+                },
+                RecordNode {
+                    tag: tag::TRACKCHANGE,
+                    data: trackchange,
+                    children: Vec::new(),
+                },
+            ],
+        });
+    }
+
     roots.extend(h.extras.iter().map(opaque_to_node));
     roots
 }

@@ -31,6 +31,19 @@ fn 합성_문서_한글_규격_충족() {
         "NUMBERING dangling reference"
     );
 
+    // 1b. COMPATIBLE_DOCUMENT(0x1E) 존재 — 5.1.x 필수 (한글 정품 가나다·hello_world 보유)
+    let mut c0 = hwp5::Hwp5Container::open(&out).unwrap();
+    let di0 = c0.read_record_stream("/DocInfo").unwrap();
+    let scan = hwp5::record::scan_stream(&di0, hwp5::record::ScanMode::Tolerant).unwrap();
+    let compat = scan
+        .roots
+        .iter()
+        .find(|r| r.tag == 0x1E)
+        .expect("COMPATIBLE_DOCUMENT");
+    let child_tags: Vec<u16> = compat.children.iter().map(|c| c.tag).collect();
+    assert!(child_tags.contains(&0x1F), "LAYOUT_COMPATIBILITY 자식");
+    assert!(child_tags.contains(&0x20), "TRACKCHANGE 자식");
+
     // 2. secd 필수 자식: 각주/미주 모양 + 쪽 테두리 3종
     let secd = d.sections[0].section_def().expect("구역 정의");
     let footnotes = secd.extras.iter().filter(|e| e.tag == 0x4A).count();
