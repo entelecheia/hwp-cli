@@ -60,16 +60,21 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
     // (sample_m6 5.1.0.1·halla 5.1.1.0 실증). pre-5.0.3.2(work_report 5.0.2.4)는
     // 22B가 정답이므로 게이트 false.
     let add_tracking_tail = parse_version(&doc.meta.source_version).to_u32() >= 0x05_00_03_02;
+    // 문단 고유 ID 카운터 — 합성 문단(instance_id=0)에 non-zero 유니크 값 부여.
+    // 한글은 instance_id=0을 비정상으로 보고 '손상/변조' 판정(표본은 전부 non-zero).
+    // hwp5 원본 왕복은 원본 instance_id(0 포함)를 보존해야 바이트 동일하므로 제외.
+    let synthesize = doc.meta.source_format != "hwp5";
+    let mut inst_counter = 0x1000_0000u32;
     let sections: Vec<Vec<u8>> = doc
         .sections
         .iter()
         .map(|s| {
-            RecordNode::serialize_forest(&emit_section(
-                s,
-                opts.preserve_linesegs,
-                add_tracking_tail,
-                &mut warnings,
-            ))
+            let mut roots =
+                emit_section(s, opts.preserve_linesegs, add_tracking_tail, &mut warnings);
+            if synthesize {
+                assign_instance_ids(&mut roots, &mut inst_counter);
+            }
+            RecordNode::serialize_forest(&roots)
         })
         .collect();
 
@@ -168,6 +173,22 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
     }
     cfb.flush()?;
     Ok(warnings)
+}
+
+/// PARA_HEADER instance_id(offset 18~22)가 0이면 유니크 non-zero 값을 부여.
+/// 레코드 트리를 재귀 순회 — 표 셀/글상자 안 문단도 포함.
+fn assign_instance_ids(roots: &mut [RecordNode], counter: &mut u32) {
+    for node in roots {
+        if node.tag == tag::PARA_HEADER && node.data.len() >= 22 {
+            let inst =
+                u32::from_le_bytes([node.data[18], node.data[19], node.data[20], node.data[21]]);
+            if inst == 0 {
+                *counter = counter.wrapping_add(1);
+                node.data[18..22].copy_from_slice(&counter.to_le_bytes());
+            }
+        }
+        assign_instance_ids(&mut node.children, counter);
+    }
 }
 
 /// hwp5로 쓸 수 없는 그림(SHAPE_COMPONENT 레코드 부재)이 있는지.
@@ -492,8 +513,10 @@ fn emit_doc_info(doc: &Document, _warnings: &mut Vec<String>) -> Vec<RecordNode>
     // DOCUMENT_PROPERTIES — 구역 수는 실제 섹션 수에서 유도
     let mut w = ByteWriter::new();
     w.write_u16(doc.sections.len().max(1) as u16);
+    // 시작 번호(쪽/각주/미주/그림/표/수식)는 최소 1. 합성 문서는 전부 0인데
+    // 한글은 쪽 번호 0을 비정상으로 보고 '손상/변조' 판정 (표본 전부 1).
     for n in h.properties.start_numbers {
-        w.write_u16(n);
+        w.write_u16(n.max(1));
     }
     w.write_u32(h.properties.caret.0);
     w.write_u32(h.properties.caret.1);
