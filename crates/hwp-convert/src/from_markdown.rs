@@ -220,16 +220,35 @@ impl Builder {
     }
 
     fn flush_paragraph(&mut self) {
-        if self.chars.is_empty() && self.runs.is_empty() {
+        self.flush_paragraph_inner(false);
+    }
+
+    /// 문단을 닫는다. `force`면 내용이 없어도 빈 문단을 만든다.
+    ///
+    /// 표 셀은 반드시 문단을 1개 이상 가져야 한다(LIST_HEADER nparas≥1).
+    /// 빈 markdown 셀(`| |`)을 그냥 흘리면 셀에 PARA_HEADER가 하나도 안 붙어
+    /// nparas=0 셀이 되고, 한글이 이를 '손상'으로 거부한다. 셀 종료 시 force=true로
+    /// 호출해 빈 셀도 빈 문단을 갖게 한다.
+    fn flush_paragraph_inner(&mut self, force: bool) {
+        if self.chars.is_empty() && self.runs.is_empty() && !force {
             return;
         }
         // 문단끝 문자(0x0d)·nchars bit31·char_shape run 병합 등 한글 문단 불변식은
         // hwp5 writer(emit_paragraph)가 합성 경로 전체(md+hwpx)에 일원 적용한다.
+        // 단, 모든 문단은 PARA_CHAR_SHAPE를 1개 이상 가져야 한다(정품 전수:
+        // PARA_HEADER 수 == PARA_CHAR_SHAPE 수, 빈 셀 문단도 (0,id) run 1개 보유).
+        // writer는 char_shape_runs가 비면 PARA_CHAR_SHAPE를 아예 방출하지 않으므로,
+        // 빈 문단(force로 만든 빈 셀 등)은 여기서 (0, 본문모양) run 1개를 채운다.
+        // 누락 시 한글이 '손상'으로 거부하고 pyhwp 파서도 크래시한다.
+        let mut runs = std::mem::take(&mut self.runs);
+        if runs.is_empty() {
+            runs.push((0, CharShapeId(self.current_shape())));
+        }
         let para = Paragraph {
             para_shape: ParaShapeId(if self.heading.is_some() { 1 } else { 0 }),
             style: StyleId(self.style),
             chars: std::mem::take(&mut self.chars),
-            char_shape_runs: std::mem::take(&mut self.runs),
+            char_shape_runs: runs,
             ..Paragraph::default()
         };
         self.wchar_pos = 0;
@@ -312,7 +331,8 @@ impl Builder {
                 }
             }
             Event::End(TagEnd::TableCell) => {
-                self.flush_paragraph();
+                // 빈 셀도 문단 1개를 반드시 만든다(nparas≥1 보장 + 열 수 정합).
+                self.flush_paragraph_inner(true);
                 self.bold = false;
             }
             Event::End(TagEnd::Table) => {
@@ -446,7 +466,19 @@ fn table_paragraph(tb: TableBuilder) -> Paragraph {
                 margins: [510, 510, 141, 141],
                 border_fill: BorderFillId(TABLE_BORDER_FILL),
                 header_tail: Vec::new(),
-                paragraphs: row.get(c).cloned().map(|p| vec![p]).unwrap_or_default(),
+                // 셀은 문단 1개 이상 필수(nparas≥1). 짧은 행에서 누락된 칸은
+                // 빈 문단으로 채운다 — nparas=0 셀은 한글이 손상 처리한다. 채움
+                // 문단도 PARA_CHAR_SHAPE run 1개를 가져야 한다(정품 전수 불변식,
+                // writer는 char_shape_runs가 비면 레코드를 방출하지 않음).
+                paragraphs: row.get(c).cloned().map_or_else(
+                    || {
+                        vec![Paragraph {
+                            char_shape_runs: vec![(0, CharShapeId(0))],
+                            ..Paragraph::default()
+                        }]
+                    },
+                    |p| vec![p],
+                ),
             });
         }
     }

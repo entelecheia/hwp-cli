@@ -112,6 +112,56 @@ fn 합성_문단_본문_구조_정품_동형() {
     );
 }
 
+/// 빈 셀을 포함한 GFM 표 → 모든 표 셀 LIST_HEADER 의 nparas ≥ 1.
+///
+/// 셀에 PARA_HEADER 가 하나도 안 붙으면(nparas=0) 한글이 문서를 '손상'으로
+/// 거부한다(M6-md생성.hwp 구 산출물의 실제 결함). from_markdown 은 셀 종료 시
+/// flush_paragraph_inner(force=true) 와 누락 칸 vec![Paragraph::default()]
+/// 충전으로 nparas≥1 을 보장한다. 짧은 행·빈 셀·헤더-only 표 모두 검증.
+#[test]
+fn 표_빈셀_포함_모든_셀_nparas_1이상() {
+    // 빈 셀(`| |`)·짧은 행(2칸 < 3열 헤더)·헤더 only 행을 모두 포함.
+    let doc = hwp_convert::from_markdown(
+        "|  |  |  |\n| --- | --- | --- |\n| a |  |  |\n| b | c |\n",
+    );
+    let out = tmp("synth_empty_cell.hwp");
+    hwp5::write_document(&doc, &out, &hwp5::WriteOptions::default()).unwrap();
+
+    let mut c = hwp5::Hwp5Container::open(&out).unwrap();
+    let bt = c.read_record_stream("/BodyText/Section0").unwrap();
+
+    let list_headers = all_records(&bt, 0x48); // LIST_HEADER
+    assert!(!list_headers.is_empty(), "표 셀 LIST_HEADER 가 있어야");
+    for (i, lh) in list_headers.iter().enumerate() {
+        let nparas = i32::from_le_bytes([lh[0], lh[1], lh[2], lh[3]]);
+        assert!(
+            nparas >= 1,
+            "LIST_HEADER #{i}: nparas={nparas} — 빈 셀에도 문단 1개 필수(한글 손상 방지)"
+        );
+    }
+}
+
+/// 스트림에서 특정 태그 레코드들의 페이로드 목록.
+fn all_records(data: &[u8], tag: u16) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= data.len() {
+        let h = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        let t = (h & 0x3FF) as u16;
+        let mut sz = h >> 20;
+        let mut hl = 4;
+        if sz == 0xFFF {
+            sz = u32::from_le_bytes([data[i + 4], data[i + 5], data[i + 6], data[i + 7]]);
+            hl = 8;
+        }
+        if t == tag {
+            out.push(data[i + hl..i + hl + sz as usize].to_vec());
+        }
+        i += hl + sz as usize;
+    }
+    out
+}
+
 /// 스트림에서 특정 태그의 첫 레코드 페이로드.
 fn first_record(data: &[u8], tag: u16) -> Option<Vec<u8>> {
     let mut i = 0usize;
