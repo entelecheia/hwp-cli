@@ -10,8 +10,8 @@ use std::io::Write as _;
 use std::path::Path;
 
 use hwp_model::{
-    BorderLine, Cell, CharShape, Control, Document, FaceName, HwpChar, LANG_COUNT, OpaqueRecord,
-    ParaShape, Paragraph, Picture, RawEntry, Section, SectionDef, Style, Table,
+    BorderLine, Cell, CharShape, Control, Document, FaceName, HwpChar, LANG_COUNT, LineSeg,
+    OpaqueRecord, ParaShape, Paragraph, Picture, RawEntry, Section, SectionDef, Style, Table,
 };
 
 use crate::codec::{ByteWriter, compress};
@@ -37,13 +37,21 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
 
     // hwpx 출신 문서 정규화: hwp5 레코드(SHAPE_COMPONENT)가 없는 그림은
     // 쓸 수 없으므로 컨트롤과 확장 문자를 동기 제거한다
+    let synthesize = doc.meta.source_format != "hwp5";
     let normalized;
-    let doc = if needs_normalize(doc) {
+    let doc = if needs_normalize(doc) || synthesize {
         let mut d = doc.clone();
         for section in &mut d.sections {
             for para in &mut section.paragraphs {
                 strip_unwritable_pictures(para, &mut warnings);
             }
+        }
+        // 합성 5.1.x 문서: 줄 배치(PARA_LINE_SEG)를 합성한다. 5.1.x는 줄 배치
+        // 캐시가 없으면 한글이 본문을 0높이로 그려 '검은 바'/'빈 내용', 심하면
+        // '손상'으로 판정한다(실기 13차 확정 — bit31 클리어 시 전부 손상,
+        // work_rt 5.0.2.4는 재계산하나 5.1.x 정품은 본문 문단 lineseg 100% 보유).
+        if synthesize {
+            synthesize_linesegs(&mut d);
         }
         normalized = d;
         &normalized
@@ -63,7 +71,6 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
     // 문단 고유 ID 카운터 — 합성 문단(instance_id=0)에 non-zero 유니크 값 부여.
     // 한글은 instance_id=0을 비정상으로 보고 '손상/변조' 판정(표본은 전부 non-zero).
     // hwp5 원본 왕복은 원본 instance_id(0 포함)를 보존해야 바이트 동일하므로 제외.
-    let synthesize = doc.meta.source_format != "hwp5";
     let mut inst_counter = 0x1000_0000u32;
     let sections: Vec<Vec<u8>> = doc
         .sections
@@ -194,6 +201,69 @@ fn assign_instance_ids(roots: &mut [RecordNode], counter: &mut u32) {
         }
         assign_instance_ids(&mut node.children, counter);
     }
+}
+
+/// 합성 문서(md/hwpx)에 줄 배치(PARA_LINE_SEG)를 합성한다.
+/// 5.1.x 한글은 본문 문단에 줄 배치 캐시가 없으면 글자를 0높이로 그려
+/// '검은 바'/'빈 내용'으로 표시한다(13차 실기 확정). 정품 5.1.x는 본문
+/// 문단 lineseg 100% 보유. 현재는 문단당 1줄(단일 seg) — 한 줄에 들어가는
+/// 문단은 정확하고, 여러 줄 문단은 세로 위치가 근사된다(후속: 폰트 셰이핑).
+fn synthesize_linesegs(doc: &mut Document) {
+    let char_shapes = doc.header.char_shapes.clone();
+    for section in &mut doc.sections {
+        let body_width = section
+            .section_def()
+            .and_then(|sd| sd.page.as_ref())
+            .map_or(42520, |pg| pg.width.0 - pg.margin_left.0 - pg.margin_right.0);
+        let mut v_pos = 0i32;
+        for para in &mut section.paragraphs {
+            synth_para_lineseg(para, &char_shapes, body_width, &mut v_pos);
+            // 표 셀 안 문단도 줄 배치가 필요하다(정품 셀 문단 lineseg 보유).
+            for control in &mut para.controls {
+                if let Control::Table(t) = control {
+                    for cell in &mut t.cells {
+                        let cw =
+                            (cell.width.0 - i32::from(cell.margins[0]) - i32::from(cell.margins[1]))
+                                .max(1);
+                        let mut cell_v = 0i32;
+                        for cp in &mut cell.paragraphs {
+                            synth_para_lineseg(cp, &char_shapes, cw, &mut cell_v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 문단에 단일 줄 배치를 합성하고 세로 커서(v_pos)를 진행시킨다.
+/// 정품 가나다 실측 공식: line_height=text_height=글자크기(base_size),
+/// baseline_gap=base×0.85, line_spacing=base×0.6(줄간격 160%), seg_width=본문폭,
+/// flags=0x00060000(페이지/컬럼 첫 줄).
+fn synth_para_lineseg(
+    para: &mut Paragraph,
+    char_shapes: &[CharShape],
+    body_width: i32,
+    v_pos: &mut i32,
+) {
+    let base = para
+        .char_shape_runs
+        .first()
+        .and_then(|(_, id)| char_shapes.get(id.0 as usize))
+        .map_or(1000, |cs| if cs.base_size > 0 { cs.base_size } else { 1000 });
+    let line_spacing = base * 60 / 100;
+    para.line_segs = vec![LineSeg {
+        text_start: 0,
+        v_pos: *v_pos,
+        line_height: base,
+        text_height: base,
+        baseline_gap: base * 85 / 100,
+        line_spacing,
+        col_start: 0,
+        seg_width: body_width.max(1),
+        flags: 0x0006_0000,
+    }];
+    *v_pos += base + line_spacing;
 }
 
 /// hwp5로 쓸 수 없는 그림(SHAPE_COMPONENT 레코드 부재)이 있는지.
@@ -943,10 +1013,10 @@ fn emit_paragraph(
     w.write_u16(range_tags);
     // 줄 배치(PARA_LINE_SEG) 개수.
     // - preserve_linesegs(=hwp5 무수정 왕복): 원본 그대로 보존(바이트 동일 게이트).
-    // - 그 외(합성: md/hwpx 출신): 0. 한글은 줄 배치 캐시가 내용과 어긋나면
-    //   '변조' 경고를 내므로(7f7f63d), 정확한 레이아웃을 계산하지 않는 한
-    //   합성하지 않는다. lineseg 부재 자체는 한글이 허용한다(work_rt 실기 통과).
-    let seg_count = if preserve_linesegs {
+    // - synthesize(=md/hwpx 합성): synthesize_linesegs가 채운 줄 배치를 방출.
+    //   5.1.x는 줄 배치 캐시가 없으면 본문이 안 그려진다(13차 실기).
+    let emit_lineseg = synthesize || preserve_linesegs;
+    let seg_count = if emit_lineseg {
         para.line_segs.len()
     } else {
         0
@@ -986,7 +1056,7 @@ fn emit_paragraph(
             children: Vec::new(),
         });
     }
-    if preserve_linesegs && !para.line_segs.is_empty() {
+    if emit_lineseg && !para.line_segs.is_empty() {
         let mut lw = ByteWriter::new();
         for seg in &para.line_segs {
             lw.write_u32(seg.text_start);
