@@ -41,6 +41,11 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
     let normalized;
     let doc = if needs_normalize(doc) || synthesize {
         let mut d = doc.clone();
+        // hwpx/md 출신 이미지에 hwp5 도형 레코드(SHAPE_COMPONENT + 그림)를 먼저
+        // 합성한다 — 합성되면 extras가 채워져 아래 strip이 드롭하지 않는다.
+        if synthesize {
+            synthesize_pictures(&mut d, &mut warnings);
+        }
         for section in &mut d.sections {
             for para in &mut section.paragraphs {
                 strip_unwritable_pictures(para, &mut warnings);
@@ -288,6 +293,186 @@ fn needs_normalize(doc: &Document) -> bool {
         .iter()
         .flat_map(|s| &s.paragraphs)
         .any(para_has)
+}
+
+// ── hwpx/md 출신 이미지의 hwp5 도형 레코드 합성 ───────────────────────────
+//
+// hwpx의 `<hp:pic>`은 IR Picture(extras 비어 있음)로 읽힌다. hwp5는 그림을
+// gso CTRL_HEADER → SHAPE_COMPONENT → SHAPE_COMPONENT_PICTURE 트리 + BIN_DATA
+// 항목 + BinData 스트림으로 저장한다. 정품 work_report.hwp의 이미지 레코드를
+// 템플릿으로 쓰고 크기·모서리·BinItem ID만 패치한다(단위 변환행렬은 크기
+// 무관). 합성 후 extras가 채워져 strip이 드롭하지 않는다.
+
+/// gso CTRL_HEADER 공통 속성 40B (" osg" 이후). width@12, height@16.
+const GSO_COMMON_TEMPLATE: &str =
+    "11232a04000000000000000038220000ec040000040000000000000000000000d507bf6d00000000";
+/// SHAPE_COMPONENT 196B. width@20/28, height@24/32.
+const SHAPE_COMPONENT_TEMPLATE: &str = "636970246369702400000000000000000000010038220000ec04000038220000ec0400000000082400001c110000760200000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000";
+/// SHAPE_COMPONENT_PICTURE. 모서리/자르기 = width/height, BinItem ID@71.
+/// work_report(5.0.2.4) 78B(border12+rect32+clip16+padding8+picture5+
+/// 투명1+instance_id4) 뒤에 picture_effect flags(4B=0)을 덧붙여 82B로 만든다 —
+/// 5.0.3.4+ 그림 개체는 picture_effect가 필수다(pyhwp ShapePicture 버전 게이트).
+/// 누락 시 한글/pyhwp가 레코드를 짧게 읽어 거부.
+const PICTURE_TEMPLATE: &str = "0000000000000000000000000000000000000000382200000000000038220000ec04000000000000ec040000000000000000000038220000ec0400000000000000000000000000010000d607bf2d00000000";
+
+fn hex_to_bytes(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("템플릿 hex"))
+        .collect()
+}
+
+/// 정품 템플릿을 크기·BinItem ID로 패치해 그림 extras(SHAPE_COMPONENT +
+/// 그 자식 SHAPE_COMPONENT_PICTURE)를 만든다.
+fn build_picture_extras(width: i32, height: i32, bin_id: u16) -> Vec<OpaqueRecord> {
+    let w = width.to_le_bytes();
+    let h = height.to_le_bytes();
+    let mut sc = hex_to_bytes(SHAPE_COMPONENT_TEMPLATE);
+    sc[20..24].copy_from_slice(&w); // 폭
+    sc[24..28].copy_from_slice(&h); // 높이
+    sc[28..32].copy_from_slice(&w); // 폭(초기)
+    sc[32..36].copy_from_slice(&h); // 높이(초기)
+    let mut pic = hex_to_bytes(PICTURE_TEMPLATE);
+    pic[20..24].copy_from_slice(&w); // 꼭지점1.x
+    pic[28..32].copy_from_slice(&w); // 꼭지점2.x
+    pic[32..36].copy_from_slice(&h); // 꼭지점2.y
+    pic[40..44].copy_from_slice(&h); // 꼭지점3.y
+    pic[52..56].copy_from_slice(&w); // 자르기 우
+    pic[56..60].copy_from_slice(&h); // 자르기 하
+    pic[71..73].copy_from_slice(&bin_id.to_le_bytes()); // BinItem ID
+    vec![OpaqueRecord {
+        tag: tag::SHAPE_COMPONENT,
+        data: sc,
+        children: vec![OpaqueRecord {
+            tag: tag::SHAPE_COMPONENT_PICTURE,
+            data: pic,
+            children: Vec::new(),
+        }],
+    }]
+}
+
+/// 합성 문서의 hwpx 출신 이미지에 도형 레코드 + BIN_DATA 항목을 채운다.
+fn synthesize_pictures(doc: &mut Document, warnings: &mut Vec<String>) {
+    let bin_names: Vec<String> = doc.bin_streams.iter().map(|b| b.name.clone()).collect();
+    if bin_names.is_empty() {
+        return;
+    }
+    let mut next_id: u16 = doc
+        .header
+        .bin_data
+        .iter()
+        .filter_map(|b| b.storage_id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    // bin_stream별 부여된 storage_id (여러 그림이 같은 이미지를 공유하면 재사용).
+    let mut assigned: Vec<Option<u16>> = vec![None; bin_names.len()];
+    let mut new_items: Vec<hwp_model::BinDataItem> = Vec::new();
+    // (bin_stream 인덱스, 새 이름)
+    let mut renames: Vec<(usize, String)> = Vec::new();
+
+    for section in &mut doc.sections {
+        for para in &mut section.paragraphs {
+            synth_pictures_para(
+                para,
+                &bin_names,
+                &mut assigned,
+                &mut next_id,
+                &mut new_items,
+                &mut renames,
+                warnings,
+            );
+        }
+    }
+    for item in new_items {
+        doc.header.bin_data.push(item);
+    }
+    for (idx, new_name) in renames {
+        doc.bin_streams[idx].name = new_name;
+    }
+}
+
+/// 한 문단(및 표 셀·글상자 재귀)의 빈 extras 그림에 도형 레코드를 합성한다.
+#[allow(clippy::too_many_arguments)]
+fn synth_pictures_para(
+    para: &mut Paragraph,
+    bin_names: &[String],
+    assigned: &mut [Option<u16>],
+    next_id: &mut u16,
+    new_items: &mut Vec<hwp_model::BinDataItem>,
+    renames: &mut Vec<(usize, String)>,
+    warnings: &mut Vec<String>,
+) {
+    for control in &mut para.controls {
+        match control {
+            Control::Picture(p) if p.extras.is_empty() => {
+                let item_ref = match &p.bin_ref {
+                    hwp_model::BinRef::ItemRef(s) => s.clone(),
+                    hwp_model::BinRef::Id(_) => String::new(),
+                };
+                // ItemRef가 파일명에 들어 있는 스트림, 없으면 첫 스트림. 같은
+                // 이미지를 여러 그림이 참조할 수 있으므로 배타 사용하지 않는다.
+                let pick = bin_names
+                    .iter()
+                    .position(|n| !item_ref.is_empty() && n.contains(&item_ref))
+                    .or(if bin_names.is_empty() { None } else { Some(0) });
+                let Some(idx) = pick else {
+                    warnings.push("이미지 바이너리 스트림을 찾지 못해 생략".to_string());
+                    continue;
+                };
+                // 같은 스트림에 이미 storage_id가 있으면 재사용(공유 이미지).
+                let sid = match assigned[idx] {
+                    Some(s) => s,
+                    None => {
+                        let s = *next_id;
+                        *next_id += 1;
+                        assigned[idx] = Some(s);
+                        let ext = bin_names[idx]
+                            .rsplit('.')
+                            .next()
+                            .filter(|e| !e.contains('/'))
+                            .unwrap_or("png")
+                            .to_ascii_lowercase();
+                        new_items.push(hwp_model::BinDataItem {
+                            attr: 1, // 임베딩
+                            storage_id: Some(s),
+                            extension: Some(ext.clone()),
+                            ..Default::default()
+                        });
+                        renames.push((idx, format!("BinData/BIN{s:04X}.{ext}")));
+                        s
+                    }
+                };
+                // gso 개체 공통 속성도 정품 템플릿(40B)으로 채운다 — emit_picture가
+                // common_data 비면 최소 합성(불완전 flags)을 써 한글/pyhwp가 거부.
+                let mut common = hex_to_bytes(GSO_COMMON_TEMPLATE);
+                common[12..16].copy_from_slice(&p.width.0.to_le_bytes());
+                common[16..20].copy_from_slice(&p.height.0.to_le_bytes());
+                p.common_data = common;
+                p.extras = build_picture_extras(p.width.0, p.height.0, sid);
+                p.bin_ref = hwp_model::BinRef::Id(hwp_model::BinDataId(sid));
+            }
+            Control::Table(t) => {
+                for cell in &mut t.cells {
+                    for cp in &mut cell.paragraphs {
+                        synth_pictures_para(
+                            cp, bin_names, assigned, next_id, new_items, renames, warnings,
+                        );
+                    }
+                }
+            }
+            Control::Generic(g) => {
+                for list in &mut g.paragraph_lists {
+                    for lp in &mut list.paragraphs {
+                        synth_pictures_para(
+                            lp, bin_names, assigned, next_id, new_items, renames, warnings,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// hwp5 레코드가 없는 그림 컨트롤을 확장 문자와 동기 제거하고
@@ -1390,5 +1575,54 @@ fn emit_picture(pic: &Picture, warnings: &mut Vec<String>) -> RecordNode {
         tag: tag::CTRL_HEADER,
         data: w.into_bytes(),
         children,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// hwpx 출신 이미지의 합성 도형 레코드가 정품 5.1.x 구조여야 한다.
+    /// SHAPE_COMPONENT(196B, "$pic") → SHAPE_COMPONENT_PICTURE(82B, 5.0.3.4+
+    /// picture_effect 포함). 크기·BinItem ID 패치 확인.
+    #[test]
+    fn 그림_extras_합성_구조() {
+        let extras = build_picture_extras(8760, 1260, 1);
+        assert_eq!(extras.len(), 1, "SHAPE_COMPONENT 1개");
+        let sc = &extras[0];
+        assert_eq!(sc.tag, tag::SHAPE_COMPONENT);
+        assert_eq!(sc.data.len(), 196, "SHAPE_COMPONENT 196B");
+        assert_eq!(&sc.data[0..4], b"cip$", "chid = $pic(역순)");
+        assert_eq!(
+            i32::from_le_bytes(sc.data[20..24].try_into().unwrap()),
+            8760
+        );
+        assert_eq!(
+            i32::from_le_bytes(sc.data[24..28].try_into().unwrap()),
+            1260
+        );
+
+        assert_eq!(sc.children.len(), 1, "SHAPE_COMPONENT_PICTURE 자식");
+        let pic = &sc.children[0];
+        assert_eq!(pic.tag, tag::SHAPE_COMPONENT_PICTURE);
+        assert_eq!(
+            pic.data.len(),
+            82,
+            "PICTURE 82B (5.1.x: picture_effect 포함)"
+        );
+        assert_eq!(
+            u16::from_le_bytes(pic.data[71..73].try_into().unwrap()),
+            1,
+            "BinItem ID @71"
+        );
+        // 꼭지점2 = (width, height)
+        assert_eq!(
+            i32::from_le_bytes(pic.data[28..32].try_into().unwrap()),
+            8760
+        );
+        assert_eq!(
+            i32::from_le_bytes(pic.data[32..36].try_into().unwrap()),
+            1260
+        );
     }
 }
