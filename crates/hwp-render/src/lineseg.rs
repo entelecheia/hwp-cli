@@ -8,13 +8,21 @@
 //!
 //! 정확도의 핵심은 한글과 동일한 폰트(함초롬바탕)로 셰이핑하는 것이다.
 
-use hwp_model::{Control, Document, LineSeg, Paragraph};
+use hwp_model::{Control, Document, LineSeg, Paragraph, Table};
 
 use crate::fonts::FontStore;
 use crate::shape::{InlineItem, shape_range};
 
 /// 탭 간격 (pt) — layout.rs place_wrapped와 동일해야 한다.
 const TAB_INTERVAL_PT: f32 = 40.0;
+
+/// 표 블록의 고정 세로 여유 (HWPUNIT). 정품 한글이 표 전체에 더하는 상수.
+///
+/// 정품 실측(첫째 문단입니다.hwp 5.1.1.0, work_report.hwp 5.0.2.4)에서 두
+/// 파일 모두 `표 advance − Σ행높이 = 566`으로 일치한다(=2.0mm, 566.93 HWPUNIT).
+/// 표 안쪽 위/아래 여백(상141·하141)·셀 좌우여백과 무관하게 같은 값이라,
+/// 행 높이 합산과 별도로 표마다 한 번 더해지는 표 고유의 외곽 여유로 본다.
+const TABLE_BLOCK_PADDING: i32 = 566;
 
 /// 합성 문서 전체에 줄 배치를 합성한다 (본문·표 셀 문단).
 /// `store`는 함초롬바탕이 로드된 FontStore여야 한글과 줄바꿈이 일치한다.
@@ -27,10 +35,27 @@ pub fn synthesize_linesegs(doc: &mut Document, store: &mut FontStore, warnings: 
             .map_or(42520, |pg| pg.width.0 - pg.margin_left.0 - pg.margin_right.0);
         let mut v_pos = 0i32;
         for pi in 0..doc.sections[si].paragraphs.len() {
+            // 표 앵커 문단의 줄 배치는 진입 시점 커서(=직전 문단 누적 후)에 놓인다.
+            // 정품 첫째문단.hwp: 본문 문단(advance 1600) → 표 앵커 문단 v_pos=1600.
+            let anchor_v = v_pos;
             let src = &snap.sections[si].paragraphs[pi];
             let segs = compute_linesegs(store, &snap, src, body_width, &mut v_pos, warnings);
             doc.sections[si].paragraphs[pi].line_segs = segs;
+            // 셀 안 문단 줄 배치를 먼저 채운다(셀 줄 수를 표 높이 계산이 읽어야 한다).
             fill_nested(si, pi, &snap, doc, store, warnings);
+            // 표가 있는 문단은 한 줄(line_advance)이 아니라 표 높이만큼 커서를 내려야
+            // 다음 본문 문단이 표와 겹치지 않는다(겹치면 한글이 '손상' 판정). 앵커
+            // 문단은 compute_linesegs가 이미 line_advance를 1회 더했으므로, 커서를
+            // 진입값 + 표 높이로 덮어쓴다(여러 표가 한 문단에 있으면 높이를 누적).
+            let mut table_total = 0i32;
+            for ctrl in &doc.sections[si].paragraphs[pi].controls {
+                if let Control::Table(t) = ctrl {
+                    table_total += table_height(t);
+                }
+            }
+            if table_total > 0 {
+                v_pos = anchor_v + table_total;
+            }
         }
     }
 }
@@ -72,6 +97,69 @@ fn fill_nested(
                 }
             }
         }
+    }
+}
+
+/// 표 한 개의 세로 높이(HWPUNIT)를 정품 한글 규칙으로 계산한다.
+///
+/// 셀 안 문단의 줄 배치(line_segs)는 이 함수 호출 전에 fill_nested가 채워 둔다.
+/// 정품 실측(첫째 문단입니다.hwp·work_report.hwp)으로 도출한 공식:
+///
+/// ```text
+/// 행 높이 rowH = cell.top_margin + cell.bottom_margin + 줄블록
+/// 줄블록(N줄) = (마지막 줄.v_pos) + (마지막 줄.line_height)
+///            = (N-1)*line_advance + line_height
+/// 표 높이 = Σ_행 max(rowH over 그 행의 셀) + TABLE_BLOCK_PADDING(566)
+/// ```
+///
+/// 근거: 첫째문단.hwp(3행, 셀 1줄, 여백 상141/하141, lh=1000, la=1600)
+/// → 3*(141+1000+141)+566 = 4412 = 정품 표 advance(6012−1600). work_report.hwp
+/// 첫 표(1행 2열, 한 셀 2줄)도 (141+(3200+2000)+141)+566 = 5482+566 = 6048 = 정품
+/// advance와 일치. 두 파일 모두 상수 566(=2.0mm)으로 떨어진다.
+///
+/// 병합 셀(row_span>1)은 시작 행 하나에만 높이를 싣지 않고 건너뛴다(각 행의
+/// row_span==1 셀들로 행 높이를 잡는다 — 정품도 행 높이는 단일 행 셀 기준).
+/// 행을 채우는 단일 행 셀이 하나도 없으면(전부 병합) 안전하게 폴백 높이를 쓴다.
+fn table_height(table: &Table) -> i32 {
+    // 행별 최대 셀 높이(rowH). 인덱스 = Cell.row.
+    let mut row_heights = vec![0i32; usize::from(table.rows)];
+    for cell in &table.cells {
+        // 병합 셀은 시작 행에만 단일 높이를 강제하지 않는다(아래 폴백이 처리).
+        if cell.row_span != 1 {
+            continue;
+        }
+        let r = usize::from(cell.row);
+        if r >= row_heights.len() {
+            continue;
+        }
+        // 셀 안 모든 문단의 줄블록 합(여러 문단이면 누적). 마지막 줄은 line_height,
+        // 그 위 줄들은 line_advance(=v_pos 증분)로 이미 v_pos에 반영돼 있다.
+        let mut block = 0i32;
+        for para in &cell.paragraphs {
+            block += para_line_block(para);
+        }
+        let cell_h = i32::from(cell.margins[2]) + block + i32::from(cell.margins[3]);
+        if cell_h > row_heights[r] {
+            row_heights[r] = cell_h;
+        }
+    }
+    // row_span>1 셀만 있는 행(높이 0)은 폴백 1줄 높이로 보정해 겹침을 막는다.
+    let fallback = 141 + 1000 + 141; // 상여백 + 1줄(lh) + 하여백 (정품 기본)
+    let sum: i32 = row_heights
+        .iter()
+        .map(|&h| if h > 0 { h } else { fallback })
+        .sum();
+    sum + TABLE_BLOCK_PADDING
+}
+
+/// 셀 안 문단 하나의 줄블록 높이(HWPUNIT) = 마지막 줄.v_pos + 마지막 줄.line_height.
+/// 셀 v_pos는 셀 내부 0부터 누적되므로(fill_nested), 마지막 줄.v_pos가 곧
+/// (줄수−1)*line_advance 이고 거기에 마지막 줄 높이를 더하면 문단 전체 세로 크기다.
+fn para_line_block(para: &Paragraph) -> i32 {
+    match para.line_segs.last() {
+        Some(seg) => seg.v_pos + seg.line_height,
+        // 줄 배치가 없으면(이론상 없음) 기본 1줄 높이로 폴백.
+        None => 1000,
     }
 }
 
