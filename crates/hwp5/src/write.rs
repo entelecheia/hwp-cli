@@ -54,6 +54,11 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
             // 줄 배치(PARA_LINE_SEG)는 hwp-cli가 hwp-render의 폰트 셰이핑으로
             // 정확히 계산해 IR(para.line_segs)에 미리 채운다(hwp5는 hwp-render를
             // 역참조할 수 없으므로). 여기서는 채워진 줄 배치를 방출만 한다.
+            // nchars bit31 = '리스트의 마지막 문단' 표식: 각 리스트(섹션/표 셀/
+            // 글상자)의 마지막 문단만 세팅한다(정품 다문단 5.1.1.0 실측).
+            for section in &mut d.sections {
+                set_last_para_flag(&mut section.paragraphs);
+            }
             // hwpx 경유 변환은 ParaShape.attr1(한글 줄나눔·줄격자 비트)·
             // line_spacing_old·border_fill_id 와 구역 첫 문단 break_type=0x03 을
             // 왕복에서 잃는다(hwpx writer/reader가 직렬화/복원하지 않음). 합성
@@ -213,6 +218,35 @@ fn assign_instance_ids(roots: &mut [RecordNode], counter: &mut u32) {
             }
         }
         assign_instance_ids(&mut node.children, counter);
+    }
+}
+
+/// 리스트(문단 목록)의 마지막 문단에만 nchars bit31(chars_flags 0x80)을 세팅한다.
+/// 정품 다문단(5.1.1.0): 섹션·표 셀·글상자의 마지막 문단만 세팅, 나머지 0.
+/// 표 셀·글상자 안 문단 리스트도 재귀 처리한다.
+fn set_last_para_flag(paras: &mut [Paragraph]) {
+    let n = paras.len();
+    for (i, p) in paras.iter_mut().enumerate() {
+        if i + 1 == n {
+            p.header.chars_flags |= 0x80;
+        } else {
+            p.header.chars_flags &= !0x80;
+        }
+        for ctrl in &mut p.controls {
+            match ctrl {
+                Control::Table(t) => {
+                    for cell in &mut t.cells {
+                        set_last_para_flag(&mut cell.paragraphs);
+                    }
+                }
+                Control::Generic(g) => {
+                    for list in &mut g.paragraph_lists {
+                        set_last_para_flag(&mut list.paragraphs);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -926,9 +960,11 @@ fn emit_paragraph(
         if p.chars.last() != Some(&HwpChar::CharCtrl(13)) {
             p.chars.push(HwpChar::CharCtrl(13));
         }
-        // 2. nchars 최상위 비트(0x80000000) — 한글 내부 '줄 배치 최신' 캐시 비트.
-        //    정품 단일 문단 표본 전수가 세팅(읽을 때 마스킹되어 글자 수 무영향).
-        p.header.chars_flags |= 0x80;
+        // 2. nchars 최상위 비트(0x80000000)는 '리스트의 마지막 문단' 표식이다.
+        //    정품 다문단(5.1.1.0) 실측: 섹션의 마지막 문단만 세팅, 나머지 0.
+        //    모든 문단에 세팅하면 한글이 첫 문단을 마지막으로 보고 뒤 문단을
+        //    무시한다(다문단 '둘째부터 안 보임' 원인). chars_flags는 IR 단계의
+        //    set_last_para_flag가 리스트별로 설정하므로 여기서 건드리지 않는다.
         // 3. PARA_CHAR_SHAPE 연속 동일 id run 병합 (중복 run은 손상 판정).
         p.char_shape_runs.dedup_by(|(_, b), (_, a)| a == b);
         patched = p;
