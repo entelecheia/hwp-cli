@@ -303,9 +303,11 @@ fn needs_normalize(doc: &Document) -> bool {
 // 템플릿으로 쓰고 크기·모서리·BinItem ID만 패치한다(단위 변환행렬은 크기
 // 무관). 합성 후 extras가 채워져 strip이 드롭하지 않는다.
 
-/// gso CTRL_HEADER 공통 속성 40B (" osg" 이후). width@12, height@16.
-const GSO_COMMON_TEMPLATE: &str =
-    "11232a04000000000000000038220000ec040000040000000000000000000000d507bf6d00000000";
+/// 머리말/꼬리말(head/foot) LIST_HEADER 34B 템플릿 (정품 work_report.hwp foot).
+/// paraCount@0(u16)만 실제 문단 수로 패치. hwpx 출신 머리말은 LIST_HEADER가
+/// 비어 있어 이 템플릿으로 채워야 한글이 머리말(과 내부 로고)을 그린다.
+const HEADER_LIST_HEADER_TEMPLATE: &str =
+    "01000000400000003ebc0000130b0000000000000000000000000000000000000000";
 /// SHAPE_COMPONENT 196B. width@20/28, height@24/32.
 const SHAPE_COMPONENT_TEMPLATE: &str = "636970246369702400000000000000000000010038220000ec04000038220000ec0400000000082400001c110000760200000100000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f0000000000000000";
 /// SHAPE_COMPONENT_PICTURE. 모서리/자르기 = width/height, BinItem ID@71.
@@ -370,6 +372,8 @@ fn synthesize_pictures(doc: &mut Document, warnings: &mut Vec<String>) {
     let mut new_items: Vec<hwp_model::BinDataItem> = Vec::new();
     // (bin_stream 인덱스, 새 이름)
     let mut renames: Vec<(usize, String)> = Vec::new();
+    // gso 개체마다 유니크 instance_id (같은 값이면 한글이 같은 개체로 보고 무시 가능).
+    let mut inst: u32 = 0x3000_0000;
 
     for section in &mut doc.sections {
         for para in &mut section.paragraphs {
@@ -378,6 +382,7 @@ fn synthesize_pictures(doc: &mut Document, warnings: &mut Vec<String>) {
                 &bin_names,
                 &mut assigned,
                 &mut next_id,
+                &mut inst,
                 &mut new_items,
                 &mut renames,
                 warnings,
@@ -399,6 +404,7 @@ fn synth_pictures_para(
     bin_names: &[String],
     assigned: &mut [Option<u16>],
     next_id: &mut u16,
+    inst: &mut u32,
     new_items: &mut Vec<hwp_model::BinDataItem>,
     renames: &mut Vec<(usize, String)>,
     warnings: &mut Vec<String>,
@@ -443,11 +449,31 @@ fn synth_pictures_para(
                         s
                     }
                 };
-                // gso 개체 공통 속성도 정품 템플릿(40B)으로 채운다 — emit_picture가
-                // common_data 비면 최소 합성(불완전 flags)을 써 한글/pyhwp가 거부.
-                let mut common = hex_to_bytes(GSO_COMMON_TEMPLATE);
-                common[12..16].copy_from_slice(&p.width.0.to_le_bytes());
-                common[16..20].copy_from_slice(&p.height.0.to_le_bytes());
+                // gso 개체 공통 속성(40B)을 배치에서 합성한다. 정품 attr 템플릿:
+                // 인라인(글자처럼)=0x042a2311(work_report), 떠 있는(floating)=
+                // 0x046a4000(annual_report). floating은 hwpx 오프셋으로 위치 지정.
+                // instance_id는 개체마다 유니크 부여. (고정 템플릿을 쓰면 떠 있는
+                // 로고가 인라인으로 배치돼 한글에서 안 보이거나 오배치된다.)
+                let attr: u32 = if p.treat_as_char {
+                    0x042a_2311
+                } else {
+                    0x046a_4000
+                };
+                let voff: i32 = if p.treat_as_char { 0 } else { p.vert_offset };
+                let hoff: i32 = if p.treat_as_char { 0 } else { p.horz_offset };
+                let inst_id = *inst;
+                *inst += 1;
+                let mut common = Vec::with_capacity(40);
+                common.extend_from_slice(&attr.to_le_bytes());
+                common.extend_from_slice(&voff.to_le_bytes());
+                common.extend_from_slice(&hoff.to_le_bytes());
+                common.extend_from_slice(&p.width.0.to_le_bytes());
+                common.extend_from_slice(&p.height.0.to_le_bytes());
+                common.extend_from_slice(&p.z_order.to_le_bytes());
+                common.extend_from_slice(&0u32.to_le_bytes()); // 바깥 여백(왼/위)
+                common.extend_from_slice(&0u32.to_le_bytes()); // 바깥 여백(오른/아래)
+                common.extend_from_slice(&inst_id.to_le_bytes());
+                common.extend_from_slice(&0u32.to_le_bytes()); // 쪽 나눔 방지 등
                 p.common_data = common;
                 p.extras = build_picture_extras(p.width.0, p.height.0, sid);
                 p.bin_ref = hwp_model::BinRef::Id(hwp_model::BinDataId(sid));
@@ -456,16 +482,33 @@ fn synth_pictures_para(
                 for cell in &mut t.cells {
                     for cp in &mut cell.paragraphs {
                         synth_pictures_para(
-                            cp, bin_names, assigned, next_id, new_items, renames, warnings,
+                            cp, bin_names, assigned, next_id, inst, new_items, renames, warnings,
                         );
                     }
                 }
             }
             Control::Generic(g) => {
+                // hwpx 출신 머리말/꼬리말(head/foot)은 payload·LIST_HEADER가 비어
+                // strip이 통째로 드롭한다(내부 그림째). 4B data + 정품 LIST_HEADER
+                // 템플릿을 채워 보존한다(paraCount는 실제 문단 수로 패치).
+                if (g.ctrl_id == *b"head" || g.ctrl_id == *b"foot")
+                    && g.data.is_empty()
+                    && g.raw_children.is_empty()
+                {
+                    g.data = vec![0, 0, 0, 0];
+                    for list in &mut g.paragraph_lists {
+                        if list.header_data.is_empty() {
+                            let mut lh = hex_to_bytes(HEADER_LIST_HEADER_TEMPLATE);
+                            let npara = list.paragraphs.len().max(1) as u16;
+                            lh[0..2].copy_from_slice(&npara.to_le_bytes());
+                            list.header_data = lh;
+                        }
+                    }
+                }
                 for list in &mut g.paragraph_lists {
                     for lp in &mut list.paragraphs {
                         synth_pictures_para(
-                            lp, bin_names, assigned, next_id, new_items, renames, warnings,
+                            lp, bin_names, assigned, next_id, inst, new_items, renames, warnings,
                         );
                     }
                 }

@@ -43,8 +43,16 @@ pub struct Picture {
     pub common_data: Vec<u8>,
     pub width: HwpUnit,
     pub height: HwpUnit,
-    /// 글자처럼 취급 여부 (배치 힌트)
+    /// 글자처럼 취급 여부 (배치 힌트). false면 떠 있는(floating) 개체.
     pub treat_as_char: bool,
+    /// z-순서(겹침). hwpx `<hp:pic zOrder>`.
+    #[serde(default)]
+    pub z_order: u32,
+    /// 떠 있는 개체의 세로/가로 오프셋(HWPUNIT). hwpx `<hp:pos vertOffset/horzOffset>`.
+    #[serde(default)]
+    pub vert_offset: i32,
+    #[serde(default)]
+    pub horz_offset: i32,
     /// 바이너리 데이터 참조
     pub bin_ref: BinRef,
     pub extras: Vec<OpaqueRecord>,

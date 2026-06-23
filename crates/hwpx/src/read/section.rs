@@ -18,7 +18,7 @@ use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::error::{HwpxError, Result};
-use crate::read::xml::{attr, attr_i32, attr_u16, attr_u32};
+use crate::read::xml::{attr, attr_i32, attr_offset_i32, attr_u16, attr_u32};
 
 type XmlReader<'a> = Reader<&'a [u8]>;
 
@@ -470,6 +470,9 @@ fn default_picture() -> hwp_model::Picture {
         width: HwpUnit(0),
         height: HwpUnit(0),
         treat_as_char: false,
+        z_order: 0,
+        vert_offset: 0,
+        horz_offset: 0,
         bin_ref: hwp_model::BinRef::ItemRef(String::new()),
         extras: Vec::new(),
     }
@@ -490,6 +493,11 @@ fn parse_picture(reader: &mut XmlReader<'_>) -> Result<hwp_model::Picture> {
                     }
                     b"pos" => {
                         pic.treat_as_char = attr(e, "treatAsChar").as_deref() == Some("1");
+                        // 떠 있는 개체 위치 오프셋(글자처럼 취급이면 무시됨). hwpx는
+                        // 음수를 unsigned 2의보수 십진수로 저장(예: -77 = 4294967219)하므로
+                        // u32로 파싱 후 i32로 재해석한다(i32 직접 파싱은 범위 초과로 실패).
+                        pic.vert_offset = attr_offset_i32(e, "vertOffset").unwrap_or(0);
+                        pic.horz_offset = attr_offset_i32(e, "horzOffset").unwrap_or(0);
                     }
                     b"img" => {
                         if let Some(item) = attr(e, "binaryItemIDRef") {

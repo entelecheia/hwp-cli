@@ -323,6 +323,10 @@ fn parse_picture_gso(common: &[u8], children: &[RecordNode]) -> Result<hwp_model
         width,
         height,
         treat_as_char: attr & 1 != 0,
+        // hwp5 원본은 배치를 common_data로 보존하므로 합성용 필드는 0.
+        z_order: 0,
+        vert_offset: 0,
+        horz_offset: 0,
         bin_ref: hwp_model::BinRef::Id(hwp_model::BinDataId(bin_id)),
         extras: children.iter().map(to_opaque).collect(),
     })

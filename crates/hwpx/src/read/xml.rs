@@ -22,6 +22,12 @@ pub fn attr_i32(e: &BytesStart<'_>, name: &str) -> Option<i32> {
     attr(e, name)?.parse().ok()
 }
 
+/// 오프셋 등 부호 있는 32비트 속성. hwpx는 음수를 unsigned 2의보수 십진수로
+/// 저장(예: -77 = "4294967219")하므로 i64로 파싱 후 i32로 재해석한다.
+pub fn attr_offset_i32(e: &BytesStart<'_>, name: &str) -> Option<i32> {
+    attr(e, name)?.parse::<i64>().ok().map(|v| v as i32)
+}
+
 pub fn attr_u16(e: &BytesStart<'_>, name: &str) -> Option<u16> {
     attr(e, name)?.parse().ok()
 }
