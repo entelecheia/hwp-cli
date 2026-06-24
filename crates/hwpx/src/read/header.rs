@@ -198,10 +198,17 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                         }
                     }
                     b"strikeout" => {
-                        if let Some(cs) = &mut current_char
-                            && attr(e, "shape").as_deref() != Some("NONE")
-                        {
-                            cs.attr |= 1 << 18;
+                        // 취소선 비트(18)는 한글이 "보이는 취소선 선"으로 렌더하는 shape에만
+                        // 켠다. shape="3D" 계열은 정품/한글에서 보이지 않게 렌더되는데(사용자
+                        // 확인), 우리가 비트18(종류=1 실선)로 매핑하면 인라인 표 폭에 걸친
+                        // 실선 취소선이 합성돼 목차에 가로선이 나타난다. NONE/3D는 비취소선
+                        // 으로 둔다(시각 결과 동일, SOLID 등 실제 취소선은 보존).
+                        if let Some(cs) = &mut current_char {
+                            let shape = attr(e, "shape");
+                            let visible = matches!(shape.as_deref(), Some(s) if s != "NONE" && !s.contains("3D"));
+                            if visible {
+                                cs.attr |= 1 << 18;
+                            }
                         }
                     }
                     b"paraPr" => {

@@ -82,6 +82,30 @@ fn 합성_헤더_굵게_기울임() {
     assert_eq!(header.styles[0].name, "개요 1");
 }
 
+/// 취소선 shape 매핑: SOLID는 취소선, NONE/3D는 비취소선.
+/// "3D" 취소선은 한글에서 보이지 않게 렌더되는데(정품 한라대 실측·사용자 확인),
+/// 비트18(실선)로 매핑하면 인라인 표 폭에 걸친 가로선이 합성돼 목차에 취소선이 보였다.
+#[test]
+fn 취소선_3d_shape는_비취소선() {
+    let xml = r##"<?xml version="1.0"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:charProperties itemCnt="3">
+      <hh:charPr id="0" height="1000"><hh:strikeout shape="SOLID" color="#000000"/></hh:charPr>
+      <hh:charPr id="1" height="1000"><hh:strikeout shape="NONE" color="#000000"/></hh:charPr>
+      <hh:charPr id="2" height="1000"><hh:strikeout shape="3D" color="#000000"/></hh:charPr>
+    </hh:charProperties>
+  </hh:refList>
+</hh:head>"##;
+    let (header, _) = hwpx::read::header::parse_header(xml).unwrap();
+    assert!(header.char_shapes[0].has_strike(), "SOLID은 취소선");
+    assert!(!header.char_shapes[1].has_strike(), "NONE은 비취소선");
+    assert!(
+        !header.char_shapes[2].has_strike(),
+        "3D는 비취소선(한글 비가시 렌더 — 가로선 합성 방지)"
+    );
+}
+
 #[test]
 fn 합성_섹션_표와_컨트롤문자() {
     let xml = r##"<?xml version="1.0"?>
