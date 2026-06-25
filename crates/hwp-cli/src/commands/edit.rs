@@ -15,6 +15,7 @@ pub fn run(
     output: &Path,
     replaces: &[String],
     set_cells: &[String],
+    set_fields: &[String],
     verify: bool,
 ) -> anyhow::Result<()> {
     let mut doc = load_document(input)?;
@@ -45,8 +46,21 @@ pub fn run(
         edits += 1;
     }
 
+    for spec in set_fields {
+        let (name, value) = spec
+            .split_once('=')
+            .with_context(|| format!("--set-field 형식은 \"이름=값\" 입니다: {spec:?}"))?;
+        let n = hwp_convert::set_field(&mut doc, name, value);
+        if n == 0 {
+            eprintln!("경고: 필드 {name:?}를 찾지 못했습니다 (hwp fields로 이름 확인)");
+        } else {
+            eprintln!("필드 설정: {name:?} = {value:?} ({n}건)");
+        }
+        edits += n;
+    }
+
     if edits == 0 {
-        eprintln!("경고: 적용된 편집이 없습니다 (--replace/--set-cell 확인)");
+        eprintln!("경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field 확인)");
     }
 
     write_output(&doc, output)?;

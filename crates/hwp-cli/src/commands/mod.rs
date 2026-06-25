@@ -3,6 +3,7 @@ pub mod convert;
 pub mod diff;
 pub mod dump;
 pub mod edit;
+pub mod fields;
 pub mod info;
 pub mod mcp;
 pub mod new;
