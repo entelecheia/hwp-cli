@@ -137,7 +137,7 @@ fn find_match(chars: &[HwpChar], from: &str, start_idx: usize) -> Option<(usize,
 /// 치환 위치 `p`(WCHAR), 옛 길이 `lo`, 새 길이 `ln`에 맞춰 char_shape_run 경계를
 /// 옮긴다. 치환 구간 내부 경계는 제거하고(치환 텍스트는 p에서 활성인 모양을 상속),
 /// 이후 경계는 길이 변화만큼 평행 이동한다.
-fn adjust_runs(runs: &mut Vec<(u32, CharShapeId)>, p: u32, lo: u32, ln: u32) {
+pub(crate) fn adjust_runs(runs: &mut Vec<(u32, CharShapeId)>, p: u32, lo: u32, ln: u32) {
     let delta = i64::from(ln) - i64::from(lo);
     let mut out: Vec<(u32, CharShapeId)> = Vec::with_capacity(runs.len());
     for &(pos, id) in runs.iter() {
@@ -285,7 +285,7 @@ fn set_cell_in_table(
     Ok(())
 }
 
-fn utf16_len(s: &str) -> u32 {
+pub(crate) fn utf16_len(s: &str) -> u32 {
     s.encode_utf16().count() as u32
 }
 

@@ -119,6 +119,7 @@ fn call_tool(name: &str, args: &Value, ctx: &Ctx) -> Value {
     let result: Result<Vec<Value>, String> = match name {
         "hwp_info" => tool_info(args),
         "hwp_read" => tool_read(args),
+        "hwp_list_fields" => tool_list_fields(args),
         "hwp_render" => tool_render(args, ctx),
         "hwp_edit" => tool_edit(args),
         "hwp_convert" => tool_convert(args),
@@ -191,6 +192,23 @@ fn tool_read(args: &Value) -> Result<Vec<Value>, String> {
     Ok(vec![text_content(&text)])
 }
 
+fn tool_list_fields(args: &Value) -> Result<Vec<Value>, String> {
+    let path = arg_str(args, "path")?;
+    let doc = load_document(Path::new(path)).map_err(|e| e.to_string())?;
+    let fields: Vec<Value> = hwp_convert::list_fields(&doc)
+        .iter()
+        .map(|f| {
+            json!({
+                "kind": f.kind, "ctrl_id": f.ctrl_id,
+                "name": f.name, "command": f.command, "value": f.value,
+            })
+        })
+        .collect();
+    Ok(vec![text_content(
+        &serde_json::to_string_pretty(&fields).unwrap_or_default(),
+    )])
+}
+
 fn tool_render(args: &Value, ctx: &Ctx) -> Result<Vec<Value>, String> {
     let path = arg_str(args, "path")?;
     let page = arg_u64(args, "page", 1) as usize;
@@ -253,6 +271,17 @@ fn tool_edit(args: &Value) -> Result<Vec<Value>, String> {
             let text = c.get("text").and_then(Value::as_str).unwrap_or("");
             hwp_convert::set_cell(&mut doc, table, row, col, text)?;
             summary.push(format!("셀 표{table}({row},{col})={text:?}"));
+        }
+    }
+    if let Some(arr) = args.get("set_field").and_then(Value::as_array) {
+        for f in arr {
+            let name = f
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("set_field 항목에 name 필요")?;
+            let value = f.get("value").and_then(Value::as_str).unwrap_or("");
+            let n = hwp_convert::set_field(&mut doc, name, value);
+            summary.push(format!("필드 {name:?}={value:?}: {n}건"));
         }
     }
     if summary.is_empty() {
@@ -347,6 +376,13 @@ fn tool_defs() -> Vec<Value> {
             }, "required": ["path"]}
         }),
         json!({
+            "name": "hwp_list_fields",
+            "description": "필드/누름틀 목록(이름·종류·값·명령)을 JSON으로. 누름틀(%clk)은 name으로 채울 수 있다.",
+            "inputSchema": {"type": "object", "properties": {
+                "path": {"type": "string"}
+            }, "required": ["path"]}
+        }),
+        json!({
             "name": "hwp_render",
             "description": "지정 페이지를 PNG 이미지로 렌더해 반환(에이전트가 문서를 직접 본다).",
             "inputSchema": {"type": "object", "properties": {
@@ -368,7 +404,10 @@ fn tool_defs() -> Vec<Value> {
                 "set_cell": {"type": "array", "items": {"type": "object", "properties": {
                     "table": {"type": "integer"}, "row": {"type": "integer"},
                     "col": {"type": "integer"}, "text": {"type": "string"}},
-                    "required": ["table", "row", "col", "text"]}, "description": "표 셀 설정(0-기반)"}
+                    "required": ["table", "row", "col", "text"]}, "description": "표 셀 설정(0-기반)"},
+                "set_field": {"type": "array", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "value": {"type": "string"}},
+                    "required": ["name", "value"]}, "description": "필드/누름틀 채우기(이름으로)"}
             }, "required": ["input", "output"]}
         }),
         json!({

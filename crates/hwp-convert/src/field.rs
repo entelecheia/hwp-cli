@@ -1,0 +1,386 @@
+//! 필드/누름틀 읽기·채우기 (한컴 GetFieldList/PutFieldText 동등).
+//!
+//! HWP 필드 = FIELD_START(문자 코드 3, 확장 컨트롤) ... 표시 텍스트 ... FIELD_END(코드 4).
+//! - 종류: 컨트롤 ID (%clk=누름틀, %fmu=계산식, %hlk=하이퍼링크 등).
+//! - 이름: CTRL_DATA(HWPTAG, Parameter Set)의 첫 BSTR — 누름틀에만 보통 존재.
+//! - 명령: 필드 레코드의 command 문자열(계산식 식, 누름틀 지시문 등).
+//! - 값: FIELD_START~FIELD_END 사이 텍스트.
+//!
+//! IR을 바꾸지 않고 온디맨드로 파싱한다(리더/writer/왕복 무영향). 채우기는 값 영역만
+//! 교체하고 char_shape_run을 보정한다 — 쓰기는 편집 경로(write_hwp_edited)를 거친다.
+
+use hwp_model::{Control, Document, HwpChar, Paragraph};
+
+use crate::edit::{adjust_runs, utf16_len};
+
+const CTRL_DATA_TAG: u16 = 0x0010 + 71; // HWPTAG_CTRL_DATA
+const FIELD_START: u16 = 3;
+const FIELD_END: u16 = 4;
+
+/// 필드 하나의 정보.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldInfo {
+    /// 종류 표시명(누름틀/계산식/...).
+    pub kind: String,
+    /// 컨트롤 ID 원문(예: "%clk").
+    pub ctrl_id: String,
+    /// 필드 이름(누름틀; CTRL_DATA). 없으면 None.
+    pub name: Option<String>,
+    /// 명령/지시문(필드 레코드 command). 없으면 None.
+    pub command: Option<String>,
+    /// 화면 표시 값.
+    pub value: String,
+}
+
+fn kind_of(ctrl_id: &[u8; 4]) -> &'static str {
+    match ctrl_id {
+        b"%clk" => "누름틀",
+        b"%fmu" => "계산식",
+        b"%hlk" => "하이퍼링크",
+        b"%mmg" => "메일머지",
+        b"%dte" => "날짜",
+        b"%ddt" => "문서날짜",
+        b"%xrf" => "상호참조",
+        b"%bmk" => "책갈피",
+        b"%pat" => "파일경로",
+        b"%smr" => "문서요약",
+        b"%usr" => "사용자정보",
+        b"%unk" => "알수없음",
+        _ => "필드",
+    }
+}
+
+/// 문서의 모든 필드를 등장 순서로 나열한다(본문·표 셀·글상자 재귀).
+pub fn list_fields(doc: &Document) -> Vec<FieldInfo> {
+    let mut out = Vec::new();
+    for section in &doc.sections {
+        for para in &section.paragraphs {
+            collect_fields(para, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_fields(para: &Paragraph, out: &mut Vec<FieldInfo>) {
+    for (i, ch) in para.chars.iter().enumerate() {
+        if let HwpChar::ExtCtrl {
+            code,
+            ctrl_id,
+            ctrl_index,
+            ..
+        } = ch
+            && *code == FIELD_START
+        {
+            let (name, command) = ctrl_index
+                .and_then(|idx| para.controls.get(idx as usize))
+                .map(field_meta)
+                .unwrap_or((None, None));
+            out.push(FieldInfo {
+                kind: kind_of(ctrl_id).to_string(),
+                ctrl_id: String::from_utf8_lossy(ctrl_id).into_owned(),
+                name,
+                command,
+                value: field_value(&para.chars, i),
+            });
+        }
+    }
+    for ctrl in &para.controls {
+        for_each_nested(ctrl, &mut |p| collect_fields(p, out));
+    }
+}
+
+/// FIELD_START(start) 다음부터 FIELD_END 전까지의 표시 텍스트.
+fn field_value(chars: &[HwpChar], start: usize) -> String {
+    let mut s = String::new();
+    for ch in &chars[start + 1..] {
+        match ch {
+            HwpChar::Text(c) => s.push(*c),
+            HwpChar::CharCtrl(10) => s.push('\n'),
+            HwpChar::InlineCtrl { code, .. } if *code == FIELD_END => break,
+            _ => {}
+        }
+    }
+    s
+}
+
+/// 필드 컨트롤에서 (이름, 명령)을 읽는다.
+fn field_meta(ctrl: &Control) -> (Option<String>, Option<String>) {
+    let Control::Generic(g) = ctrl else {
+        return (None, None);
+    };
+    let name = g
+        .raw_children
+        .iter()
+        .find(|r| r.tag == CTRL_DATA_TAG)
+        .and_then(|r| first_bstr(&r.data));
+    (name, parse_command(&g.data))
+}
+
+/// 필드 레코드(ctrl_id 제거됨) command 문자열: 속성(4) 기타(1) len(2) WCHAR[len] id(4).
+fn parse_command(data: &[u8]) -> Option<String> {
+    if data.len() < 7 {
+        return None;
+    }
+    let len = u16::from_le_bytes([data[5], data[6]]) as usize;
+    let end = 7usize.checked_add(len * 2)?;
+    if end > data.len() || len == 0 {
+        return None;
+    }
+    Some(decode_utf16le(&data[7..end]))
+}
+
+/// CTRL_DATA Parameter Set의 첫 BSTR(필드 이름). 알 수 없는 항목 타입을 만나면 중단.
+fn first_bstr(data: &[u8]) -> Option<String> {
+    if data.len() < 4 {
+        return None;
+    }
+    let count = i16::from_le_bytes([data[2], data[3]]).max(0) as usize;
+    let mut o = 4usize;
+    for _ in 0..count {
+        if o + 4 > data.len() {
+            break;
+        }
+        let item_type = u16::from_le_bytes([data[o + 2], data[o + 3]]);
+        o += 4;
+        match item_type {
+            0 => {} // PIT_NULL
+            1 => {
+                // PIT_BSTR: UINT32 len + WCHAR[len]
+                if o + 4 > data.len() {
+                    break;
+                }
+                let len =
+                    u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize;
+                o += 4;
+                let end = o.checked_add(len * 2)?;
+                if end > data.len() {
+                    break;
+                }
+                return Some(decode_utf16le(&data[o..end]));
+            }
+            2 | 6 => o += 1,         // I1/UI1
+            3 | 7 => o += 2,         // I2/UI2
+            4 | 5 | 8 | 9 => o += 4, // I4/I/UI4/UI
+            _ => break,              // SET/ARRAY/BINDATA/미지 — 안전 중단
+        }
+    }
+    None
+}
+
+fn decode_utf16le(b: &[u8]) -> String {
+    let units: Vec<u16> = b
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// 이름이 일치하는 필드의 값을 `value`로 채운다. 반환=채운 개수.
+pub fn set_field(doc: &mut Document, name: &str, value: &str) -> usize {
+    let mut count = 0;
+    for section in &mut doc.sections {
+        for para in &mut section.paragraphs {
+            count += set_field_para(para, name, value);
+        }
+    }
+    count
+}
+
+fn set_field_para(para: &mut Paragraph, name: &str, value: &str) -> usize {
+    // 불변 스캔: 이름 일치 필드의 (값 시작 char idx, 값 끝 char idx, 값 WCHAR 위치, 옛 값 WCHAR 길이).
+    let mut regions: Vec<(usize, usize, u32, u32)> = Vec::new();
+    let mut wpos = 0u32;
+    for (idx, ch) in para.chars.iter().enumerate() {
+        if let HwpChar::ExtCtrl {
+            code, ctrl_index, ..
+        } = ch
+            && *code == FIELD_START
+        {
+            let nm = ctrl_index
+                .and_then(|i| para.controls.get(i as usize))
+                .and_then(|c| field_meta(c).0);
+            if nm.as_deref() == Some(name) {
+                let value_wpos = wpos + ch.wchar_width();
+                let mut e = idx + 1;
+                let mut vw = 0u32;
+                while e < para.chars.len() {
+                    match &para.chars[e] {
+                        HwpChar::InlineCtrl { code, .. } if *code == FIELD_END => break,
+                        other => vw += other.wchar_width(),
+                    }
+                    e += 1;
+                }
+                regions.push((idx + 1, e, value_wpos, vw));
+            }
+        }
+        wpos += ch.wchar_width();
+    }
+
+    let count = regions.len();
+    let new_wlen = utf16_len(value);
+    // 인덱스 무효화 방지: 뒤에서 앞으로 적용.
+    for (s, e, vp, old_wlen) in regions.into_iter().rev() {
+        para.chars.splice(s..e, build_value_chars(value));
+        adjust_runs(&mut para.char_shape_runs, vp, old_wlen, new_wlen);
+    }
+    if count > 0 {
+        para.line_segs.clear();
+    }
+
+    let mut nested = 0;
+    for ctrl in &mut para.controls {
+        match ctrl {
+            Control::Table(t) => {
+                for cell in &mut t.cells {
+                    for p in &mut cell.paragraphs {
+                        nested += set_field_para(p, name, value);
+                    }
+                }
+            }
+            Control::Generic(g) => {
+                for l in &mut g.paragraph_lists {
+                    for p in &mut l.paragraphs {
+                        nested += set_field_para(p, name, value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    count + nested
+}
+
+fn build_value_chars(value: &str) -> Vec<HwpChar> {
+    value
+        .chars()
+        .map(|c| {
+            if c == '\n' {
+                HwpChar::CharCtrl(10)
+            } else {
+                HwpChar::Text(c)
+            }
+        })
+        .collect()
+}
+
+/// 컨트롤의 중첩 문단(표 셀·글상자 리스트)에 f를 적용한다(읽기 전용).
+fn for_each_nested(ctrl: &Control, f: &mut impl FnMut(&Paragraph)) {
+    match ctrl {
+        Control::Table(t) => {
+            for cell in &t.cells {
+                for p in &cell.paragraphs {
+                    f(p);
+                }
+            }
+        }
+        Control::Generic(g) => {
+            for l in &g.paragraph_lists {
+                for p in &l.paragraphs {
+                    f(p);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hwp_model::opaque::OpaqueRecord;
+    use hwp_model::{CharShapeId, GenericControl};
+
+    fn wbytes(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn parse_command_계산식() {
+        // 속성(4) 기타(1) len(2) WCHAR[len] id(4)
+        let cmd = "SUM(A1:A3)";
+        let mut data = vec![0u8; 5];
+        data.extend((cmd.encode_utf16().count() as u16).to_le_bytes());
+        data.extend(wbytes(cmd));
+        data.extend([0u8; 4]);
+        assert_eq!(parse_command(&data).as_deref(), Some("SUM(A1:A3)"));
+    }
+
+    #[test]
+    fn first_bstr_파라미터셋() {
+        // SetID(2) count(2)=2; item1: id(2) type(2)=3(I2) + 2바이트; item2: id(2) type(2)=1(BSTR)
+        let name = "수신";
+        let mut data = vec![0, 0, 2, 0]; // setid=0, count=2
+        data.extend([1, 0, 3, 0, 0xAA, 0xBB]); // item id=1 type=I2(3) value 2B
+        data.extend([2, 0, 1, 0]); // item id=2 type=BSTR(1)
+        data.extend((name.encode_utf16().count() as u32).to_le_bytes());
+        data.extend(wbytes(name));
+        assert_eq!(first_bstr(&data).as_deref(), Some("수신"));
+    }
+
+    /// 이름 있는 누름틀 필드 하나를 가진 합성 문단.
+    fn field_para(name: &str, value: &str) -> Paragraph {
+        // CTRL_DATA: Parameter Set(setid=0, count=1) + item(id=1, type=BSTR) + len + WCHAR[]
+        let mut cd = vec![0, 0, 1, 0];
+        cd.extend([1, 0, 1, 0]); // item id=1, type=BSTR(1)
+        cd.extend((name.encode_utf16().count() as u32).to_le_bytes());
+        cd.extend(wbytes(name));
+        let ctrl = Control::Generic(GenericControl {
+            ctrl_id: *b"%clk",
+            data: vec![0u8; 11], // 속성4 기타1 len2=0 id4
+            paragraph_lists: Vec::new(),
+            extras: Vec::new(),
+            raw_children: vec![OpaqueRecord {
+                tag: CTRL_DATA_TAG,
+                data: cd,
+                children: Vec::new(),
+            }],
+        });
+        let mut chars = vec![HwpChar::ExtCtrl {
+            code: FIELD_START,
+            ctrl_id: *b"%clk",
+            payload: vec![0u8; 12],
+            ctrl_index: Some(0),
+        }];
+        chars.extend(value.chars().map(HwpChar::Text));
+        chars.push(HwpChar::InlineCtrl {
+            code: FIELD_END,
+            payload: vec![0u8; 12],
+        });
+        chars.push(HwpChar::CharCtrl(13));
+        Paragraph {
+            chars,
+            char_shape_runs: vec![(0, CharShapeId(0))],
+            controls: vec![ctrl],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn list_fields_이름_종류_값() {
+        let mut doc = Document::default();
+        doc.sections.push(hwp_model::Section {
+            paragraphs: vec![field_para("수신", "내부결재")],
+            extras: Vec::new(),
+        });
+        let fields = list_fields(&doc);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].kind, "누름틀");
+        assert_eq!(fields[0].name.as_deref(), Some("수신"));
+        assert_eq!(fields[0].value, "내부결재");
+    }
+
+    #[test]
+    fn set_field_값_교체() {
+        let mut doc = Document::default();
+        doc.sections.push(hwp_model::Section {
+            paragraphs: vec![field_para("수신", "")], // 빈 누름틀
+            extras: Vec::new(),
+        });
+        let n = set_field(&mut doc, "수신", "기획팀");
+        assert_eq!(n, 1);
+        let fields = list_fields(&doc);
+        assert_eq!(fields[0].value, "기획팀");
+        // 다른 이름은 안 바뀜
+        assert_eq!(set_field(&mut doc, "없는이름", "x"), 0);
+    }
+}

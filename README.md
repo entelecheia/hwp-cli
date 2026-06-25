@@ -1,84 +1,215 @@
 # hwp-cli
 
-한글 문서(.hwp, .hwpx)를 처리하는 Rust CLI. HWP 5.0 바이너리와 HWPX(OWPML,
-KS X 6101) 포맷의 읽기·쓰기·변환·렌더링을 외부 HWP 라이브러리 없이 직접 구현한다.
+> A clean-room Rust toolkit to read, convert, render, write and AI-edit HWP 5.0 / HWPX documents with **no Hancom or COM dependency** — runs on Linux / macOS / CI.
 
-## 목표 기능
+[![CI](https://github.com/YeolHanMyeong/hwp-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/YeolHanMyeong/hwp-cli/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#라이선스)
+[![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](Cargo.toml)
 
-- **읽기·텍스트 추출** — hwp/hwpx → plain/markdown/JSON
-- **포맷 변환** — hwp → hwpx, hwpx ↔ markdown/JSON
-- **이미지 렌더링** — hwp/hwpx → PNG/SVG/PDF (파일에 저장된 줄 배치
-  정보(PARA_LINE_SEG)를 활용해 원본에 가까운 레이아웃)
-- **문서 생성·쓰기** — hwpx와 **hwp 바이너리 쓰기** (생태계 공백)
+한글 문서(`.hwp` HWP 5.0 바이너리, `.hwpx` OWPML/KS X 6101)를 **외부 HWP 라이브러리 없이**
+읽고·추출하고·변환하고·렌더링하고·쓰고·AI로 편집하는 Rust 워크스페이스. CFB 컨테이너, HWP 레코드
+스트림, OWPML XML, 페이지 레이아웃, 글리프 셰이핑까지 전부 스펙 기반으로 직접 구현한 클린룸
+엔진이다. 한컴오피스나 Windows COM 자동화에 의존하지 않으므로 Linux/macOS 서버와 CI에서
+그대로 동작한다.
 
-## 사용법
+## 주요 기능
+
+- **읽기·텍스트 추출** — hwp/hwpx → plain / markdown / JSON(전체 IR). 표·이미지·머리말/꼬리말·
+  미해석 레코드까지 보존하며 파싱한다.
+- **포맷 변환** — hwp ↔ hwpx, hwp/hwpx ↔ markdown, hwp/hwpx ↔ JSON(IR). 공용 문서 모델(IR)을
+  경유한 양방향 변환.
+- **이미지 렌더링** — hwp/hwpx → **PNG / SVG**. 파일에 저장된 줄 배치(PARA_LINE_SEG)를 우선 사용하고,
+  없으면 자체 줄바꿈으로 보정한다. 표·이미지·머리말/꼬리말·밑줄/취소선·글상자를 그린다.
+- **문서 쓰기 (hwp 바이너리 포함)** — hwpx 패키지 쓰기와 **HWP 5.0 바이너리(CFB) 쓰기**를 모두 구현.
+  hwp 출신·무수정 문서는 표·이미지·도형·책갈피를 포함해도 압축 해제 스트림 기준 **바이트 동일 왕복**까지
+  보장한다(전체 fixture 게이트).
+- **AI 편집** — IR을 JSON으로 내보내 고치고 되쓰는 read→edit→rewrite 왕복. 텍스트 치환, 표 셀 설정,
+  누름틀/필드 채우기를 이미지·서식·미해석 레코드를 보존한 채 인메모리로 적용한다.
+- **MCP 서버** — 의존성 없는(serde_json만) stdio MCP 서버로 8개 도구를 노출. 에이전트가 문서를
+  읽고·렌더해서 직접 보고·편집·변환한다.
+
+## 현재 범위와 한계
+
+- **구현 완료**: hwp/hwpx 읽기, hwpx 쓰기, **hwp 바이너리 쓰기**(convert hwpx→hwp, new→hwp,
+  edit→hwp 포함), markdown/JSON 왕복, PNG/SVG 렌더링, 렌더 충실도 diff, 누름틀/필드 채우기, MCP 서버.
+- **PDF 출력은 미구현(계획)** — 렌더러는 PNG와 SVG만 지원한다.
+- **무손실 왕복의 범위**: hwp 출신·무수정 문서는 표·이미지·도형·책갈피를 포함해도 압축 해제 스트림
+  기준 바이트 동일 왕복까지 보장한다(전체 fixture 게이트). 편집했거나 hwpx/markdown 출신인 문서는
+  writer의 합성 경로를 거쳐 **의미 동등**(텍스트·구조 보존)으로 되쓴다. hwpx 쓰기는 항상 의미 동등
+  (템플릿 기반 재생성)이다. JSON 이미지까지 포함한 완전 무손실 왕복은 `--embed-bin`(base64 임베드)
+  경로 전용이다.
+- **미지원 입력**: 암호화/배포용(DRM) HWP 5.0 문서는 읽기를 거부한다.
+- **의미 모델 한계**: 표·그림·구역·머리말/꼬리말·글상자·필드는 의미 파싱되지만, 도형(사각형/타원/선/
+  다각형/수식/차트/OLE)은 의미 모델이 없어 hwp 내부에서는 원형 보존(round-trip)만 되고 포맷 간 합성
+  변환은 되지 않는다. 누름틀/필드는 기존 이름의 값만 채울 수 있고 신규 필드 생성은 없다.
+
+## 설치와 빌드
+
+### 사전 요구사항
+
+- **Rust** edition 2024, `rust-version = 1.93` 이상(워크스페이스 `Cargo.toml` 기준).
+- **CJK 폰트** — 렌더링과 hwp 바이너리 쓰기(미리보기 텍스트/이미지)에 한글 글리프가 필요하다.
+  레포에 함초롬 폰트(`HCRBatang`, `HCRDotum`, 각 Bold 포함 4종)가 `fonts/`에 동봉되어 있다.
+
+#### 폰트 지정 방법
+
+| 사용처 | 폰트 지정 |
+|---|---|
+| `render` / `diff` / `mcp` | `--font-dir <dir>` 플래그(반복 지정 가능) |
+| `convert` / 테스트 | 환경변수 `HWP_FONT_DIR`(미설정 시 프로젝트 `fonts/` 자동 사용) |
+
+### 빌드 / 설치
 
 ```sh
-hwp info <file>                     # 포맷/버전/속성/스트림 진단
-hwp cat <file> [--format md|json]   # 본문 텍스트 추출 (--preview: PrvText)
-hwp convert <in> -o out.md          # hwp/hwpx → markdown/JSON
-hwp convert <in> -o out.hwpx        # hwp/hwpx → hwpx (표·이미지·머리말 보존)
-hwp convert doc.json -o out.hwp     # JSON IR → hwp/hwpx (편집 왕복; --embed-bin로 이미지 임베드)
-hwp render <in> -o out.png          # 페이지 렌더링 (PNG/SVG, --dpi, --font-dir)
-hwp new -o out.hwpx --from doc.md   # markdown/JSON → 새 문서
-hwp edit <in> -o out.hwp \          # 기존 문서 편집 (이미지·서식 보존)
-    --replace "찾기=>바꾸기" --set-cell "표:행:열=값" [--verify]
-hwp mcp [--font-dir <dir>]          # MCP stdio 서버 (AI 에이전트용 도구 인터페이스)
-hwp dump <file> [--raw] [--json]    # [개발자용] 레코드/패키지 구조 덤프
+git clone git@github.com:YeolHanMyeong/hwp-cli.git && cd hwp-cli
+cargo build --release
+cargo install --path crates/hwp-cli   # `hwp` 바이너리 설치
 ```
 
-### MCP 서버 (AI 에이전트 연동)
+> 이후 예시에서 `<repo>`는 위에서 클론한 디렉터리의 절대 경로를 가리킨다.
 
-`hwp mcp`는 의존성 없이(serde_json만) **MCP(Model Context Protocol) stdio 서버**를 띄운다.
-Claude 등 에이전트가 도구 호출로 HWP를 **읽고·렌더해서 보고·편집·변환**한다 — Windows/한컴이
-필요한 COM 자동화와 달리 크로스플랫폼 오픈 엔진. 노출 도구:
+## 빠른 시작 (Quickstart)
 
-| 도구 | 기능 |
-|---|---|
-| `hwp_info` | 포맷/버전/속성/스트림 진단(JSON) |
-| `hwp_read` | 본문 추출 (plain/markdown/**json**=전체 IR 구조) |
-| `hwp_render` | 페이지를 **PNG 이미지로 반환** — 에이전트가 문서를 직접 봄 |
-| `hwp_edit` | 텍스트 치환·표 셀 설정 후 되쓰기(이미지·서식 보존) |
-| `hwp_convert` | 포맷 변환(.hwp/.hwpx/.json/.md) |
-| `hwp_new` | markdown/JSON에서 새 문서 생성 |
-| `hwp_diff` | 렌더 결과를 기준 PNG와 비교(잉크 적용률·위치 오프셋) |
+```sh
+# 진단: 포맷/버전/속성/스트림
+hwp info report.hwp
 
-MCP 클라이언트 설정 예:
+# 본문 추출
+hwp cat report.hwp                       # plain text
+hwp cat report.hwp --format markdown     # markdown
+hwp cat report.hwp --format json         # 전체 IR(JSON)
+
+# 변환 (출력 확장자로 포맷 추론)
+hwp convert report.hwp   -o report.hwpx  # hwp → hwpx (표·이미지·머리말 보존)
+hwp convert report.hwpx  -o report.hwp   # hwpx → hwp 바이너리
+hwp convert report.hwp   -o report.md    # hwp → markdown
+hwp convert report.hwp   -o doc.json --embed-bin   # 이미지까지 임베드한 자급식 JSON
+
+# 렌더링 (함초롬 폰트 디렉터리 지정)
+hwp render report.hwp -o page.png --dpi 150 --font-dir ./fonts
+hwp render report.hwp -o page.svg --pages 1-3 --font-dir ./fonts
+
+# 새 문서 생성
+hwp new -o out.hwpx --from notes.md
+hwp new -o out.hwp  --from doc.json
+
+# 편집 (이미지·서식·미해석 레코드 보존)
+hwp fields form.hwp                        # 채울 수 있는 필드/누름틀 이름 확인
+hwp edit form.hwp -o filled.hwp \
+    --replace "초안=>최종" \
+    --set-cell "0:1:2=12,300원" \
+    --set-field "수신처=홍길동" --verify
+
+# 렌더 충실도 비교 (한글 기준 PNG와 잉크/오프셋/픽셀 오차)
+hwp diff report.hwp --ref hancom_p1.png --page 1 --dpi 150 --font-dir ./fonts
+
+# MCP stdio 서버
+hwp mcp --font-dir ./fonts
+```
+
+## 명령 레퍼런스
+
+| 명령 | 인자 / 플래그 | 설명 |
+|---|---|---|
+| `info <file>` | `--json` | 포맷/버전/속성/스트림 진단 |
+| `cat <file>` | `--format plain\|markdown\|json` (기본 `plain`), `--preview` | 본문 추출. `--preview`는 본문 파싱 없이 PrvText만 출력 |
+| `convert <input> -o <output>` | `--to hwp\|hwpx\|md\|json`(생략 시 확장자 추론), `--strict`(예약 — 현재 미동작), `--preserve-layout`, `--embed-bin` | 포맷 변환. `--preserve-layout`는 무수정 왕복 전용 줄 배치 보존. `--embed-bin`은 JSON에 이미지 base64 임베드. `--strict`는 향후 보존 불가 데이터 발견 시 실패 처리 예정(현재는 동작하지 않음) |
+| `render <input> -o <output>` | `--pages "1"\|"1-3"\|"all"`(기본 `all`), `--dpi <f64>`(기본 96), `--format png\|svg`(생략 시 확장자 추론), `--font-dir <dir>`(반복) | 페이지를 PNG/SVG로 렌더 |
+| `new -o <output>` | `--from <md\|json>`(생략 시 빈 문서) | markdown/JSON IR에서 새 문서 생성 |
+| `edit <input> -o <output>` | `--replace "찾기=>바꾸기"`(반복), `--set-cell "표:행:열=값"`(반복, 0-기반), `--set-field "이름=값"`(반복), `--verify` | 기존 문서 편집. `--verify`는 쓰기 후 재읽기로 검증 |
+| `fields <file>` | `--json` | 필드/누름틀 목록(이름·종류·값·명령) |
+| `diff <input> --ref <png>` | `--page <n>`(기본 1), `--dpi <f64>`(기본 96), `-o/--out <png>`, `--font-dir <dir>`(반복), `--tolerance <u8>`(기본 16) | 렌더 결과를 한글 기준 PNG와 비교(잉크 적용률·dx/dy 오프셋·픽셀 차이율·MAE) |
+| `mcp` | `--font-dir <dir>`(반복) | MCP stdio 서버 실행 |
+| `dump <file>` | `--stream <name>`, `--raw`, `--json` | [개발자용] 레코드/패키지 구조 덤프 |
+
+> 출력 포맷은 대부분 출력 파일의 확장자(`.hwp` / `.hwpx` / `.md` / `.json` / `.png` / `.svg`)에서
+> 추론된다. `convert`/`render`는 `--to`/`--format`으로 명시할 수도 있다.
+
+## MCP 서버 (AI 에이전트 연동)
+
+`hwp mcp`는 tokio나 SDK 없이 `serde_json`만으로 동기 JSON-RPC 2.0(stdio, 줄 단위)을 구현한 **MCP
+서버**다(프로토콜 버전 `2024-11-05`). stdout은 프로토콜 전용이고 로그는 stderr로 나간다.
+Windows/한컴이 필요한 COM 자동화와 달리 크로스플랫폼 오픈 엔진으로 동작한다.
+
+### 노출 도구 (8종)
+
+| 도구 | 필수 인자 | 기능 |
+|---|---|---|
+| `hwp_info` | `path` | 포맷/버전/속성/스트림 진단(JSON) |
+| `hwp_read` | `path` (`format` = `plain`\|`markdown`\|`json`) | 본문 추출. `json`이면 전체 IR 구조 |
+| `hwp_list_fields` | `path` | 필드/누름틀 목록(이름·종류·값·명령) |
+| `hwp_render` | `path` (`page`, `dpi`, `font_dir`) | 지정 페이지를 **PNG 이미지로 반환** — 에이전트가 문서를 직접 본다 |
+| `hwp_edit` | `input`, `output` (`replace[]`, `set_cell[]`, `set_field[]`) | 텍스트 치환·표 셀 설정·필드 채우기 후 되쓰기(이미지·서식 보존) |
+| `hwp_convert` | `input`, `output` (`embed_bin`) | 포맷 변환(확장자로 결정) |
+| `hwp_new` | `output` (`markdown` 또는 `json`) | markdown/JSON IR에서 새 문서 생성 |
+| `hwp_diff` | `input`, `ref` (`page`, `dpi`, `font_dir`) | 렌더 결과를 기준 PNG와 비교(잉크 적용률·오프셋·픽셀 차이율) |
+
+### 클라이언트 설정 예
+
 ```json
-{ "mcpServers": { "hwp": { "command": "hwp", "args": ["mcp", "--font-dir", "<repo>/fonts"] } } }
+{
+  "mcpServers": {
+    "hwp": {
+      "command": "hwp",
+      "args": ["mcp", "--font-dir", "<repo>/fonts"]
+    }
+  }
+}
 ```
 
-`cat --format json`은 전체 IR을 구조적으로 내보내고, `convert *.json`/`new --from *.json`은
-이를 다시 문서로 쓴다(AI가 읽고·고치고·되쓰는 왕복). `edit`은 원본을 IR로 읽어 텍스트 치환·
-표 셀 설정을 인메모리로 적용하므로 이미지·서식·opaque 레코드가 모두 보존된다. 편집된 hwp는
-writer의 합성 경로를 거쳐 한글 문단 불변식(줄 배치·문단끝·nchars 등)을 다시 세운다.
+### AI read → edit → rewrite 왕복
 
-렌더링은 표(테두리/배경), 이미지, 머리말/꼬리말, 밑줄/취소선을 지원하며
-파일에 저장된 줄 배치(lineseg)를 우선 사용하고 불완전한 파일은 자체
-줄바꿈으로 보정한다. hwp 바이너리 쓰기(M6)와 PDF 출력(M7)은 진행 중.
+1. **읽기** — `hwp_read`(`format=json`)가 문서 전체를 IR(JSON)로 내보낸다. 텍스트뿐 아니라 표·이미지
+   참조·서식·미해석 레코드까지 구조적으로 담긴다.
+2. **편집** — 에이전트는 `hwp_edit`로 텍스트 치환·표 셀 설정·누름틀 채우기를 적용한다. IR만 바꾸므로
+   이미지·서식·opaque 레코드가 보존되고, 편집된 문단의 줄 배치만 무효화되어 writer가 재합성한다.
+   `hwp_new`/`hwp_convert`로 JSON IR을 그대로 문서로 되쓸 수도 있다.
+3. **확인** — `hwp_render`가 결과 페이지를 PNG로 돌려주어 에이전트가 변경을 **눈으로 검증**한다.
+   `hwp_diff`로 한글 기준 렌더와 정량 비교할 수 있다.
+
+편집된 hwp는 writer의 합성 경로를 거쳐 한글 문단 불변식(줄 배치·문단끝 `0x0d`·nchars 등)을 다시
+세우므로 한글에서 정상 문서로 열린다.
 
 ## 워크스페이스 구성
 
 | 크레이트 | 역할 |
 |---|---|
-| `hwp-model` | 공유 문서 모델(IR) — 모든 크레이트의 계약 |
-| `hwp5` | HWP 5.0 바이너리 reader/writer (CFB + 레코드 스트림) |
-| `hwpx` | HWPX reader/writer (ZIP + OWPML XML) |
-| `hwp-convert` | IR ↔ markdown/JSON |
-| `hwp-render` | IR → PNG/SVG/PDF 렌더러 |
-| `hwp-cli` | `hwp` 바이너리 |
+| `hwp-model` | 공유 문서 모델(IR) — 모든 크레이트가 의존하는 단일 계약. `Document{meta,header,sections,bin_streams}`, 무손실 보존(opaque/tail), 단위 변환 |
+| `hwp5` | HWP 5.0 바이너리 reader/writer (CFB 컨테이너 + 레코드 스트림 + 압축) |
+| `hwpx` | HWPX reader/writer (ZIP 패키지 + OWPML XML) |
+| `hwp-convert` | IR ↔ markdown / JSON, 인메모리 편집(치환·셀·필드), 필드 스캔 |
+| `hwp-render` | IR → PNG / SVG 렌더러, 줄 배치 합성, 텍스트 셰이핑, 렌더 diff |
+| `hwp-cli` | `hwp` 바이너리 (CLI + MCP 서버) |
 
-## 개발
+## 개발과 테스트
 
 ```sh
-cargo build
-cargo test
-cargo clippy --all-targets
+cargo build --all-targets
+cargo test                              # 워크스페이스 전체 테스트
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
-`docs/`에 한글문서파일형식 5.0 공식 스펙 PDF와 스펙 hwp 원본(배포용 문서
-테스트 겸용)이 있다. 진행 상황과 설계 결정은 계획 문서(마일스톤 M0~M7) 참조.
+테스트는 hwp5의 바이트 동일 왕복(identity/roundtrip/synth), hwpx 의미 동등 왕복, IR JSON·markdown
+왕복, 편집/필드 보정, 렌더 레이아웃·표·diff 메트릭 등을 포함한다.
+
+`docs/`에 한글문서파일형식 5.0 공식 스펙 PDF·스펙 hwp 원본·렌더 기준 PNG가 있다 — 파서/렌더러 작업
+시 참고한다.
+
+**CI** (`.github/workflows/ci.yml`, GitHub Actions, Ubuntu): `fonts-noto-cjk` 설치 후
+`cargo fmt --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test`를 실행한다.
+
+## 기여
+
+버그 리포트와 PR을 환영한다. 이슈는 GitHub Issues에, 변경은 PR로 제출한다.
+
+- PR 전 로컬에서 CI와 동일한 게이트를 통과시킨다: `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+- 새 포맷 기능은 가능하면 왕복/골든 테스트를 함께 추가한다.
+- 스펙 참고 자료는 `docs/`의 한글문서파일형식 5.0 PDF·스펙 hwp 원본을 본다.
 
 ## 라이선스
 
-MIT OR Apache-2.0
+이 프로젝트는 듀얼 라이선스다 — [MIT](LICENSE-MIT) 또는 [Apache-2.0](LICENSE-APACHE) 중 하나를
+선택할 수 있다(워크스페이스 `Cargo.toml`에 `MIT OR Apache-2.0`으로 선언). 별도 명시가 없는 한, 이
+저장소에 기여한 코드는 위 두 라이선스로 동일하게 배포되는 것에 동의하는 것으로 간주한다.

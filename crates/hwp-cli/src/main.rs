@@ -114,9 +114,20 @@ enum Cmd {
         /// 표 셀 설정 "표:행:열=값" (반복 가능, 0-기반 인덱스)
         #[arg(long = "set-cell")]
         set_cell: Vec<String>,
+        /// 필드/누름틀 채우기 "이름=값" (반복 가능 — hwp fields로 이름 확인)
+        #[arg(long = "set-field")]
+        set_field: Vec<String>,
         /// 쓰기 후 재읽기로 검증
         #[arg(long)]
         verify: bool,
+    },
+
+    /// 필드/누름틀 목록 표시 (이름·종류·값)
+    Fields {
+        file: PathBuf,
+        /// JSON으로 출력
+        #[arg(long)]
+        json: bool,
     },
 
     /// MCP(Model Context Protocol) stdio 서버 — AI 에이전트용 도구 인터페이스
@@ -218,7 +229,9 @@ fn main() -> anyhow::Result<()> {
             output,
             replace,
             set_cell,
+            set_field,
             verify,
-        } => commands::edit::run(&input, &output, &replace, &set_cell, verify),
+        } => commands::edit::run(&input, &output, &replace, &set_cell, &set_field, verify),
+        Cmd::Fields { file, json } => commands::fields::run(&file, json),
     }
 }
