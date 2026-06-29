@@ -277,3 +277,103 @@ fn fill_replaces_slots() {
         let _ = std::fs::remove_file(f);
     }
 }
+
+#[test]
+fn edit_add_row_then_fill() {
+    // 양식(2행 표) → 행 3개 추가 + 같은 호출에서 셀 채움 → hwp5. cat으로 내용 확인.
+    let md = tmp("hwp_cli_addrow.md");
+    std::fs::write(&md, "| 품목 | 수량 |\n|------|------|\n| | |\n").unwrap();
+    let form = tmp("hwp_cli_addrow_form.hwp");
+    assert!(
+        hwp()
+            .args(["new", "--from"])
+            .arg(&md)
+            .arg("-o")
+            .arg(&form)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = tmp("hwp_cli_addrow_out.hwp");
+    let r = hwp()
+        .arg("edit")
+        .arg(&form)
+        .arg("-o")
+        .arg(&out)
+        .args([
+            "--add-row",
+            "0:3",
+            "--set-cell",
+            "0:1:0=노트북",
+            "--set-cell",
+            "0:3:0=키보드",
+            "--verify",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "edit --add-row: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let cat = hwp().arg("cat").arg(&out).output().unwrap();
+    let text = String::from_utf8_lossy(&cat.stdout);
+    assert!(
+        text.contains("노트북") && text.contains("키보드"),
+        "내용: {text}"
+    );
+    for f in [&md, &form, &out] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+#[test]
+fn fill_data_tables_grows() {
+    // 데이터 구동: --data tables 로 표를 데이터 수만큼 자동 증식 + 채움.
+    let md = tmp("hwp_cli_filltab.md");
+    std::fs::write(&md, "| 품목 | 수량 |\n|------|------|\n| | |\n").unwrap();
+    let form = tmp("hwp_cli_filltab_form.hwp");
+    assert!(
+        hwp()
+            .args(["new", "--from"])
+            .arg(&md)
+            .arg("-o")
+            .arg(&form)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let data = tmp("hwp_cli_filltab.json");
+    std::fs::write(
+        &data,
+        r#"{"tables":[{"table":0,"start_row":1,"rows":[["사과","3"],["배","7"],["감","9"]]}]}"#,
+    )
+    .unwrap();
+    let out = tmp("hwp_cli_filltab_out.hwp");
+    let r = hwp()
+        .arg("fill")
+        .arg(&form)
+        .arg("-o")
+        .arg(&out)
+        .arg("--data")
+        .arg(&data)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "fill --data tables: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let j = String::from_utf8_lossy(&r.stdout);
+    assert!(j.contains("\"rows_added\""), "rows_added 키: {j}");
+    let cat = hwp().arg("cat").arg(&out).output().unwrap();
+    let text = String::from_utf8_lossy(&cat.stdout);
+    assert!(
+        text.contains("사과") && text.contains("배") && text.contains("감"),
+        "데이터 채움: {text}"
+    );
+    for f in [&md, &form, &data, &out] {
+        let _ = std::fs::remove_file(f);
+    }
+}

@@ -123,6 +123,10 @@ enum Cmd {
         /// 텍스트 치환 "찾기=>바꾸기" (반복 가능, 모든 일치 치환)
         #[arg(long)]
         replace: Vec<String>,
+        /// 표 행 추가 "표:N" 또는 "표:템플릿행:N" (반복 가능, 0-기반). 마지막 행을
+        /// 복제해 빈 행 N개 추가 — 새 행(인덱스 기존행수부터)은 --set-cell로 채운다.
+        #[arg(long = "add-row")]
+        add_row: Vec<String>,
         /// 표 셀 설정 "표:행:열=값" (반복 가능, 0-기반 인덱스)
         #[arg(long = "set-cell")]
         set_cell: Vec<String>,
@@ -314,13 +318,15 @@ fn main() -> anyhow::Result<()> {
             input,
             output,
             replace,
+            add_row,
             set_cell,
             set_field,
             set_meta,
             add_memo,
             verify,
         } => commands::edit::run(
-            &input, &output, &replace, &set_cell, &set_field, &set_meta, &add_memo, verify,
+            &input, &output, &replace, &add_row, &set_cell, &set_field, &set_meta, &add_memo,
+            verify,
         ),
         Cmd::Fields { file, json } => commands::fields::run(&file, json),
         Cmd::Slots { file, json } => commands::slots::run(&file, json),

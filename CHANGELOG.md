@@ -3,6 +3,23 @@
 모든 주요 변경은 이 파일에 기록한다. 형식은 [Keep a Changelog](https://keepachangelog.com/),
 버전은 [SemVer](https://semver.org/)를 따른다.
 
+## [Unreleased]
+
+### Added
+- **표 행 추가(양식 변형)** — `hwp_convert::add_rows(doc, table_index, template_row, count)`:
+  마지막의 병합 없는 행을 복제해 빈 행 N개를 추가(셀 폭·여백·테두리·문자/문단 모양 보존,
+  내용은 비움)하고, 추가된 행은 `set_cell`로 채운다. IR 구조체 변경 없음.
+  - `hwp edit --add-row "표:N"`(또는 `"표:템플릿행:N"`) — `--set-cell`보다 먼저 적용돼
+    같은 호출에서 새 행을 채운다.
+  - `hwp fill --data {"fields":{...}, "tables":[{"table":0,"start_row":1,"rows":[[..],..]}]}`
+    — 데이터 수만큼 표를 자동 증식 + 셀 채우기(.hwp/.hwpx). 자리표시자 치환(바이트 보존)
+    경로는 그대로 유지.
+  - MCP `hwp_edit`에 `add_rows` 배열(set_cell보다 먼저 적용).
+  - 가드: 병합 셀/세로병합에 덮인 부분 행은 복제 거부(그리드 보호); u16 행 한도 초과 거부;
+    복제 문단은 고유 instance_id·마지막 문단 bit31 부여(hwp5 출신 편집 경로는 writer가
+    정규화하지 않으므로 IR에서 보장). hwp5 바이트 동일성 게이트는 미편집 경로만 영향받아
+    무관, 한글 합성 게이트(셀당 nparas≥1, row_cell_counts 정합)는 통과.
+
 ## [0.2.0]
 
 ### Added

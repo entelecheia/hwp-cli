@@ -317,6 +317,19 @@ fn tool_edit(args: &Value) -> Result<Vec<Value>, String> {
             summary.push(format!("치환 {from:?}→{to:?}: {n}건"));
         }
     }
+    // 행 추가는 셀 설정보다 먼저 — 새 행을 같은 호출에서 set_cell로 채울 수 있게.
+    if let Some(arr) = args.get("add_rows").and_then(Value::as_array) {
+        for a in arr {
+            let table = a.get("table").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let count = a.get("count").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let template_row = a
+                .get("template_row")
+                .and_then(Value::as_u64)
+                .map(|r| r as u16);
+            hwp_convert::add_rows(&mut doc, table, template_row, count)?;
+            summary.push(format!("행 추가 표{table}×{count}"));
+        }
+    }
     if let Some(arr) = args.get("set_cell").and_then(Value::as_array) {
         for c in arr {
             let table = c.get("table").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -339,7 +352,9 @@ fn tool_edit(args: &Value) -> Result<Vec<Value>, String> {
         }
     }
     if summary.is_empty() {
-        return Err("적용할 편집이 없습니다 (replace/set_cell 확인)".to_string());
+        return Err(
+            "적용할 편집이 없습니다 (replace/add_rows/set_cell/set_field 확인)".to_string(),
+        );
     }
 
     crate::commands::convert::write_by_ext(&doc, Path::new(output), true, false)
@@ -455,6 +470,11 @@ fn tool_defs() -> Vec<Value> {
                 "replace": {"type": "array", "items": {"type": "object", "properties": {
                     "from": {"type": "string"}, "to": {"type": "string"}}, "required": ["from", "to"]},
                     "description": "텍스트 치환(모든 일치)"},
+                "add_rows": {"type": "array", "items": {"type": "object", "properties": {
+                    "table": {"type": "integer"}, "count": {"type": "integer"},
+                    "template_row": {"type": "integer"}},
+                    "required": ["table", "count"]},
+                    "description": "표 행 추가(0-기반). 마지막 행 복제로 빈 행 count개 추가 — set_cell보다 먼저 적용돼 새 행(인덱스 기존행수부터)을 같은 호출에서 채울 수 있다. template_row로 복제 원본 행 지정(선택)."},
                 "set_cell": {"type": "array", "items": {"type": "object", "properties": {
                     "table": {"type": "integer"}, "row": {"type": "integer"},
                     "col": {"type": "integer"}, "text": {"type": "string"}},

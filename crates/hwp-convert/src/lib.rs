@@ -10,7 +10,7 @@ pub mod odt;
 
 use hwp_model::Document;
 
-pub use edit::{add_memo, replace_text, set_cell};
+pub use edit::{add_memo, add_rows, replace_text, set_cell, table_dims};
 pub use field::{FieldInfo, PlaceholderInfo, list_fields, scan_placeholders, set_field};
 pub use from_markdown::{
     Preset, default_header, default_header_preset, from_markdown, from_markdown_preset,

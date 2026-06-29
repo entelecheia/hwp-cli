@@ -15,6 +15,7 @@ pub fn run(
     input: &Path,
     output: &Path,
     replaces: &[String],
+    add_rows: &[String],
     set_cells: &[String],
     set_fields: &[String],
     set_meta: &[String],
@@ -31,6 +32,17 @@ pub fn run(
         let n = hwp_convert::replace_text(&mut doc, from, to, true);
         eprintln!("치환: {from:?} → {to:?} ({n}건)");
         edits += n;
+    }
+
+    // 행 추가는 셀 설정보다 먼저 — 같은 호출 안에서 새 행을 --set-cell로 채울 수 있게.
+    for spec in add_rows {
+        let (ti, tpl, count) = parse_add_row(spec)?;
+        hwp_convert::add_rows(&mut doc, ti, tpl, count).map_err(|e| anyhow::anyhow!(e))?;
+        match tpl {
+            Some(r) => eprintln!("행 추가: 표{ti} (템플릿 행 {r}) × {count}"),
+            None => eprintln!("행 추가: 표{ti} × {count}"),
+        }
+        edits += count;
     }
 
     for spec in set_cells {
@@ -88,7 +100,7 @@ pub fn run(
 
     if edits == 0 {
         eprintln!(
-            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--set-meta/--add-memo 확인)"
+            "경고: 적용된 편집이 없습니다 (--replace/--add-row/--set-cell/--set-field/--set-meta/--add-memo 확인)"
         );
     }
 
@@ -98,6 +110,26 @@ pub fn run(
     }
     eprintln!("편집 완료: {} → {}", input.display(), output.display());
     Ok(())
+}
+
+/// `--add-row` 사양 파싱 — `"표:N"`(템플릿 자동) 또는 `"표:템플릿행:N"`.
+/// 반환: (표 인덱스, 템플릿 행 옵션, 추가 행 수).
+fn parse_add_row(spec: &str) -> anyhow::Result<(usize, Option<u16>, usize)> {
+    let parts: Vec<&str> = spec.split(':').map(str::trim).collect();
+    match parts.as_slice() {
+        [t, n] => {
+            let ti: usize = t.parse().context("표 인덱스")?;
+            let count: usize = n.parse().context("행 수")?;
+            Ok((ti, None, count))
+        }
+        [t, r, n] => {
+            let ti: usize = t.parse().context("표 인덱스")?;
+            let tpl: u16 = r.parse().context("템플릿 행")?;
+            let count: usize = n.parse().context("행 수")?;
+            Ok((ti, Some(tpl), count))
+        }
+        _ => anyhow::bail!("--add-row 형식은 \"표:N\" 또는 \"표:템플릿행:N\" 입니다: {spec:?}"),
+    }
 }
 
 fn write_output(doc: &hwp_model::Document, output: &Path) -> anyhow::Result<()> {
