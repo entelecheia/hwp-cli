@@ -6,7 +6,7 @@
 use rustybuzz::ttf_parser;
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
-use crate::display::{DisplayList, Item, PageList};
+use crate::display::{BOLD_STROKE, DisplayList, Item, PageList};
 use crate::error::RenderError;
 
 /// 기울임 시뮬레이션 각도의 탄젠트 (≈12°).
@@ -143,9 +143,9 @@ fn render_page(page: &PageList, dpi: f32) -> Result<Pixmap, RenderError> {
 
                         pixmap.fill_path(&path, &paint, FillRule::Winding, t, None);
                         if run.bold {
-                            // 합성 굵게: 윤곽선 위 스트로크 (굵기 ≈ 크기의 3%)
+                            // 합성 굵게: 윤곽선 위 스트로크 (굵기 ≈ 크기의 4.5% — 한컴 굵게 대조)
                             let stroke = Stroke {
-                                width: run.size_pt * 0.03 / glyph_scale,
+                                width: run.size_pt * BOLD_STROKE / glyph_scale,
                                 ..Stroke::default()
                             };
                             pixmap.stroke_path(&path, &paint, &stroke, t, None);

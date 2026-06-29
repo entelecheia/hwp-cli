@@ -21,7 +21,7 @@ use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str};
 use rustybuzz::ttf_parser;
 use subsetter::GlyphRemapper;
 
-use crate::display::{DisplayList, Item, PageList};
+use crate::display::{BOLD_STROKE, DisplayList, Item, PageList};
 
 const ITALIC_SKEW: f32 = 0.2126;
 
@@ -441,7 +441,7 @@ fn build_page_content(
                 if run.bold {
                     content.set_text_rendering_mode(TextRenderingMode::FillStroke);
                     content.set_stroke_rgb(r, g, b);
-                    content.set_line_width(run.size_pt * 0.03);
+                    content.set_line_width(run.size_pt * BOLD_STROKE);
                 } else {
                     content.set_text_rendering_mode(TextRenderingMode::Fill);
                 }

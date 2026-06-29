@@ -55,14 +55,29 @@ pub fn layout_document(
                 warnings.push("PAGE_DEF 없음 — A4 기본값 사용".to_string());
                 default_page()
             });
-        let (w, h) = (
-            page_def.width.to_pt() as f32,
-            page_def.height.to_pt() as f32,
-        );
+        // 가로(landscape, attr bit0): 용지를 90° 돌려 폭↔높이 스왑.
+        let landscape = page_def.attr & 1 != 0;
+        let (w, h) = if landscape {
+            (
+                page_def.height.to_pt() as f32,
+                page_def.width.to_pt() as f32,
+            )
+        } else {
+            (
+                page_def.width.to_pt() as f32,
+                page_def.height.to_pt() as f32,
+            )
+        };
+        // 본문 폭 계산의 기준 용지 폭(HWPUNIT) — landscape면 height가 폭이 된다.
+        let paper_w_hu = if landscape {
+            page_def.height.0
+        } else {
+            page_def.width.0
+        };
         let body_left = page_def.margin_left.to_pt() as f32;
         let body_top = (page_def.margin_top.0 + page_def.margin_header.0) as f32 / 100.0;
         let body_width =
-            (page_def.width.0 - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
+            (paper_w_hu - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
         // 본문 영역 하한 (넘침 분할 기준)
         let body_bottom = h - (page_def.margin_bottom.0 + page_def.margin_footer.0) as f32 / 100.0;
 
@@ -586,9 +601,12 @@ fn layout_table(
     // 기준이라, 우리 셰이핑/합성 줄바꿈이 더 많은 줄을 만들면 내용이 다음 행을 침범해
     // 겹친다 — 실측 높이와 max로 행을 늘려 방지). 스크래치 페이지에 그려 높이만 잰다.
     let mut spanned: Vec<(usize, usize, f32)> = Vec::new(); // (시작행, 스팬, 필요높이)
+    // 셀별 실측 내용 높이 (table.cells 순서) — 세로정렬에 재사용(재측정 회피).
+    let mut content_h_by_cell: Vec<f32> = Vec::with_capacity(table.cells.len());
     for cell in &table.cells {
         let (c, r) = (cell.col as usize, cell.row as usize);
         if c >= cols || r >= rows {
+            content_h_by_cell.push(0.0);
             continue;
         }
         let cw: f32 = col_w[c..(c + cell.col_span as usize).min(cols)]
@@ -611,6 +629,7 @@ fn layout_table(
             (cw - ml - mr).max(4.0),
             &mut scratch_warn,
         );
+        content_h_by_cell.push(content_h);
         let needed = content_h + mt + mb;
         let span = (cell.row_span as usize).max(1);
         if span == 1 {
@@ -632,7 +651,7 @@ fn layout_table(
     let col_x: Vec<f32> = prefix_sums(&col_w, x);
     let row_y: Vec<f32> = prefix_sums(&row_h, y);
 
-    for cell in &table.cells {
+    for (ci, cell) in table.cells.iter().enumerate() {
         let (c, r) = (cell.col as usize, cell.row as usize);
         if c >= cols || r >= rows {
             warnings.push(format!("셀 주소가 표 범위를 벗어남: ({r},{c})"));
@@ -663,15 +682,23 @@ fn layout_table(
             });
         }
 
-        // 2) 내용 — 셀 여백(셀 지정 → 표 기본 → 한글 기본) 적용
-        let (ml, mr, mt, _mb) = cell_margins(table, cell);
+        // 2) 내용 — 셀 여백(셀 지정 → 표 기본 → 한글 기본) + 세로정렬
+        let (ml, mr, mt, mb) = cell_margins(table, cell);
+        // 세로정렬: list_attr bits5-6 (0=위, 1=가운데, 2=아래). 실측 내용 높이로 오프셋.
+        let content_h = content_h_by_cell.get(ci).copied().unwrap_or(0.0);
+        let avail = (ch - mt - mb - content_h).max(0.0);
+        let voff = match (cell.list_attr >> 5) & 0x3 {
+            1 => avail * 0.5,
+            2 => avail,
+            _ => 0.0,
+        };
         layout_box_paragraphs(
             doc,
             store,
             page,
             &cell.paragraphs,
             cx + ml,
-            cy + mt,
+            cy + mt + voff,
             (cw - ml - mr).max(4.0),
             warnings,
         );

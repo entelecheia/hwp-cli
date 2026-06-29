@@ -202,6 +202,17 @@ fn shape_piece(
         return Vec::new();
     };
 
+    // 요청 글꼴 이름이 굵은(heavy) 계열인데 우리 대체 글꼴엔 굵은 페이스가 없으면,
+    // faux-bold로 굵기를 보강한다(예: HY견고딕/헤드라인M → 함초롬돋움 regular).
+    let face_name = doc
+        .header
+        .fonts
+        .get(lang)
+        .and_then(|f| f.get(face_id as usize))
+        .map(|f| f.name.as_str())
+        .unwrap_or("");
+    let bold = cs.is_bold() || is_heavy_name(face_name);
+
     // 글자별 글꼴 배정: primary가 글리프를 가지면 primary, 아니면 커버리지 폴백.
     let primary_face = ttf_parser::Face::parse(&primary.data, primary.index).ok();
     let primary_covers = |c: char| {
@@ -230,9 +241,26 @@ fn shape_piece(
     segments
         .into_iter()
         .filter_map(|(font, seg_text, seg_start)| {
-            shape_with_font(&font, cs, lang, &seg_text, seg_start)
+            shape_with_font(&font, cs, lang, &seg_text, seg_start, bold)
         })
         .collect()
+}
+
+/// 글꼴 이름이 굵은(heavy/bold) 계열인지 — 대체 글꼴 faux-bold 판단용.
+/// 숫자 굵기(예: 윤고딕 240/760)는 모호해 제외하고 명확한 키워드만 본다.
+fn is_heavy_name(name: &str) -> bool {
+    const HEAVY: &[&str] = &[
+        "견고딕",
+        "견명조",
+        "헤드라인",
+        "굵은",
+        "Heavy",
+        "Black",
+        "ExtraBold",
+        "Ultra",
+        "Bold",
+    ];
+    HEAVY.iter().any(|k| name.contains(k))
 }
 
 /// 주어진 글꼴 하나로 텍스트를 셰이핑해 [`ShapedRun`]을 만든다.
@@ -242,6 +270,7 @@ fn shape_with_font(
     lang: usize,
     text: &str,
     start_wchar: u32,
+    bold: bool,
 ) -> Option<ShapedRun> {
     let face = rustybuzz::Face::from_slice(&font.data, font.index)?;
     let upem = face.units_per_em() as f32;
@@ -278,7 +307,7 @@ fn shape_with_font(
         size_pt,
         x_scale,
         color: cs.text_color,
-        bold: cs.is_bold(),
+        bold,
         italic: cs.is_italic(),
         underline: cs.has_underline(),
         strike: cs.has_strike(),

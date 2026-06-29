@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 
 use rustybuzz::ttf_parser;
 
-use crate::display::{DisplayList, Item, PageList};
+use crate::display::{BOLD_STROKE, DisplayList, Item, PageList};
 
 pub fn render_svg(list: &DisplayList) -> Vec<String> {
     list.pages.iter().map(render_page).collect()
@@ -81,7 +81,10 @@ fn render_page(page: &PageList) -> String {
                 let color = hex_color(run.color);
                 let skew_c = if run.italic { 0.2126 * s } else { 0.0 };
                 let stroke = if run.bold {
-                    format!(r#" stroke="{color}" stroke-width="{:.1}""#, 0.03 * upem)
+                    format!(
+                        r#" stroke="{color}" stroke-width="{:.1}""#,
+                        BOLD_STROKE * upem
+                    )
                 } else {
                     String::new()
                 };
