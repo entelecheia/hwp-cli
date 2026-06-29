@@ -4,12 +4,20 @@ use std::path::Path;
 
 use hwp_convert::Preset;
 
-pub fn run(output: &Path, from: Option<&Path>, preset: Preset) -> anyhow::Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    output: &Path,
+    from: Option<&Path>,
+    preset: Preset,
+    title: Option<String>,
+    author: Option<String>,
+    subject: Option<String>,
+) -> anyhow::Result<()> {
     let ext = output
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase);
-    let doc = match from {
+    let mut doc = match from {
         Some(src) => {
             let text = std::fs::read_to_string(src)?;
             if src
@@ -27,14 +35,23 @@ pub fn run(output: &Path, from: Option<&Path>, preset: Preset) -> anyhow::Result
         None => hwp_convert::from_markdown_preset("", preset),
     };
 
-    if ext.as_deref() == Some("hwp") {
-        crate::commands::convert::write_hwp(&doc, output, false)?;
-    } else {
-        let warnings = hwpx::write_document(&doc, output)?;
-        for w in &warnings {
-            eprintln!("경고: {w}");
-        }
+    // 메타데이터 플래그가 있으면 덮어쓴다(JSON IR에 있던 값보다 우선).
+    if title.is_some() {
+        doc.metadata.title = title;
     }
+    if author.is_some() {
+        doc.metadata.author = author;
+    }
+    if subject.is_some() {
+        doc.metadata.subject = subject;
+    }
+
+    let warnings = if ext.as_deref() == Some("hwp") {
+        crate::commands::convert::write_hwp(&doc, output, false)?
+    } else {
+        hwpx::write_document(&doc, output)?
+    };
+    crate::commands::convert::print_warnings(&warnings);
     eprintln!("생성 완료: {}", output.display());
     Ok(())
 }

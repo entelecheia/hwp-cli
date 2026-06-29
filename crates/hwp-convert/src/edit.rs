@@ -7,7 +7,25 @@
 //! 쓸 때 반드시 writer의 합성 경로(hwp5: `WriteOptions.edited=true`)를 거쳐야
 //! 한글이 수용한다. 이 모듈은 IR만 바꾸고, 불변식 재수립은 writer가 담당한다.
 
-use hwp_model::{CharShapeId, Control, Document, HwpChar, Paragraph};
+use hwp_model::{CharShapeId, Control, Document, HwpChar, Memo, Paragraph};
+
+/// 문서에 메모(주석)를 추가한다. `section`(0-기반)에 메모를 단다(범위 밖이면 마지막 섹션).
+/// hwpx 출력에서만 방출된다(hwp5 바이너리 메모 합성 미지원 — writer가 경고 후 생략).
+/// 반환값은 부여된 메모 id.
+pub fn add_memo(doc: &mut Document, section: usize, author: Option<&str>, text: &str) -> u32 {
+    if doc.sections.is_empty() {
+        doc.sections.push(hwp_model::Section::default());
+    }
+    let idx = section.min(doc.sections.len() - 1);
+    let sec = &mut doc.sections[idx];
+    let id = sec.memos.iter().map(|m| m.id + 1).max().unwrap_or(0);
+    sec.memos.push(Memo {
+        id,
+        author: author.filter(|a| !a.is_empty()).map(str::to_string),
+        text: text.to_string(),
+    });
+    id
+}
 
 /// 문서 전체에서 `from`을 `to`로 치환한다(본문·표 셀·글상자 문단 재귀).
 /// `all`이 거짓이면 첫 1건만 바꾼다. 반환값은 치환 횟수.

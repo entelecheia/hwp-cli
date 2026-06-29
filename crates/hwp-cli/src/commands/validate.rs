@@ -5,9 +5,13 @@
 
 use std::path::Path;
 
+use serde_json::{Value, json};
+
 use crate::format::{FileFormat, detect};
 
-pub fn run(path: &Path, json: bool) -> anyhow::Result<()> {
+/// 구조 검증 결과를 JSON 객체로 만든다 (CLI와 MCP가 공유 — `process::exit` 없음).
+/// `{file, format, valid, errors, warnings}`.
+pub fn validate_json(path: &Path) -> Value {
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut format = "unknown";
@@ -27,27 +31,30 @@ pub fn run(path: &Path, json: bool) -> anyhow::Result<()> {
         Err(e) => errors.push(format!("포맷 감지 실패: {e}")),
     }
 
-    let valid = errors.is_empty();
+    json!({
+        "file": path.display().to_string(),
+        "format": format,
+        "valid": errors.is_empty(),
+        "errors": errors,
+        "warnings": warnings,
+    })
+}
+
+pub fn run(path: &Path, json: bool) -> anyhow::Result<()> {
+    let result = validate_json(path);
+    let valid = result["valid"].as_bool().unwrap_or(false);
+
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "file": path.display().to_string(),
-                "format": format,
-                "valid": valid,
-                "errors": errors,
-                "warnings": warnings,
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!("파일: {}", path.display());
-        println!("포맷: {format}");
+        println!("포맷: {}", result["format"].as_str().unwrap_or("unknown"));
         println!("결과: {}", if valid { "유효" } else { "오류" });
-        for e in &errors {
-            println!("  오류: {e}");
+        for e in result["errors"].as_array().into_iter().flatten() {
+            println!("  오류: {}", e.as_str().unwrap_or_default());
         }
-        for w in &warnings {
-            println!("  경고: {w}");
+        for w in result["warnings"].as_array().into_iter().flatten() {
+            println!("  경고: {}", w.as_str().unwrap_or_default());
         }
     }
 

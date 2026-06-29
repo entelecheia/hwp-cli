@@ -427,6 +427,7 @@ mod tests {
         doc.sections.push(hwp_model::Section {
             paragraphs: vec![field_para("수신", "내부결재")],
             extras: Vec::new(),
+            memos: Vec::new(),
         });
         let fields = list_fields(&doc);
         assert_eq!(fields.len(), 1);
@@ -454,6 +455,7 @@ mod tests {
         doc.sections.push(hwp_model::Section {
             paragraphs: vec![field_para("수신", "")], // 빈 누름틀
             extras: Vec::new(),
+            memos: Vec::new(),
         });
         let n = set_field(&mut doc, "수신", "기획팀");
         assert_eq!(n, 1);

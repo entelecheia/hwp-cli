@@ -108,9 +108,8 @@ pub fn layout_document(
                         c,
                         Control::SectionDef(_) | Control::Table(_) | Control::Picture(_)
                     ) || [*b"cold", *b"head", *b"foot"].contains(&c.ctrl_id())
-                        // 글상자(텍스트 있는 gso)는 이제 렌더한다 — 미지원에서 제외.
-                        || matches!(c, Control::Generic(g)
-                            if g.ctrl_id == *b"gso " && !g.paragraph_lists.is_empty());
+                        // gso는 이제 모두 렌더한다(글상자=텍스트, 그 외=도형/placeholder).
+                        || c.ctrl_id() == *b"gso ";
                     !rendered
                 })
                 .count();
@@ -410,10 +409,132 @@ fn layout_para_objects(
                     object_y += used;
                 }
             }
+            // 텍스트 없는 gso: 도형(사각형/타원/선)·수식·차트·OLE — 실제 도형 또는
+            // 외곽선 placeholder로 렌더한다(드롭하지 않음).
+            Control::Generic(g) if g.ctrl_id == *b"gso " => {
+                if let Some(b) = crate::gso::parse_gso_box(&g.data) {
+                    let bw = b.width as f32 / 100.0;
+                    let bh = b.height as f32 / 100.0;
+                    if bw > 0.0 && bh > 0.0 {
+                        let (bx, by) = if b.treat_as_char() {
+                            (x, object_y)
+                        } else {
+                            (b.horz_offset as f32 / 100.0, b.vert_offset as f32 / 100.0)
+                        };
+                        render_shape(page, bx, by, bw, bh, shape_kind(&g.raw_children));
+                        if b.treat_as_char() {
+                            bottom = bottom.max(by + bh);
+                            object_y += bh;
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
     bottom
+}
+
+/// gso 도형 종류 (raw_children의 SHAPE_COMPONENT 리프 태그로 판별).
+#[derive(Clone, Copy, PartialEq)]
+enum ShapeKind {
+    Rectangle,
+    Ellipse,
+    Line,
+    /// 다각형/곡선/호 등 — 외곽선으로 근사.
+    Other,
+    Equation,
+    Chart,
+    Ole,
+}
+
+/// raw_children 서브트리에서 첫 SHAPE_COMPONENT_* 리프로 도형 종류를 추정한다.
+/// 수식/차트/OLE(비기하)을 만나면 즉시 확정(placeholder 우선).
+fn shape_kind(children: &[hwp_model::OpaqueRecord]) -> ShapeKind {
+    // HWPTAG_BEGIN = 16
+    const LINE: u16 = 16 + 62;
+    const RECT: u16 = 16 + 63;
+    const ELLIPSE: u16 = 16 + 64;
+    const ARC: u16 = 16 + 65;
+    const POLYGON: u16 = 16 + 66;
+    const CURVE: u16 = 16 + 67;
+    const OLE: u16 = 16 + 68;
+    const EQEDIT: u16 = 16 + 72;
+    const CHART: u16 = 16 + 79;
+
+    fn nongeometric(k: ShapeKind) -> bool {
+        matches!(k, ShapeKind::Equation | ShapeKind::Chart | ShapeKind::Ole)
+    }
+    fn scan(recs: &[hwp_model::OpaqueRecord], found: &mut Option<ShapeKind>) {
+        for r in recs {
+            let k = match r.tag {
+                LINE => Some(ShapeKind::Line),
+                RECT => Some(ShapeKind::Rectangle),
+                ELLIPSE => Some(ShapeKind::Ellipse),
+                ARC | POLYGON | CURVE => Some(ShapeKind::Other),
+                OLE => Some(ShapeKind::Ole),
+                EQEDIT => Some(ShapeKind::Equation),
+                CHART => Some(ShapeKind::Chart),
+                _ => None,
+            };
+            if let Some(k) = k {
+                if nongeometric(k) {
+                    *found = Some(k);
+                    return;
+                }
+                found.get_or_insert(k);
+            }
+            scan(&r.children, found);
+            if found.is_some_and(nongeometric) {
+                return;
+            }
+        }
+    }
+    let mut found = None;
+    scan(children, &mut found);
+    found.unwrap_or(ShapeKind::Other)
+}
+
+/// gso 도형을 회색 선분으로 렌더한다 (실제 색/세부 기하는 후속 마일스톤).
+/// 사각형/타원/선은 실제 형태, 그 외(다각형 등)는 외곽선, 수식/차트/OLE은 외곽선+X.
+fn render_shape(page: &mut PageList, x: f32, y: f32, w: f32, h: f32, kind: ShapeKind) {
+    const GRAY: u32 = 0x0080_8080;
+    fn seg(page: &mut PageList, x1: f32, y1: f32, x2: f32, y2: f32) {
+        page.items.push(Item::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            color: GRAY,
+            width: 0.75,
+        });
+    }
+    let outline = |page: &mut PageList| {
+        seg(page, x, y, x + w, y);
+        seg(page, x + w, y, x + w, y + h);
+        seg(page, x + w, y + h, x, y + h);
+        seg(page, x, y + h, x, y);
+    };
+    match kind {
+        ShapeKind::Line => seg(page, x, y, x + w, y + h),
+        ShapeKind::Ellipse => {
+            let (cx, cy, rx, ry) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+            let n = 48;
+            let (mut px, mut py) = (cx + rx, cy);
+            for i in 1..=n {
+                let t = (i as f32) * std::f32::consts::TAU / (n as f32);
+                let (nx, ny) = (cx + rx * t.cos(), cy + ry * t.sin());
+                seg(page, px, py, nx, ny);
+                (px, py) = (nx, ny);
+            }
+        }
+        ShapeKind::Rectangle | ShapeKind::Other => outline(page),
+        ShapeKind::Equation | ShapeKind::Chart | ShapeKind::Ole => {
+            outline(page);
+            seg(page, x, y, x + w, y + h);
+            seg(page, x + w, y, x, y + h);
+        }
+    }
 }
 
 /// 표 하나를 (x, y)에 배치하고 높이를 반환한다.

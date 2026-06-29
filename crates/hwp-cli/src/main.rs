@@ -82,6 +82,15 @@ enum Cmd {
         /// 문서 스타일 프리셋 (markdown 입력에만 적용; JSON IR 입력은 무시)
         #[arg(long, value_enum, default_value = "plain")]
         preset: PresetArg,
+        /// 문서 제목 (요약 정보 / OPF 메타데이터)
+        #[arg(long)]
+        title: Option<String>,
+        /// 지은이
+        #[arg(long)]
+        author: Option<String>,
+        /// 주제
+        #[arg(long)]
+        subject: Option<String>,
     },
 
     /// 렌더 결과를 한글 기준 PNG와 비교해 오차 측정 (위치 오프셋·픽셀 차이율)
@@ -120,6 +129,12 @@ enum Cmd {
         /// 필드/누름틀 채우기 "이름=값" (반복 가능 — hwp fields로 이름 확인)
         #[arg(long = "set-field")]
         set_field: Vec<String>,
+        /// 메타데이터 설정 "키=값" (키: title|author|subject|keywords, 반복 가능)
+        #[arg(long = "set-meta")]
+        set_meta: Vec<String>,
+        /// 메모(주석) 추가 "텍스트" (hwpx 출력 전용, 실험적, 반복 가능)
+        #[arg(long = "add-memo")]
+        add_memo: Vec<String>,
         /// 쓰기 후 재읽기로 검증
         #[arg(long)]
         verify: bool,
@@ -203,6 +218,7 @@ enum ConvertFormat {
     Json,
     Html,
     Pdf,
+    Odt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -283,15 +299,29 @@ fn main() -> anyhow::Result<()> {
             output,
             from,
             preset,
-        } => commands::new::run(&output, from.as_deref(), preset.into()),
+            title,
+            author,
+            subject,
+        } => commands::new::run(
+            &output,
+            from.as_deref(),
+            preset.into(),
+            title,
+            author,
+            subject,
+        ),
         Cmd::Edit {
             input,
             output,
             replace,
             set_cell,
             set_field,
+            set_meta,
+            add_memo,
             verify,
-        } => commands::edit::run(&input, &output, &replace, &set_cell, &set_field, verify),
+        } => commands::edit::run(
+            &input, &output, &replace, &set_cell, &set_field, &set_meta, &add_memo, verify,
+        ),
         Cmd::Fields { file, json } => commands::fields::run(&file, json),
         Cmd::Slots { file, json } => commands::slots::run(&file, json),
         Cmd::Fill {

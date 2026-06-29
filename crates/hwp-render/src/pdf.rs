@@ -6,16 +6,18 @@
 //! (폰트 advance 메트릭 비의존). 좌표 변환: PDF는 좌하단 원점·y 상향 → `pdf_y =
 //! page_height - hwp_y`.
 //!
-//! 폰트는 서브셋 없이 전체 임베드(Phase 1). 이미지(Item::Image)는 Phase 1 미지원
-//! (공문/기안문에 드묾) — Phase 2에서 XObject로 추가.
+//! 폰트는 사용 글리프만 서브셋 임베드. 이미지(Item::Image)는 PDF Image XObject로
+//! 임베드한다 — JPEG는 DCTDecode 무손실 통과, PNG/BMP/GIF는 디코드 후 FlateDecode RGB
+//! (알파는 흰색 합성). 위치는 단위 정사각형 CTM(좌하단 원점 변환).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::sync::Arc;
 
 use pdf_writer::types::{CidFontType, FontFlags, SystemInfo, TextRenderingMode, UnicodeCmap};
-use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str};
+use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str};
 use rustybuzz::ttf_parser;
 use subsetter::GlyphRemapper;
 
@@ -37,6 +39,101 @@ struct FontUse {
     used_gids: BTreeSet<u16>,
     /// 원본 GID → 서브셋 GID 재매핑 (서브셋 후 채움).
     remapper: GlyphRemapper,
+}
+
+/// 임베드 준비가 끝난 이미지 한 장 (XObject 스트림 바이트 + 메타).
+struct ImageUse {
+    res_name: String,
+    id: Ref,
+    width: i32,
+    height: i32,
+    /// 스트림 바이트 (JPEG 원본 또는 zlib 압축 RGB).
+    data: Vec<u8>,
+    filter: Filter,
+    gray: bool,
+}
+
+/// JPEG SOF에서 (너비, 높이, 컴포넌트 수)를 읽는다 (DCTDecode 통과용).
+fn jpeg_dims(data: &[u8]) -> Option<(u32, u32, u8)> {
+    if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = data[i + 1];
+        // 길이 없는 standalone 마커: RSTn(D0..D7), SOI/EOI/TEM 등.
+        if (0xD0..=0xD9).contains(&marker) || marker == 0x01 {
+            i += 2;
+            continue;
+        }
+        let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+        // SOF0..SOF15 (DHT=C4, JPG=C8, DAC=CC 제외)
+        let is_sof = matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
+        if is_sof {
+            if i + 9 < data.len() {
+                let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+                let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
+                let comps = data[i + 9];
+                return Some((w, h, comps));
+            }
+            return None;
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// zlib(=PDF FlateDecode) 압축.
+fn deflate(data: &[u8]) -> Vec<u8> {
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let _ = enc.write_all(data);
+    enc.finish().unwrap_or_default()
+}
+
+/// 인코딩된 이미지 바이트를 PDF XObject 스트림으로 준비한다.
+/// JPEG(1/3 컴포넌트)는 DCTDecode 무손실 통과, 그 외(또는 CMYK JPEG)는 RGB 디코드 후 Flate.
+fn prepare_image(bytes: &[u8]) -> Option<(i32, i32, Vec<u8>, Filter, bool)> {
+    if bytes.starts_with(&[0xFF, 0xD8])
+        && let Some((w, h, comps)) = jpeg_dims(bytes)
+        && (comps == 1 || comps == 3)
+        && w > 0
+        && h > 0
+    {
+        return Some((
+            w as i32,
+            h as i32,
+            bytes.to_vec(),
+            Filter::DctDecode,
+            comps == 1,
+        ));
+    }
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    // 알파를 흰 배경에 합성하고 RGB로 평탄화.
+    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+    for px in rgba.pixels() {
+        let [r, g, b, a] = px.0;
+        let af = a as f32 / 255.0;
+        let comp = |c: u8| ((c as f32 * af) + 255.0 * (1.0 - af)).round() as u8;
+        rgb.push(comp(r));
+        rgb.push(comp(g));
+        rgb.push(comp(b));
+    }
+    Some((
+        w as i32,
+        h as i32,
+        deflate(&rgb),
+        Filter::FlateDecode,
+        false,
+    ))
 }
 
 /// DisplayList를 단일 다페이지 PDF 바이트로 직렬화한다.
@@ -90,6 +187,33 @@ pub fn render_pdf(list: &DisplayList) -> Vec<u8> {
                     for (g, c) in run.glyphs.iter().zip(chars) {
                         fonts[fi].gid_to_char.entry(g.id).or_insert(c);
                     }
+                }
+            }
+        }
+    }
+
+    // ── 1c. 이미지 수집 (data 포인터로 유일화; 준비 실패 시 건너뜀) ──
+    let mut images: Vec<ImageUse> = Vec::new();
+    let mut image_index: HashMap<usize, usize> = HashMap::new();
+    for page in &list.pages {
+        for item in &page.items {
+            if let Item::Image { data, .. } = item {
+                let key = data.as_ptr() as usize;
+                if image_index.contains_key(&key) {
+                    continue;
+                }
+                if let Some((width, height, bytes, filter, gray)) = prepare_image(data) {
+                    let idx = images.len();
+                    images.push(ImageUse {
+                        res_name: format!("Im{idx}"),
+                        id: take(&mut alloc),
+                        width,
+                        height,
+                        data: bytes,
+                        filter,
+                        gray,
+                    });
+                    image_index.insert(key, idx);
                 }
             }
         }
@@ -187,6 +311,21 @@ pub fn render_pdf(list: &DisplayList) -> Vec<u8> {
         pdf.cmap(f.cmap, &cmap.finish());
     }
 
+    // ── 2b. 이미지 XObject 임베드 ──
+    for img in &images {
+        let mut xobj = pdf.image_xobject(img.id, &img.data);
+        xobj.width(img.width);
+        xobj.height(img.height);
+        xobj.bits_per_component(8);
+        xobj.filter(img.filter);
+        if img.gray {
+            xobj.color_space().device_gray();
+        } else {
+            xobj.color_space().device_rgb();
+        }
+        xobj.finish();
+    }
+
     // ── 3. 페이지 ──
     let mut page_ids: Vec<Ref> = Vec::new();
     for page in &list.pages {
@@ -194,7 +333,7 @@ pub fn render_pdf(list: &DisplayList) -> Vec<u8> {
         let content_id = take(&mut alloc);
         page_ids.push(page_id);
 
-        let content = build_page_content(page, &fonts, &font_index);
+        let content = build_page_content(page, &fonts, &font_index, &images, &image_index);
 
         let mut p = pdf.page(page_id);
         p.media_box(Rect::new(0.0, 0.0, page.width_pt, page.height_pt));
@@ -207,6 +346,13 @@ pub fn render_pdf(list: &DisplayList) -> Vec<u8> {
                 dict.pair(Name(f.res_name.as_bytes()), f.type0);
             }
             dict.finish();
+            if !images.is_empty() {
+                let mut xdict = res.x_objects();
+                for img in &images {
+                    xdict.pair(Name(img.res_name.as_bytes()), img.id);
+                }
+                xdict.finish();
+            }
             res.finish();
         }
         p.finish();
@@ -226,6 +372,8 @@ fn build_page_content(
     page: &PageList,
     fonts: &[FontUse],
     font_index: &HashMap<usize, usize>,
+    images: &[ImageUse],
+    image_index: &HashMap<usize, usize>,
 ) -> Vec<u8> {
     let h = page.height_pt;
     let mut content = Content::new();
@@ -263,8 +411,22 @@ fn build_page_content(
                 content.stroke();
                 content.restore_state();
             }
-            Item::Image { .. } => {
-                // Phase 1 미지원 (공문/기안문에 드묾).
+            Item::Image {
+                x,
+                y,
+                w,
+                h: ih,
+                data,
+            } => {
+                let key = data.as_ptr() as usize;
+                let Some(&ii) = image_index.get(&key) else {
+                    continue; // 준비 실패 이미지 — 건너뜀
+                };
+                // 단위 정사각형 이미지 공간 → 페이지 좌표 (좌하단 원점, y 뒤집기).
+                content.save_state();
+                content.transform([*w, 0.0, 0.0, *ih, *x, h - (*y + *ih)]);
+                content.x_object(Name(images[ii].res_name.as_bytes()));
+                content.restore_state();
             }
             Item::Glyphs { x, y, run } => {
                 let Some(&fi) = font_index.get(&(run.font.data.as_ptr() as usize)) else {

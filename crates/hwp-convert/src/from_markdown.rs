@@ -232,10 +232,12 @@ pub fn from_markdown_preset(md: &str, preset: Preset) -> Document {
             source_format: "markdown".to_string(),
             source_version: String::new(),
         },
+        metadata: Default::default(),
         header: default_header_preset(preset),
         sections: vec![Section {
             paragraphs: b.paragraphs,
             extras: Vec::new(),
+            memos: Vec::new(),
         }],
         bin_streams: Vec::new(),
     }

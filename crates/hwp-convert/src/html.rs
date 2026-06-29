@@ -26,7 +26,15 @@ pub fn to_html(doc: &Document) -> String {
             render_paragraph(doc, para, &mut body);
         }
     }
-    let title = escape(&first_heading(doc).unwrap_or_default());
+    // 문서 메타데이터 제목 우선, 없으면 첫 개요 단락으로 폴백.
+    let title_text = doc
+        .metadata
+        .title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| first_heading(doc))
+        .unwrap_or_default();
+    let title = escape(&title_text);
     let mut out = String::with_capacity(body.len() + CSS.len() + 256);
     out.push_str("<!DOCTYPE html>\n<html lang=\"ko\"><head><meta charset=\"utf-8\">\n<title>");
     out.push_str(&title);
