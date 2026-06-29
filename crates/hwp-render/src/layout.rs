@@ -55,14 +55,29 @@ pub fn layout_document(
                 warnings.push("PAGE_DEF 없음 — A4 기본값 사용".to_string());
                 default_page()
             });
-        let (w, h) = (
-            page_def.width.to_pt() as f32,
-            page_def.height.to_pt() as f32,
-        );
+        // 가로(landscape, attr bit0): 용지를 90° 돌려 폭↔높이 스왑.
+        let landscape = page_def.attr & 1 != 0;
+        let (w, h) = if landscape {
+            (
+                page_def.height.to_pt() as f32,
+                page_def.width.to_pt() as f32,
+            )
+        } else {
+            (
+                page_def.width.to_pt() as f32,
+                page_def.height.to_pt() as f32,
+            )
+        };
+        // 본문 폭 계산의 기준 용지 폭(HWPUNIT) — landscape면 height가 폭이 된다.
+        let paper_w_hu = if landscape {
+            page_def.height.0
+        } else {
+            page_def.width.0
+        };
         let body_left = page_def.margin_left.to_pt() as f32;
         let body_top = (page_def.margin_top.0 + page_def.margin_header.0) as f32 / 100.0;
         let body_width =
-            (page_def.width.0 - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
+            (paper_w_hu - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
         // 본문 영역 하한 (넘침 분할 기준)
         let body_bottom = h - (page_def.margin_bottom.0 + page_def.margin_footer.0) as f32 / 100.0;
 
@@ -108,9 +123,8 @@ pub fn layout_document(
                         c,
                         Control::SectionDef(_) | Control::Table(_) | Control::Picture(_)
                     ) || [*b"cold", *b"head", *b"foot"].contains(&c.ctrl_id())
-                        // 글상자(텍스트 있는 gso)는 이제 렌더한다 — 미지원에서 제외.
-                        || matches!(c, Control::Generic(g)
-                            if g.ctrl_id == *b"gso " && !g.paragraph_lists.is_empty());
+                        // gso는 이제 모두 렌더한다(글상자=텍스트, 그 외=도형/placeholder).
+                        || c.ctrl_id() == *b"gso ";
                     !rendered
                 })
                 .count();
@@ -410,13 +424,152 @@ fn layout_para_objects(
                     object_y += used;
                 }
             }
+            // 텍스트 없는 gso: 도형(사각형/타원/선)·수식·차트·OLE — 실제 도형 또는
+            // 외곽선 placeholder로 렌더한다(드롭하지 않음).
+            Control::Generic(g) if g.ctrl_id == *b"gso " => {
+                if let Some(b) = crate::gso::parse_gso_box(&g.data) {
+                    let bw = b.width as f32 / 100.0;
+                    let bh = b.height as f32 / 100.0;
+                    if bw > 0.0 && bh > 0.0 {
+                        let (bx, by) = if b.treat_as_char() {
+                            (x, object_y)
+                        } else {
+                            (b.horz_offset as f32 / 100.0, b.vert_offset as f32 / 100.0)
+                        };
+                        render_shape(page, bx, by, bw, bh, shape_kind(&g.raw_children));
+                        if b.treat_as_char() {
+                            bottom = bottom.max(by + bh);
+                            object_y += bh;
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
     bottom
 }
 
+/// gso 도형 종류 (raw_children의 SHAPE_COMPONENT 리프 태그로 판별).
+#[derive(Clone, Copy, PartialEq)]
+enum ShapeKind {
+    Rectangle,
+    Ellipse,
+    Line,
+    /// 다각형/곡선/호 등 — 외곽선으로 근사.
+    Other,
+    Equation,
+    Chart,
+    Ole,
+}
+
+/// raw_children 서브트리에서 첫 SHAPE_COMPONENT_* 리프로 도형 종류를 추정한다.
+/// 수식/차트/OLE(비기하)을 만나면 즉시 확정(placeholder 우선).
+fn shape_kind(children: &[hwp_model::OpaqueRecord]) -> ShapeKind {
+    // HWPTAG_BEGIN = 16
+    const LINE: u16 = 16 + 62;
+    const RECT: u16 = 16 + 63;
+    const ELLIPSE: u16 = 16 + 64;
+    const ARC: u16 = 16 + 65;
+    const POLYGON: u16 = 16 + 66;
+    const CURVE: u16 = 16 + 67;
+    const OLE: u16 = 16 + 68;
+    const EQEDIT: u16 = 16 + 72;
+    const CHART: u16 = 16 + 79;
+
+    fn nongeometric(k: ShapeKind) -> bool {
+        matches!(k, ShapeKind::Equation | ShapeKind::Chart | ShapeKind::Ole)
+    }
+    fn scan(recs: &[hwp_model::OpaqueRecord], found: &mut Option<ShapeKind>) {
+        for r in recs {
+            let k = match r.tag {
+                LINE => Some(ShapeKind::Line),
+                RECT => Some(ShapeKind::Rectangle),
+                ELLIPSE => Some(ShapeKind::Ellipse),
+                ARC | POLYGON | CURVE => Some(ShapeKind::Other),
+                OLE => Some(ShapeKind::Ole),
+                EQEDIT => Some(ShapeKind::Equation),
+                CHART => Some(ShapeKind::Chart),
+                _ => None,
+            };
+            if let Some(k) = k {
+                if nongeometric(k) {
+                    *found = Some(k);
+                    return;
+                }
+                found.get_or_insert(k);
+            }
+            scan(&r.children, found);
+            if found.is_some_and(nongeometric) {
+                return;
+            }
+        }
+    }
+    let mut found = None;
+    scan(children, &mut found);
+    found.unwrap_or(ShapeKind::Other)
+}
+
+/// gso 도형을 회색 선분으로 렌더한다 (실제 색/세부 기하는 후속 마일스톤).
+/// 사각형/타원/선은 실제 형태, 그 외(다각형 등)는 외곽선, 수식/차트/OLE은 외곽선+X.
+fn render_shape(page: &mut PageList, x: f32, y: f32, w: f32, h: f32, kind: ShapeKind) {
+    const GRAY: u32 = 0x0080_8080;
+    fn seg(page: &mut PageList, x1: f32, y1: f32, x2: f32, y2: f32) {
+        page.items.push(Item::Line {
+            x1,
+            y1,
+            x2,
+            y2,
+            color: GRAY,
+            width: 0.75,
+        });
+    }
+    let outline = |page: &mut PageList| {
+        seg(page, x, y, x + w, y);
+        seg(page, x + w, y, x + w, y + h);
+        seg(page, x + w, y + h, x, y + h);
+        seg(page, x, y + h, x, y);
+    };
+    match kind {
+        ShapeKind::Line => seg(page, x, y, x + w, y + h),
+        ShapeKind::Ellipse => {
+            let (cx, cy, rx, ry) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
+            let n = 48;
+            let (mut px, mut py) = (cx + rx, cy);
+            for i in 1..=n {
+                let t = (i as f32) * std::f32::consts::TAU / (n as f32);
+                let (nx, ny) = (cx + rx * t.cos(), cy + ry * t.sin());
+                seg(page, px, py, nx, ny);
+                (px, py) = (nx, ny);
+            }
+        }
+        ShapeKind::Rectangle | ShapeKind::Other => outline(page),
+        ShapeKind::Equation | ShapeKind::Chart | ShapeKind::Ole => {
+            outline(page);
+            seg(page, x, y, x + w, y + h);
+            seg(page, x + w, y, x, y + h);
+        }
+    }
+}
+
 /// 표 하나를 (x, y)에 배치하고 높이를 반환한다.
+/// 셀 여백 (왼/오른/위/아래) pt — 셀 지정 → 표 기본 → 한글 기본.
+fn cell_margins(table: &Table, cell: &hwp_model::Cell) -> (f32, f32, f32, f32) {
+    let m = if cell.margins.iter().any(|&v| v > 0) {
+        cell.margins
+    } else if table.inner_margins.iter().any(|&v| v > 0) {
+        table.inner_margins
+    } else {
+        DEFAULT_CELL_MARGINS
+    };
+    (
+        m[0] as f32 / 100.0,
+        m[1] as f32 / 100.0,
+        m[2] as f32 / 100.0,
+        m[3] as f32 / 100.0,
+    )
+}
+
 fn layout_table(
     doc: &Document,
     store: &mut FontStore,
@@ -444,11 +597,61 @@ fn layout_table(
     fill_unknown(&mut col_w, 60.0);
     fill_unknown(&mut row_h, 18.0);
 
+    // 측정 패스: 실제 내용 높이로 행 높이를 확장한다(저장된 cell.height는 한글의 줄바꿈
+    // 기준이라, 우리 셰이핑/합성 줄바꿈이 더 많은 줄을 만들면 내용이 다음 행을 침범해
+    // 겹친다 — 실측 높이와 max로 행을 늘려 방지). 스크래치 페이지에 그려 높이만 잰다.
+    let mut spanned: Vec<(usize, usize, f32)> = Vec::new(); // (시작행, 스팬, 필요높이)
+    // 셀별 실측 내용 높이 (table.cells 순서) — 세로정렬에 재사용(재측정 회피).
+    let mut content_h_by_cell: Vec<f32> = Vec::with_capacity(table.cells.len());
+    for cell in &table.cells {
+        let (c, r) = (cell.col as usize, cell.row as usize);
+        if c >= cols || r >= rows {
+            content_h_by_cell.push(0.0);
+            continue;
+        }
+        let cw: f32 = col_w[c..(c + cell.col_span as usize).min(cols)]
+            .iter()
+            .sum();
+        let (ml, mr, mt, mb) = cell_margins(table, cell);
+        let mut scratch = PageList {
+            width_pt: page.width_pt,
+            height_pt: page.height_pt,
+            items: Vec::new(),
+        };
+        let mut scratch_warn = Vec::new();
+        let content_h = layout_box_paragraphs(
+            doc,
+            store,
+            &mut scratch,
+            &cell.paragraphs,
+            0.0,
+            0.0,
+            (cw - ml - mr).max(4.0),
+            &mut scratch_warn,
+        );
+        content_h_by_cell.push(content_h);
+        let needed = content_h + mt + mb;
+        let span = (cell.row_span as usize).max(1);
+        if span == 1 {
+            row_h[r] = row_h[r].max(needed);
+        } else {
+            spanned.push((r, span, needed));
+        }
+    }
+    // row_span>1 셀: 스팬 행 합이 부족하면 마지막 스팬 행에 부족분을 더한다.
+    for (r, span, needed) in spanned {
+        let end = (r + span).min(rows);
+        let cur: f32 = row_h[r..end].iter().sum();
+        if end > r && needed > cur {
+            row_h[end - 1] += needed - cur;
+        }
+    }
+
     // 누적 오프셋
     let col_x: Vec<f32> = prefix_sums(&col_w, x);
     let row_y: Vec<f32> = prefix_sums(&row_h, y);
 
-    for cell in &table.cells {
+    for (ci, cell) in table.cells.iter().enumerate() {
         let (c, r) = (cell.col as usize, cell.row as usize);
         if c >= cols || r >= rows {
             warnings.push(format!("셀 주소가 표 범위를 벗어남: ({r},{c})"));
@@ -479,26 +682,23 @@ fn layout_table(
             });
         }
 
-        // 2) 내용 — 셀 여백(셀 지정 → 표 기본 → 한글 기본) 적용
-        let margins = if cell.margins.iter().any(|&m| m > 0) {
-            cell.margins
-        } else if table.inner_margins.iter().any(|&m| m > 0) {
-            table.inner_margins
-        } else {
-            DEFAULT_CELL_MARGINS
+        // 2) 내용 — 셀 여백(셀 지정 → 표 기본 → 한글 기본) + 세로정렬
+        let (ml, mr, mt, mb) = cell_margins(table, cell);
+        // 세로정렬: list_attr bits5-6 (0=위, 1=가운데, 2=아래). 실측 내용 높이로 오프셋.
+        let content_h = content_h_by_cell.get(ci).copied().unwrap_or(0.0);
+        let avail = (ch - mt - mb - content_h).max(0.0);
+        let voff = match (cell.list_attr >> 5) & 0x3 {
+            1 => avail * 0.5,
+            2 => avail,
+            _ => 0.0,
         };
-        let (ml, mr, mt) = (
-            margins[0] as f32 / 100.0,
-            margins[1] as f32 / 100.0,
-            margins[2] as f32 / 100.0,
-        );
         layout_box_paragraphs(
             doc,
             store,
             page,
             &cell.paragraphs,
             cx + ml,
-            cy + mt,
+            cy + mt + voff,
             (cw - ml - mr).max(4.0),
             warnings,
         );

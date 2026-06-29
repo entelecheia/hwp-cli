@@ -7,6 +7,10 @@ use std::sync::Arc;
 
 use crate::shape::ShapedRun;
 
+/// 합성 굵게(faux-bold) 스트로크 굵기 — 글자 크기 대비 비율.
+/// 한컴 굵게 렌더와 대조해 보정한 값(글리프 윤곽선 위 중앙 스트로크).
+pub const BOLD_STROKE: f32 = 0.045;
+
 pub struct DisplayList {
     pub pages: Vec<PageList>,
 }

@@ -14,6 +14,7 @@ pub mod fonts;
 pub mod gso;
 pub mod layout;
 pub mod lineseg;
+pub mod pdf;
 pub mod png;
 pub mod shape;
 pub mod svg;
@@ -52,6 +53,12 @@ pub struct SvgOutput {
     pub report: Vec<String>,
 }
 
+pub struct PdfOutput {
+    /// 단일 다페이지 PDF 바이트
+    pub bytes: Vec<u8>,
+    pub report: Vec<String>,
+}
+
 fn build_display_list(doc: &Document, opts: &RenderOptions) -> (display::DisplayList, Vec<String>) {
     let mut store = FontStore::new();
     for dir in &opts.font_dirs {
@@ -81,6 +88,15 @@ pub fn render_document_svg(doc: &Document, opts: &RenderOptions) -> SvgOutput {
     let (list, report) = build_display_list(doc, opts);
     SvgOutput {
         pages: svg::render_svg(&list),
+        report,
+    }
+}
+
+/// 문서 전체를 텍스트 선택가능 PDF로 렌더링한다.
+pub fn render_document_pdf(doc: &Document, opts: &RenderOptions) -> PdfOutput {
+    let (list, report) = build_display_list(doc, opts);
+    PdfOutput {
+        bytes: pdf::render_pdf(&list),
         report,
     }
 }
