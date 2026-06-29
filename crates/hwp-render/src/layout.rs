@@ -538,6 +538,23 @@ fn render_shape(page: &mut PageList, x: f32, y: f32, w: f32, h: f32, kind: Shape
 }
 
 /// 표 하나를 (x, y)에 배치하고 높이를 반환한다.
+/// 셀 여백 (왼/오른/위/아래) pt — 셀 지정 → 표 기본 → 한글 기본.
+fn cell_margins(table: &Table, cell: &hwp_model::Cell) -> (f32, f32, f32, f32) {
+    let m = if cell.margins.iter().any(|&v| v > 0) {
+        cell.margins
+    } else if table.inner_margins.iter().any(|&v| v > 0) {
+        table.inner_margins
+    } else {
+        DEFAULT_CELL_MARGINS
+    };
+    (
+        m[0] as f32 / 100.0,
+        m[1] as f32 / 100.0,
+        m[2] as f32 / 100.0,
+        m[3] as f32 / 100.0,
+    )
+}
+
 fn layout_table(
     doc: &Document,
     store: &mut FontStore,
@@ -564,6 +581,52 @@ fn layout_table(
     }
     fill_unknown(&mut col_w, 60.0);
     fill_unknown(&mut row_h, 18.0);
+
+    // 측정 패스: 실제 내용 높이로 행 높이를 확장한다(저장된 cell.height는 한글의 줄바꿈
+    // 기준이라, 우리 셰이핑/합성 줄바꿈이 더 많은 줄을 만들면 내용이 다음 행을 침범해
+    // 겹친다 — 실측 높이와 max로 행을 늘려 방지). 스크래치 페이지에 그려 높이만 잰다.
+    let mut spanned: Vec<(usize, usize, f32)> = Vec::new(); // (시작행, 스팬, 필요높이)
+    for cell in &table.cells {
+        let (c, r) = (cell.col as usize, cell.row as usize);
+        if c >= cols || r >= rows {
+            continue;
+        }
+        let cw: f32 = col_w[c..(c + cell.col_span as usize).min(cols)]
+            .iter()
+            .sum();
+        let (ml, mr, mt, mb) = cell_margins(table, cell);
+        let mut scratch = PageList {
+            width_pt: page.width_pt,
+            height_pt: page.height_pt,
+            items: Vec::new(),
+        };
+        let mut scratch_warn = Vec::new();
+        let content_h = layout_box_paragraphs(
+            doc,
+            store,
+            &mut scratch,
+            &cell.paragraphs,
+            0.0,
+            0.0,
+            (cw - ml - mr).max(4.0),
+            &mut scratch_warn,
+        );
+        let needed = content_h + mt + mb;
+        let span = (cell.row_span as usize).max(1);
+        if span == 1 {
+            row_h[r] = row_h[r].max(needed);
+        } else {
+            spanned.push((r, span, needed));
+        }
+    }
+    // row_span>1 셀: 스팬 행 합이 부족하면 마지막 스팬 행에 부족분을 더한다.
+    for (r, span, needed) in spanned {
+        let end = (r + span).min(rows);
+        let cur: f32 = row_h[r..end].iter().sum();
+        if end > r && needed > cur {
+            row_h[end - 1] += needed - cur;
+        }
+    }
 
     // 누적 오프셋
     let col_x: Vec<f32> = prefix_sums(&col_w, x);
@@ -601,18 +664,7 @@ fn layout_table(
         }
 
         // 2) 내용 — 셀 여백(셀 지정 → 표 기본 → 한글 기본) 적용
-        let margins = if cell.margins.iter().any(|&m| m > 0) {
-            cell.margins
-        } else if table.inner_margins.iter().any(|&m| m > 0) {
-            table.inner_margins
-        } else {
-            DEFAULT_CELL_MARGINS
-        };
-        let (ml, mr, mt) = (
-            margins[0] as f32 / 100.0,
-            margins[1] as f32 / 100.0,
-            margins[2] as f32 / 100.0,
-        );
+        let (ml, mr, mt, _mb) = cell_margins(table, cell);
         layout_box_paragraphs(
             doc,
             store,
