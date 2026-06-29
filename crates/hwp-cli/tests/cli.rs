@@ -377,3 +377,48 @@ fn fill_data_tables_grows() {
         let _ = std::fs::remove_file(f);
     }
 }
+
+#[test]
+fn fill_literal_tables_key_not_misrouted() {
+    // 최상위 "tables"가 (표 지시 객체가 아닌) 문자열 배열이면 평문 자리표시자 치환으로
+    // 라우팅돼야 한다(IR 표 채우기로 오인 → "rows 배열 필요" 오류 금지).
+    let md = tmp("hwp_cli_litkey.md");
+    std::fs::write(&md, "{{tables}} 목록\n").unwrap();
+    let tpl = tmp("hwp_cli_litkey.hwpx");
+    assert!(
+        hwp()
+            .args(["new", "--from"])
+            .arg(&md)
+            .arg("-o")
+            .arg(&tpl)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let data = tmp("hwp_cli_litkey.json");
+    std::fs::write(&data, r#"{"tables":["사과","배"]}"#).unwrap();
+    let out = tmp("hwp_cli_litkey_out.hwpx");
+    let r = hwp()
+        .arg("fill")
+        .arg(&tpl)
+        .arg("-o")
+        .arg(&out)
+        .arg("--data")
+        .arg(&data)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "flat tables 키 치환: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let j = String::from_utf8_lossy(&r.stdout);
+    assert!(
+        j.contains("\"replaced\""),
+        "평문 fill 경로(replaced 키): {j}"
+    );
+    for f in [&md, &tpl, &data, &out] {
+        let _ = std::fs::remove_file(f);
+    }
+}

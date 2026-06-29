@@ -30,12 +30,14 @@ pub fn run(
         None => None,
     };
 
-    // 데이터에 `tables` 배열이 있으면 IR 기반 표 채우기(행 추가 포함)로 분기.
+    // 데이터에 `tables`가 (객체 항목의) 비어있지 않은 배열이면 IR 기반 표 채우기로 분기.
+    // 객체-배열만 인정해, "tables"라는 이름의 평범한 자리표시자(예: 문자열 배열 값)가
+    // 표 채우기로 오인 라우팅돼 실패하지 않게 한다(평문 fill 경로로 떨어뜨림).
     let has_tables = data_value
         .as_ref()
         .and_then(|v| v.get("tables"))
-        .map(serde_json::Value::is_array)
-        .unwrap_or(false);
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| !arr.is_empty() && arr.iter().all(serde_json::Value::is_object));
     if has_tables {
         return fill_tables_ir(input, output, data_value.as_ref().unwrap(), set, json);
     }
@@ -169,6 +171,13 @@ fn fill_tables_ir(
 
         let (cur_rows, _cols) = hwp_convert::table_dims(&mut doc, table_index)
             .ok_or_else(|| anyhow::anyhow!("표 #{table_index}를 찾을 수 없습니다"))?;
+        // start_row가 현재 행 수를 넘으면 그 사이가 빈 행으로 채워진다 — 보통 실수이므로 경고.
+        if start_row as usize > cur_rows as usize {
+            eprintln!(
+                "[hwp] ⚠️  tables[{ti}] start_row={start_row} > 현재 행 수 {cur_rows} — 사이 {}행이 빈 행으로 추가됩니다",
+                start_row as usize - cur_rows as usize
+            );
+        }
         let need = start_row as usize + rows.len();
         if need > cur_rows as usize {
             let n = need - cur_rows as usize;
