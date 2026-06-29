@@ -13,6 +13,7 @@
 
 pub mod error;
 pub mod package;
+pub mod patch;
 pub mod read;
 pub mod write;
 

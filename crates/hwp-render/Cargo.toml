@@ -13,6 +13,8 @@ rustybuzz = { workspace = true }
 fontdb = { workspace = true }
 image = { workspace = true }
 thiserror = { workspace = true }
+pdf-writer = "0.15.0"
+subsetter = "0.2.6"
 
 [dev-dependencies]
 hwp5 = { workspace = true }

@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-pub fn run(output: &Path, from: Option<&Path>) -> anyhow::Result<()> {
+use hwp_convert::Preset;
+
+pub fn run(output: &Path, from: Option<&Path>, preset: Preset) -> anyhow::Result<()> {
     let ext = output
         .extension()
         .and_then(|e| e.to_str())
@@ -15,14 +17,14 @@ pub fn run(output: &Path, from: Option<&Path>) -> anyhow::Result<()> {
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("json"))
             {
-                // JSON IR(편집 왕복) 입력
+                // JSON IR(편집 왕복) 입력 — 프리셋은 무시(헤더가 JSON에 포함됨)
                 hwp_convert::from_json(&text)
                     .map_err(|e| anyhow::anyhow!("JSON IR 파싱 실패 ({}): {e}", src.display()))?
             } else {
-                hwp_convert::from_markdown(&text)
+                hwp_convert::from_markdown_preset(&text, preset)
             }
         }
-        None => hwp_convert::from_markdown(""),
+        None => hwp_convert::from_markdown_preset("", preset),
     };
 
     if ext.as_deref() == Some("hwp") {

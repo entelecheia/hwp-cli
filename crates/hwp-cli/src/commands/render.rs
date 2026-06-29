@@ -51,6 +51,13 @@ pub fn run(
                 eprintln!("저장: {}", path.display());
             }
         }
+        RenderFormat::Pdf => {
+            // PDF는 전 페이지를 담은 단일 파일 (pages_spec 무시).
+            let result = hwp_render::render_document_pdf(&doc, &opts);
+            report(&result.report);
+            std::fs::write(output, &result.bytes)?;
+            eprintln!("저장: {} ({} bytes)", output.display(), result.bytes.len());
+        }
     }
     Ok(())
 }
@@ -69,6 +76,7 @@ fn infer_format(output: &Path) -> RenderFormat {
         .as_deref()
     {
         Some("svg") => RenderFormat::Svg,
+        Some("pdf") => RenderFormat::Pdf,
         _ => RenderFormat::Png,
     }
 }

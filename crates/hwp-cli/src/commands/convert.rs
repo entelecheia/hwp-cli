@@ -26,6 +26,18 @@ pub fn run(
             let doc = load_document(input)?;
             std::fs::write(output, hwp_convert::to_markdown(&doc))?;
         }
+        ConvertFormat::Html => {
+            let doc = load_document(input)?;
+            std::fs::write(output, hwp_convert::to_html(&doc))?;
+        }
+        ConvertFormat::Pdf => {
+            let doc = load_document(input)?;
+            let result = hwp_render::render_document_pdf(&doc, &pdf_render_opts());
+            for w in &result.report {
+                eprintln!("경고: {w}");
+            }
+            std::fs::write(output, &result.bytes)?;
+        }
         ConvertFormat::Json => {
             let doc = load_document(input)?;
             std::fs::write(output, hwp_convert::to_json(&doc, true, embed_bin)?)?;
@@ -94,7 +106,29 @@ pub fn write_by_ext(
             std::fs::write(output, hwp_convert::to_markdown(doc))?;
             Ok(())
         }
+        Some("html") | Some("htm") => {
+            std::fs::write(output, hwp_convert::to_html(doc))?;
+            Ok(())
+        }
+        Some("pdf") => {
+            let result = hwp_render::render_document_pdf(doc, &pdf_render_opts());
+            for w in &result.report {
+                eprintln!("경고: {w}");
+            }
+            std::fs::write(output, &result.bytes)?;
+            Ok(())
+        }
         other => anyhow::bail!("출력 포맷을 추론할 수 없습니다 (확장자: {other:?})"),
+    }
+}
+
+/// PDF 렌더 옵션 — 폰트는 `HWP_FONT_DIR`(없으면 `fonts/`)에서 해석.
+fn pdf_render_opts() -> hwp_render::RenderOptions {
+    let font_dir =
+        std::path::PathBuf::from(std::env::var("HWP_FONT_DIR").unwrap_or_else(|_| "fonts".into()));
+    hwp_render::RenderOptions {
+        dpi: 96.0,
+        font_dirs: vec![font_dir],
     }
 }
 
@@ -106,6 +140,8 @@ fn infer_format(output: &Path) -> anyhow::Result<ConvertFormat> {
         .as_deref()
     {
         Some("md") | Some("markdown") => Ok(ConvertFormat::Md),
+        Some("html") | Some("htm") => Ok(ConvertFormat::Html),
+        Some("pdf") => Ok(ConvertFormat::Pdf),
         Some("json") => Ok(ConvertFormat::Json),
         Some("hwpx") => Ok(ConvertFormat::Hwpx),
         Some("hwp") => Ok(ConvertFormat::Hwp),
