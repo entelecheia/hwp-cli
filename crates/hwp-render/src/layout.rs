@@ -457,8 +457,11 @@ fn layout_para_objects(
                 // 다단/연결 글상자: 내부 문단의 v_pos 리셋(단 나누기)으로 단을 분할한다.
                 // 단 0은 이 박스, 단 1+는 연결 글상자(같은 크기·세로위치, 더 오른쪽
                 // 떠 있는 gso 박스) 위치로 흐른다. 없으면 가로로 한 단 진행(근사).
-                let flat: Vec<&Paragraph> =
-                    g.paragraph_lists.iter().flat_map(|l| l.paragraphs.iter()).collect();
+                let flat: Vec<&Paragraph> = g
+                    .paragraph_lists
+                    .iter()
+                    .flat_map(|l| l.paragraphs.iter())
+                    .collect();
                 let columns = split_columns(&flat);
                 let cont = if columns.len() > 1 && !inline {
                     continuation_columns(para, &b)
@@ -645,7 +648,16 @@ fn layout_box_paragraphs(
     width: f32,
     warnings: &mut Vec<String>,
 ) -> f32 {
-    layout_box_para_iter(doc, store, page, paras.iter(), origin_x, origin_y, width, warnings)
+    layout_box_para_iter(
+        doc,
+        store,
+        page,
+        paras.iter(),
+        origin_x,
+        origin_y,
+        width,
+        warnings,
+    )
 }
 
 /// `layout_box_paragraphs`의 반복자 버전 — 단(컬럼)으로 분할된 조각도 받는다.
@@ -815,9 +827,15 @@ fn last_content_seg(para: &Paragraph) -> usize {
 
 /// 정렬에 따른 가로 shift(pt). 양쪽/배분/나눔(0/4/5)이고 마지막 줄이 아니면
 /// items의 글리프 advance를 늘려 줄을 seg_width까지 채우고 shift 0을 반환한다.
-fn align_line(items: &mut [InlineItem], align: u8, seg_width: f32, natural: f32, is_last: bool) -> f32 {
+fn align_line(
+    items: &mut [InlineItem],
+    align: u8,
+    seg_width: f32,
+    natural: f32,
+    is_last: bool,
+) -> f32 {
     match align {
-        2 => (seg_width - natural).max(0.0),       // 오른쪽
+        2 => (seg_width - natural).max(0.0),         // 오른쪽
         3 => ((seg_width - natural) / 2.0).max(0.0), // 가운데
         0 | 4 | 5 if !is_last => {
             // 잉여 폭 분배. 폰트 부재 등으로 natural이 비정상이면 캡(≤100% stretch)으로 폭주 방지.
@@ -1066,10 +1084,16 @@ mod justify_tests {
         let mut items = vec![run(&[10.0, 10.0, 10.0])];
         let shift = align_line(&mut items, 0, 45.0, 30.0, false);
         assert_eq!(shift, 0.0);
-        assert!((total_adv(&items) - 45.0).abs() < 0.01, "줄이 seg_width를 채워야");
+        assert!(
+            (total_adv(&items) - 45.0).abs() < 0.01,
+            "줄이 seg_width를 채워야"
+        );
         if let InlineItem::Run(r) = &items[0] {
             assert!((r.glyphs[0].x_advance - 17.5).abs() < 0.01);
-            assert!((r.glyphs[2].x_advance - 10.0).abs() < 0.01, "마지막 글리프는 불변");
+            assert!(
+                (r.glyphs[2].x_advance - 10.0).abs() < 0.01,
+                "마지막 글리프는 불변"
+            );
             assert!((r.width_pt - 45.0).abs() < 0.01, "width_pt 갱신");
         }
     }
@@ -1094,7 +1118,11 @@ mod justify_tests {
         align_line(&mut items, 0, 40.0, 25.0, false); // slack 15
         if let InlineItem::Run(r) = &items[0] {
             // 후행 공백(idx2)은 분배 제외, last_visible=1 → gap 1개(idx0)에 15.
-            assert!((r.glyphs[0].x_advance - 25.0).abs() < 0.01, "{}", r.glyphs[0].x_advance);
+            assert!(
+                (r.glyphs[0].x_advance - 25.0).abs() < 0.01,
+                "{}",
+                r.glyphs[0].x_advance
+            );
             assert!((r.glyphs[2].x_advance - 5.0).abs() < 0.01, "후행 공백 불변");
         }
     }
@@ -1103,14 +1131,20 @@ mod justify_tests {
     fn 마지막_줄은_늘리지_않음() {
         let mut items = vec![run(&[10.0, 10.0, 10.0])];
         align_line(&mut items, 0, 45.0, 30.0, true);
-        assert!((total_adv(&items) - 30.0).abs() < 0.01, "마지막 줄은 ragged 유지");
+        assert!(
+            (total_adv(&items) - 30.0).abs() < 0.01,
+            "마지막 줄은 ragged 유지"
+        );
     }
 
     #[test]
     fn 가운데_오른쪽은_shift만() {
         let mut center = vec![run(&[10.0, 10.0])];
         assert!((align_line(&mut center, 3, 40.0, 20.0, false) - 10.0).abs() < 0.01);
-        assert!((total_adv(&center) - 20.0).abs() < 0.01, "가운데는 advance 불변");
+        assert!(
+            (total_adv(&center) - 20.0).abs() < 0.01,
+            "가운데는 advance 불변"
+        );
         let mut right = vec![run(&[10.0, 10.0])];
         assert!((align_line(&mut right, 2, 40.0, 20.0, false) - 20.0).abs() < 0.01);
     }

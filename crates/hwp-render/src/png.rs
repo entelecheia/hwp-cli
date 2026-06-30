@@ -183,7 +183,8 @@ fn render_page(page: &PageList, dpi: f32) -> Result<Pixmap, RenderError> {
                                 let (r, g, b) = colorref_rgb(*c);
                                 paint.set_color_rgba8(r, g, b, 255);
                             }
-                            Fill::Gradient(grad) => match gradient_shader(grad, commands, px_scale) {
+                            Fill::Gradient(grad) => match gradient_shader(grad, commands, px_scale)
+                            {
                                 Some(sh) => paint.shader = sh,
                                 None => {
                                     let (r, g, b) = grad
