@@ -20,6 +20,7 @@ pub mod png;
 pub mod shape;
 pub mod shape_draw;
 pub mod svg;
+pub mod tab;
 
 use hwp_model::Document;
 

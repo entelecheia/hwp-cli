@@ -222,6 +222,8 @@ pub fn layout_document(
             // 본문 각주/미주 마커(윗첨자 번호)와 이 페이지에 속할 노트 수집.
             let marks = footnote::para_marks(&notes, para);
             page_notes.extend(footnote::para_notes(&notes, para));
+            let tabs = crate::tab::tab_stops(doc, para);
+            let geom = para_geometry(doc, para);
 
             // 이 문단의 첫 줄 상단 (표 앵커 위치)
             let mut para_top: Option<f32> = None;
@@ -234,25 +236,26 @@ pub fn layout_document(
                     let end = para.wchar_len();
                     let items = shape_range_notes(store, doc, para, (0, end), &marks, warnings);
                     let max_size = items_max_size(&items).unwrap_or(10.0);
-                    let baseline_y = content_bottom + max_size * 1.2;
-                    para_top = Some(content_bottom);
-                    // 한 줄에 들어가는 가운데/오른쪽 정렬은 폴백에서도 보정한다
-                    // (캐시 lineseg가 없는 합성·편집 문단). 양쪽/배분은 줄별 분배가
-                    // 필요해 폴백에선 왼쪽으로 둔다.
+                    // 문단 들여쓰기/여백/위 간격(폴백 전용 — 캐시는 col_start에 반영됨).
+                    let left = body_left + geom.left;
+                    let avail = (body_width - geom.left - geom.right).max(4.0);
+                    let baseline_y = content_bottom + geom.spacing_top + max_size * 1.2;
+                    para_top = Some(content_bottom + geom.spacing_top);
+                    // 한 줄에 들어가는 가운데/오른쪽 정렬은 폴백에서도 보정한다.
                     let natural = items_width(&items);
                     let align = doc
                         .header
                         .para_shapes
                         .get(para.para_shape.0 as usize)
                         .map_or(1, |p| p.alignment());
-                    let x = if natural <= body_width && (align == 2 || align == 3) {
-                        body_left + (body_width - natural) * if align == 3 { 0.5 } else { 1.0 }
+                    let x = if natural <= avail && (align == 2 || align == 3) {
+                        left + (avail - natural) * if align == 3 { 0.5 } else { 1.0 }
                     } else {
-                        body_left
+                        left
                     };
                     let last_y =
-                        place_wrapped(&mut page, items, x, baseline_y, body_width, max_size * 1.6);
-                    content_bottom = last_y + max_size * 0.4;
+                        place_wrapped(&mut page, items, x, baseline_y, avail, max_size * 1.6, &tabs);
+                    content_bottom = last_y + max_size * 0.4 + geom.spacing_bottom;
                 }
                 content_bottom = layout_para_objects(
                     doc,
@@ -335,7 +338,7 @@ pub fn layout_document(
                     para_top = Some(baseline_y - baseline_gap_pt);
                 }
                 let last_y =
-                    place_wrapped(&mut page, items, x, baseline_y, wrap_width, line_advance);
+                    place_wrapped(&mut page, items, x, baseline_y, wrap_width, line_advance, &tabs);
                 content_bottom = last_y + (line_height_pt - baseline_gap_pt).max(0.0);
             }
 
@@ -1001,6 +1004,7 @@ fn layout_box_para_iter<'a>(
     let mut flow_floor = origin_y;
     for para in paras {
         let mut para_top: Option<f32> = None;
+        let tabs = crate::tab::tab_stops(doc, para);
 
         if para.line_segs.is_empty() {
             if para.chars.is_empty() {
@@ -1009,16 +1013,25 @@ fn layout_box_para_iter<'a>(
                 let end = para.wchar_len();
                 let items = shape_range(store, doc, para, (0, end), warnings);
                 let max_size = items_max_size(&items).unwrap_or(10.0);
-                para_top = Some(content_bottom);
-                let last_y = place_wrapped(
-                    page,
-                    items,
-                    origin_x,
-                    content_bottom + max_size * 1.2,
-                    width,
-                    max_size * 1.6,
-                );
-                content_bottom = last_y + max_size * 0.4;
+                let geom = para_geometry(doc, para);
+                let left = origin_x + geom.left;
+                let avail = (width - geom.left - geom.right).max(4.0);
+                let baseline_y = content_bottom + geom.spacing_top + max_size * 1.2;
+                para_top = Some(content_bottom + geom.spacing_top);
+                let natural = items_width(&items);
+                let align = doc
+                    .header
+                    .para_shapes
+                    .get(para.para_shape.0 as usize)
+                    .map_or(1, |p| p.alignment());
+                let x = if natural <= avail && (align == 2 || align == 3) {
+                    left + (avail - natural) * if align == 3 { 0.5 } else { 1.0 }
+                } else {
+                    left
+                };
+                let last_y =
+                    place_wrapped(page, items, x, baseline_y, avail, max_size * 1.6, &tabs);
+                content_bottom = last_y + max_size * 0.4 + geom.spacing_bottom;
             }
             // 폴백(캐시 없는) 문단은 흐름 배치 — 이후 캐시 문단이 넘지 않게 바닥을 올린다.
             flow_floor = flow_floor.max(content_bottom);
@@ -1072,6 +1085,7 @@ fn layout_box_para_iter<'a>(
                     baseline_y,
                     wrap_width,
                     line_advance,
+                    &tabs,
                 );
                 content_bottom = last_y + (seg.line_height as f32 / 100.0 - gap_pt).max(0.0);
                 // 우리 줄바꿈이 캐시와 어긋나 이 줄이 캐시 자리 아래로 넘쳤다면(단일 seg
@@ -1214,6 +1228,29 @@ fn justify_line(items: &mut [InlineItem], slack: f32) {
     }
 }
 
+/// 문단 기하(pt) — 폴백 경로에서 적용할 들여쓰기/여백/간격.
+/// (캐시 lineseg 경로는 col_start/v_pos에 이미 반영돼 있어 쓰지 않는다.)
+#[derive(Default, Clone, Copy)]
+struct ParaGeom {
+    /// 왼쪽 시작 가산(margin_left + 첫 줄 들여쓰기, 음수=내어쓰기 v1 무시).
+    left: f32,
+    right: f32,
+    spacing_top: f32,
+    spacing_bottom: f32,
+}
+
+fn para_geometry(doc: &Document, para: &Paragraph) -> ParaGeom {
+    match doc.header.para_shapes.get(para.para_shape.0 as usize) {
+        Some(p) => ParaGeom {
+            left: (p.margin_left as f32 / 100.0).max(0.0) + (p.indent as f32 / 100.0).max(0.0),
+            right: (p.margin_right as f32 / 100.0).max(0.0),
+            spacing_top: (p.spacing_top as f32 / 100.0).max(0.0),
+            spacing_bottom: (p.spacing_bottom as f32 / 100.0).max(0.0),
+        },
+        None => ParaGeom::default(),
+    }
+}
+
 fn items_width(items: &[InlineItem]) -> f32 {
     let mut x = 0.0f32;
     for item in items {
@@ -1266,6 +1303,7 @@ fn push_run(page: &mut PageList, x: f32, y: f32, run: crate::shape::ShapedRun) {
 
 /// 인라인 항목들을 배치한다. `max_width`를 넘으면 글리프 단위 그리디
 /// 줄바꿈(`f32::INFINITY`면 비활성). 마지막 베이스라인 y를 반환한다.
+#[allow(clippy::too_many_arguments)]
 fn place_wrapped(
     page: &mut PageList,
     items: Vec<InlineItem>,
@@ -1273,6 +1311,7 @@ fn place_wrapped(
     first_baseline_y: f32,
     max_width: f32,
     line_advance: f32,
+    tabs: &[f32],
 ) -> f32 {
     let limit = x0 + max_width;
     let mut x = x0;
@@ -1330,12 +1369,48 @@ fn place_wrapped(
                 }
             }
             InlineItem::Tab => {
-                let rel = x - x0;
-                x = x0 + (rel / TAB_INTERVAL_PT).floor() * TAB_INTERVAL_PT + TAB_INTERVAL_PT;
+                x = x0 + crate::tab::next_tab(tabs, x - x0, TAB_INTERVAL_PT);
             }
         }
     }
     y
+}
+
+#[cfg(test)]
+mod para_geom_tests {
+    use super::para_geometry;
+    use hwp_model::{Document, ParaShape, ParaShapeId, Paragraph};
+
+    #[test]
+    fn 문단_기하_단위변환() {
+        let mut doc = Document::default();
+        doc.header.para_shapes.push(ParaShape {
+            margin_left: 4000,
+            margin_right: 2000,
+            indent: 3000,
+            spacing_top: 1200,
+            spacing_bottom: 600,
+            ..ParaShape::default()
+        });
+        let para = Paragraph {
+            para_shape: ParaShapeId(0),
+            ..Paragraph::default()
+        };
+        let g = para_geometry(&doc, &para);
+        assert_eq!(g.left, 70.0); // (margin_left 4000 + indent 3000)/100
+        assert_eq!(g.right, 20.0);
+        assert_eq!(g.spacing_top, 12.0);
+        assert_eq!(g.spacing_bottom, 6.0);
+        // 음수 들여쓰기(내어쓰기)는 v1에서 0 처리 → left = margin만.
+        doc.header.para_shapes[0].indent = -1000;
+        assert_eq!(para_geometry(&doc, &para).left, 40.0);
+        // para_shape 범위 밖이면 0.
+        let p2 = Paragraph {
+            para_shape: ParaShapeId(99),
+            ..Paragraph::default()
+        };
+        assert_eq!(para_geometry(&doc, &p2).left, 0.0);
+    }
 }
 
 #[cfg(test)]
