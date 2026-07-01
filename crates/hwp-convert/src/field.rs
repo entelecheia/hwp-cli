@@ -352,7 +352,7 @@ fn for_each_nested(ctrl: &Control, f: &mut impl FnMut(&Paragraph)) {
 }
 
 /// ExtCtrl payload(12B): 선두 4B = 역순 ctrl_id(리더가 역순으로 파싱), 나머지 0.
-fn rev_payload(ctrl_id: &[u8; 4]) -> Vec<u8> {
+pub(crate) fn rev_payload(ctrl_id: &[u8; 4]) -> Vec<u8> {
     let mut p = vec![0u8; 12];
     p[0] = ctrl_id[3];
     p[1] = ctrl_id[2];
@@ -407,7 +407,7 @@ fn make_field_chars(value: &str) -> Vec<HwpChar> {
 }
 
 /// 문단의 ExtCtrl ↔ controls 등장순서 연결(ctrl_index)을 다시 매긴다.
-fn relink_ctrl_index(para: &mut Paragraph) {
+pub(crate) fn relink_ctrl_index(para: &mut Paragraph) {
     let mut next = 0u32;
     for ch in &mut para.chars {
         if let HwpChar::ExtCtrl { ctrl_index, .. } = ch {

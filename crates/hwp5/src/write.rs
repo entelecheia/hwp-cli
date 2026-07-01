@@ -48,7 +48,9 @@ pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Resul
     // synthesize = 문단 불변식·줄 배치를 다시 세워야 하는 경로(hwpx/md 출신 또는
     // 편집된 hwp5). synth_pictures = hwpx/md 출신 그림을 hwp5 도형으로 합성해야
     // 하는 경로(출처 기준 — 편집된 hwp5 그림은 이미 도형 레코드를 가지므로 제외).
-    let synth_pictures = doc.meta.source_format != "hwp5";
+    // 단 편집으로 새로 삽입된 그림(extras 빈 Picture)은 출처와 무관하게 합성해야
+    // strip_unwritable_pictures에 드롭되지 않는다.
+    let synth_pictures = doc.meta.source_format != "hwp5" || has_synthesizable_picture(doc);
     let synthesize = synth_pictures || opts.edited;
     let normalized;
     let doc = if needs_normalize(doc) || synthesize {
@@ -442,6 +444,26 @@ fn build_picture_extras(
             children: Vec::new(),
         }],
     }]
+}
+
+/// 편집으로 삽입된 그림(도형 레코드 미보유 = extras 빈 Picture)이 있는지 재귀 검사.
+/// 있으면 출처가 hwp5여도 그림 합성을 켜야 한다(안 켜면 strip_unwritable_pictures가 드롭).
+fn has_synthesizable_picture(doc: &Document) -> bool {
+    fn in_para(p: &Paragraph) -> bool {
+        p.controls.iter().any(|c| match c {
+            Control::Picture(pic) => pic.extras.is_empty(),
+            Control::Table(t) => t
+                .cells
+                .iter()
+                .any(|cell| cell.paragraphs.iter().any(in_para)),
+            Control::Generic(g) => g
+                .paragraph_lists
+                .iter()
+                .any(|l| l.paragraphs.iter().any(in_para)),
+            _ => false,
+        })
+    }
+    doc.sections.iter().flat_map(|s| &s.paragraphs).any(in_para)
 }
 
 /// 합성 문서의 hwpx 출신 이미지에 도형 레코드 + BIN_DATA 항목을 채운다.

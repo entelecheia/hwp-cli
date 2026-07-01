@@ -6,6 +6,7 @@ pub mod field;
 pub mod format;
 pub mod from_markdown;
 pub mod html;
+pub mod image;
 pub mod markdown;
 pub mod odt;
 pub mod structure;
@@ -19,6 +20,7 @@ pub use field::{
 pub use format::{CharFormat, set_char_format, set_para_align};
 pub use from_markdown::{default_header, from_markdown};
 pub use html::{to_html, to_html_fragment};
+pub use image::{ImageSize, insert_image};
 pub use markdown::to_markdown;
 pub use odt::to_odt;
 pub use structure::{add_table_row, delete_paragraph, delete_table_row, insert_paragraph};

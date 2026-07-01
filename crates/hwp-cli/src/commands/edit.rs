@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use hwp_convert::CharFormat;
+use hwp_convert::{CharFormat, ImageSize};
 
 use crate::commands::cat::load_document;
 
@@ -20,6 +20,7 @@ pub fn run(
     set_fields: &[String],
     set_meta: &[String],
     create_fields: &[String],
+    insert_images: &[String],
     set_formats: &[String],
     set_aligns: &[String],
     insert_paras: &[String],
@@ -31,12 +32,14 @@ pub fn run(
 ) -> anyhow::Result<()> {
     let mut doc = load_document(input)?;
     let mut edits = 0usize;
-    // 구조 편집(문단/행 추가·삭제)은 삽입 불변식 적용을 위해 합성 경로로 써야 한다.
+    // 구조 편집(문단/행 추가·삭제·이미지 삽입)은 합성 경로로 써야 한다 — 삽입 문단/행
+    // 불변식 + 그림 도형 레코드 합성(빈-extras Picture)이 적용되도록.
     let structural = !insert_paras.is_empty()
         || !insert_paras_before.is_empty()
         || !delete_paras.is_empty()
         || !add_rows.is_empty()
-        || !delete_rows.is_empty();
+        || !delete_rows.is_empty()
+        || !insert_images.is_empty();
 
     for spec in replaces {
         let (from, to) = spec
@@ -75,6 +78,17 @@ pub fn run(
         } else {
             eprintln!("경고: 앵커 {anchor:?}를 찾지 못했습니다");
         }
+    }
+
+    for spec in insert_images {
+        let (anchor, rhs) = spec.split_once("=>").with_context(|| {
+            format!("--insert-image 형식은 \"앵커=>경로\" 또는 \"앵커=>경로@너비x높이\"(mm) 입니다: {spec:?}")
+        })?;
+        let (path, size) = parse_image_size(rhs)?;
+        hwp_convert::insert_image(&mut doc, anchor, Path::new(path), size)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("이미지 삽입: {anchor:?} 뒤에 {path:?}");
+        edits += 1;
     }
 
     for spec in set_fields {
@@ -181,7 +195,7 @@ pub fn run(
 
     if edits == 0 {
         eprintln!(
-            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--set-meta/--create-field/--set-format/--set-align/--insert-para/--delete-para/--add-row/--delete-row 확인)"
+            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--set-meta/--create-field/--insert-image/--set-format/--set-align/--insert-para/--delete-para/--add-row/--delete-row 확인)"
         );
     }
 
@@ -274,6 +288,18 @@ pub(crate) fn parse_color(s: &str) -> Option<u32> {
     };
     let (r, g, b) = rgb;
     Some((b << 16) | (g << 8) | r)
+}
+
+/// "경로" 또는 "경로@너비x높이"(mm) → (경로, ImageSize).
+/// `@` 뒤가 "너비x높이"로 파싱될 때만 크기로 보고, 아니면 경로 일부(자연 크기)로 둔다.
+fn parse_image_size(rhs: &str) -> anyhow::Result<(&str, ImageSize)> {
+    if let Some((path, dims)) = rhs.rsplit_once('@')
+        && let Some((w, h)) = dims.split_once(['x', 'X'])
+        && let (Ok(w), Ok(h)) = (w.trim().parse::<f32>(), h.trim().parse::<f32>())
+    {
+        return Ok((path, ImageSize::Mm(w, h)));
+    }
+    Ok((rhs, ImageSize::Natural))
 }
 
 /// 정렬 이름 → 코드(0=양쪽,1=왼쪽,2=오른쪽,3=가운데,4=배분,5=나눔).

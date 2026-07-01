@@ -77,6 +77,31 @@ cargo install --path crates/hwp-cli   # `hwp` 바이너리 설치
 
 > 이후 예시에서 `<repo>`는 위에서 클론한 디렉터리의 절대 경로를 가리킨다.
 
+### 다운로드 (사전 빌드 바이너리)
+
+각 [릴리스](https://github.com/YeolHanMyeong/hwp-cli/releases)에 플랫폼별 `hwp` 아카이브와 `.sha256` 체크섬이 첨부된다:
+
+| 플랫폼 | 아카이브 |
+|---|---|
+| Linux x86_64 | `hwp-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `hwp-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `hwp-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| Windows x86_64 | `hwp-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+
+압축을 풀어 `hwp`를 PATH에 두면 된다(체크섬 검증: `shasum -a 256 -c hwp-*.sha256`).
+렌더/PDF엔 CJK 폰트가 필요하고(위 폰트 지정 참고), 텍스트 추출·변환은 폰트 없이 동작한다.
+
+### 릴리스 (메인테이너)
+
+버전은 워크스페이스 `Cargo.toml`의 `[workspace.package] version`이 단일 기준(SSOT)이다.
+
+```sh
+scripts/release.sh 0.2.0                        # 버전 bump + 커밋 + 태그 (푸시는 수동)
+git push origin main && git push origin v0.2.0  # 태그 푸시가 릴리스를 트리거
+```
+
+`vX.Y.Z` 태그를 푸시하면 `release.yml`이 ① 테스트(fmt/clippy/test) 통과 ② 태그↔`Cargo.toml` 버전 일치를 확인한 **뒤에만** 4개 플랫폼 바이너리를 빌드해 GitHub Release로 게시한다. 태그가 커밋된 버전과 다르면 릴리스가 차단된다.
+
 ## 빠른 시작 (Quickstart)
 
 ```sh
@@ -122,6 +147,11 @@ hwp edit report.hwp -o out.hwp \
 hwp edit form.hwp -o out.hwp \
     --create-field "수신:=>수신처" --set-field "수신처=홍길동" --verify
 
+# 이미지 삽입 (앵커 뒤에 그림 — 자연 크기 또는 "@너비x높이"mm)
+hwp edit report.hwp -o out.hwp \
+    --insert-image "그림:=>./logo.png" \
+    --insert-image "표지:=>./cover.jpg@120x80" --verify
+
 # 렌더 충실도 비교 (한글 기준 PNG와 잉크/오프셋/픽셀 오차)
 hwp diff report.hwp --ref hancom_p1.png --page 1 --dpi 150 --font-dir ./fonts
 
@@ -138,7 +168,7 @@ hwp mcp --font-dir ./fonts
 | `convert <input> -o <output>` | `--to hwp\|hwpx\|md\|json`(생략 시 확장자 추론), `--strict`(예약 — 현재 미동작), `--preserve-layout`, `--embed-bin` | 포맷 변환. 출력이 `.pdf`이면 렌더 경로로 위임(시스템 글꼴 사용 — 정밀 글꼴은 `render --font-dir` 권장). `--preserve-layout`는 무수정 왕복 전용 줄 배치 보존. `--embed-bin`은 JSON에 이미지 base64 임베드. `--strict`는 향후 보존 불가 데이터 발견 시 실패 처리 예정(현재는 동작하지 않음) |
 | `render <input> -o <output>` | `--pages "1"\|"1-3"\|"all"`(기본 `all`), `--dpi <f64>`(기본 96, 래스터 전용), `--format png\|svg\|pdf`(생략 시 확장자 추론), `--font-dir <dir>`(반복) | 페이지를 PNG/SVG(페이지별 파일)·PDF(단일 멀티페이지)로 렌더 |
 | `new -o <output>` | `--from <md\|json>`(생략 시 빈 문서) | markdown/JSON IR에서 새 문서 생성 |
-| `edit <input> -o <output>` | `--replace "찾기=>바꾸기"`, `--set-cell "표:행:열=값"`(0-기반), `--set-field "이름=값"`, `--create-field "앵커=>이름"`(또는 `"앵커=>이름=값"`, %clk 누름틀 생성), `--set-format "찾기:bold=on,size=16,color=#RRGGBB"`, `--set-align "찾기=left\|right\|center\|justify\|distribute\|divide"`, `--insert-para "앵커=>텍스트"`(앵커 문단 뒤), `--insert-para-before "앵커=>텍스트"`(앞), `--delete-para "텍스트"`, `--add-row "표"`, `--delete-row "표:행"`, `--verify` (모두 반복 가능) | 기존 문서 편집. 텍스트·서식·구조(문단/표 행) 편집. 삽입 문단·행은 앵커/템플릿 모양을 상속하고 합성 경로로 저장(불변식 적용). `--verify`는 쓰기 후 재읽기로 검증 |
+| `edit <input> -o <output>` | `--replace "찾기=>바꾸기"`, `--set-cell "표:행:열=값"`(0-기반), `--set-field "이름=값"`, `--create-field "앵커=>이름"`(또는 `"앵커=>이름=값"`, %clk 누름틀 생성), `--insert-image "앵커=>경로"`(또는 `"앵커=>경로@너비x높이"`mm, png/jpg/bmp/gif 삽입), `--set-format "찾기:bold=on,size=16,color=#RRGGBB"`, `--set-align "찾기=left\|right\|center\|justify\|distribute\|divide"`, `--insert-para "앵커=>텍스트"`(앵커 문단 뒤), `--insert-para-before "앵커=>텍스트"`(앞), `--delete-para "텍스트"`, `--add-row "표"`, `--delete-row "표:행"`, `--verify` (모두 반복 가능) | 기존 문서 편집. 텍스트·서식·구조(문단/표 행) 편집. 삽입 문단·행은 앵커/템플릿 모양을 상속하고 합성 경로로 저장(불변식 적용). `--verify`는 쓰기 후 재읽기로 검증 |
 | `fields <file>` | `--json` | 필드/누름틀 목록(이름·종류·값·명령) |
 | `diff <input> --ref <png>` | `--page <n>`(기본 1), `--dpi <f64>`(기본 96), `-o/--out <png>`, `--font-dir <dir>`(반복), `--tolerance <u8>`(기본 16) | 렌더 결과를 한글 기준 PNG와 비교(잉크 적용률·dx/dy 오프셋·픽셀 차이율·MAE) |
 | `mcp` | `--font-dir <dir>`(반복) | MCP stdio 서버 실행 |

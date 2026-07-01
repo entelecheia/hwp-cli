@@ -15,7 +15,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-// CLI 명령 enum은 시작 시 한 번만 생성 — 변형 크기 차이는 무의미. Edit가 옵션이 많아 큼.
+// Edit 변형이 편집 플래그(Vec<String> 다수)로 커서 다른 변형과 크기차가 크다.
+// CLI 명령 enum은 시작 시 한 번만 파싱되므로 크기차는 무의미 — 박싱 대신 허용.
 #[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// 파일 정보 표시: 포맷/버전/속성/스트림 목록
@@ -128,6 +129,9 @@ enum Cmd {
         /// 누름틀 생성 "앵커=>이름" 또는 "앵커=>이름=값" — 앵커 텍스트 뒤에 %clk 필드 삽입 (반복 가능)
         #[arg(long = "create-field")]
         create_field: Vec<String>,
+        /// 이미지 삽입 "앵커=>경로" 또는 "앵커=>경로@너비x높이"(mm) — 앵커 뒤에 그림 삽입 (반복 가능)
+        #[arg(long = "insert-image")]
+        insert_image: Vec<String>,
         /// 글자 서식 "찾기:속성=값,…" (예: "제목:bold=on,size=16,color=#FF0000")
         #[arg(long = "set-format")]
         set_format: Vec<String>,
@@ -305,6 +309,7 @@ fn main() -> anyhow::Result<()> {
             set_field,
             set_meta,
             create_field,
+            insert_image,
             set_format,
             set_align,
             insert_para,
@@ -321,6 +326,7 @@ fn main() -> anyhow::Result<()> {
             &set_field,
             &set_meta,
             &create_field,
+            &insert_image,
             &set_format,
             &set_align,
             &insert_para,

@@ -346,6 +346,28 @@ fn tool_edit(args: &Value) -> Result<Vec<Value>, String> {
             }
         }
     }
+    let mut structural = false;
+    if let Some(arr) = args.get("insert_image").and_then(Value::as_array) {
+        for im in arr {
+            let anchor = im
+                .get("anchor")
+                .and_then(Value::as_str)
+                .ok_or("insert_image 항목에 anchor 필요")?;
+            let path = im
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("insert_image 항목에 path 필요")?;
+            let wmm = im.get("width_mm").and_then(Value::as_f64);
+            let hmm = im.get("height_mm").and_then(Value::as_f64);
+            let size = match (wmm, hmm) {
+                (Some(w), Some(h)) => hwp_convert::ImageSize::Mm(w as f32, h as f32),
+                _ => hwp_convert::ImageSize::Natural,
+            };
+            structural = true;
+            hwp_convert::insert_image(&mut doc, anchor, Path::new(path), size)?;
+            summary.push(format!("이미지 삽입 {anchor:?}→{path:?}"));
+        }
+    }
     if let Some(arr) = args.get("set_field").and_then(Value::as_array) {
         for f in arr {
             let name = f
@@ -396,7 +418,6 @@ fn tool_edit(args: &Value) -> Result<Vec<Value>, String> {
             summary.push(format!("문단정렬 {pattern:?}: {n}건"));
         }
     }
-    let mut structural = false;
     if let Some(arr) = args.get("insert_para").and_then(Value::as_array) {
         for p in arr {
             let anchor = p
@@ -587,6 +608,10 @@ fn tool_defs() -> Vec<Value> {
                 "create_field": {"type": "array", "items": {"type": "object", "properties": {
                     "anchor": {"type": "string"}, "name": {"type": "string"}, "value": {"type": "string"}},
                     "required": ["anchor", "name"]}, "description": "앵커 텍스트 뒤에 %clk 누름틀 생성(이름·선택 표시값; set_field로 채움)"},
+                "insert_image": {"type": "array", "items": {"type": "object", "properties": {
+                    "anchor": {"type": "string"}, "path": {"type": "string"},
+                    "width_mm": {"type": "number"}, "height_mm": {"type": "number"}},
+                    "required": ["anchor", "path"]}, "description": "앵커 텍스트 뒤에 이미지(png/jpg/bmp/gif) 삽입(width_mm/height_mm 생략 시 원본 크기)"},
                 "set_format": {"type": "array", "items": {"type": "object", "properties": {
                     "pattern": {"type": "string"}, "bold": {"type": "boolean"},
                     "italic": {"type": "boolean"}, "underline": {"type": "boolean"},
