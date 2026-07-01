@@ -102,14 +102,19 @@ pub fn layout_document(
                 warnings.push("PAGE_DEF 없음 — A4 기본값 사용".to_string());
                 default_page()
             });
-        let (w, h) = (
-            page_def.width.to_pt() as f32,
-            page_def.height.to_pt() as f32,
-        );
+        // 가로(landscape, PAGE_DEF attr bit0): 용지를 90° 돌려 폭↔높이를 맞바꾼다.
+        // (이전엔 방향 무시 → 가로 문서가 세로로 렌더돼 우측 열이 잘렸다.)
+        let landscape = page_def.attr & 1 != 0;
+        let (paper_w_hu, paper_h_hu) = if landscape {
+            (page_def.height.0, page_def.width.0)
+        } else {
+            (page_def.width.0, page_def.height.0)
+        };
+        let (w, h) = (paper_w_hu as f32 / 100.0, paper_h_hu as f32 / 100.0);
         let body_left = page_def.margin_left.to_pt() as f32;
         let body_top = (page_def.margin_top.0 + page_def.margin_header.0) as f32 / 100.0;
         let body_width =
-            (page_def.width.0 - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
+            (paper_w_hu - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
         // 본문 영역 하한 (넘침 분할 기준)
         let body_bottom = h - (page_def.margin_bottom.0 + page_def.margin_footer.0) as f32 / 100.0;
 
