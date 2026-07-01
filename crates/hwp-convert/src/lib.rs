@@ -12,14 +12,12 @@ pub mod structure;
 
 use hwp_model::Document;
 
-pub use edit::{add_memo, add_rows, replace_text, set_cell, table_dims};
+pub use edit::{add_rows, apply_meta, replace_text, set_cell, table_dims};
 pub use field::{
     FieldInfo, PlaceholderInfo, create_field, list_fields, scan_placeholders, set_field,
 };
 pub use format::{CharFormat, set_char_format, set_para_align};
-pub use from_markdown::{
-    Preset, default_header, default_header_preset, from_markdown, from_markdown_preset,
-};
+pub use from_markdown::{default_header, from_markdown};
 pub use html::{to_html, to_html_fragment};
 pub use markdown::to_markdown;
 pub use odt::to_odt;

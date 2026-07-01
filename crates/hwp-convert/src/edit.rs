@@ -7,25 +7,7 @@
 //! 쓸 때 반드시 writer의 합성 경로(hwp5: `WriteOptions.edited=true`)를 거쳐야
 //! 한글이 수용한다. 이 모듈은 IR만 바꾸고, 불변식 재수립은 writer가 담당한다.
 
-use hwp_model::{CharShapeId, Control, Document, HwpChar, Memo, Paragraph};
-
-/// 문서에 메모(주석)를 추가한다. `section`(0-기반)에 메모를 단다(범위 밖이면 마지막 섹션).
-/// hwpx 출력에서만 방출된다(hwp5 바이너리 메모 합성 미지원 — writer가 경고 후 생략).
-/// 반환값은 부여된 메모 id.
-pub fn add_memo(doc: &mut Document, section: usize, author: Option<&str>, text: &str) -> u32 {
-    if doc.sections.is_empty() {
-        doc.sections.push(hwp_model::Section::default());
-    }
-    let idx = section.min(doc.sections.len() - 1);
-    let sec = &mut doc.sections[idx];
-    let id = sec.memos.iter().map(|m| m.id + 1).max().unwrap_or(0);
-    sec.memos.push(Memo {
-        id,
-        author: author.filter(|a| !a.is_empty()).map(str::to_string),
-        text: text.to_string(),
-    });
-    id
-}
+use hwp_model::{CharShapeId, Control, Document, HwpChar, Paragraph};
 
 /// 문서 전체에서 `from`을 `to`로 치환한다(본문·표 셀·글상자 문단 재귀).
 /// `all`이 거짓이면 첫 1건만 바꾼다. 반환값은 치환 횟수.
@@ -215,6 +197,27 @@ pub fn add_rows(
 /// 추가할 행 수를 계산할 때 쓴다(현재 행 수 조회).
 pub fn table_dims(doc: &mut Document, table_index: usize) -> Option<(u16, u16)> {
     with_nth_table(doc, table_index, |t| (t.rows, t.cols))
+}
+
+/// `"키=값"` 메타데이터 지정을 문서에 적용한다. 키: `title`|`author`|`subject`|`keywords`.
+/// 값이 비면 해당 필드를 `None`으로 지운다. 알 수 없는 키/형식은 `Err`.
+pub fn apply_meta(doc: &mut Document, spec: &str) -> Result<(), String> {
+    let (key, value) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("메타데이터 형식은 \"키=값\" 입니다: {spec:?}"))?;
+    let val = (!value.is_empty()).then(|| value.to_string());
+    match key.trim() {
+        "title" => doc.metadata.title = val,
+        "author" => doc.metadata.author = val,
+        "subject" => doc.metadata.subject = val,
+        "keywords" => doc.metadata.keywords = val,
+        other => {
+            return Err(format!(
+                "메타데이터 키는 title|author|subject|keywords 입니다: {other:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 문서 등장 순서 `index`번째 표를 찾아 `f`를 적용한다(0-기반). 본문·표 셀·글상자

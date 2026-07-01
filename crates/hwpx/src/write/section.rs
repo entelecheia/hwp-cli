@@ -77,31 +77,8 @@ pub fn write_section(
             warnings,
         );
     }
-    write_memos(&mut out, &section.memos);
     out.push_str("</hs:sec>");
     out
-}
-
-/// 메모(주석)를 `<hp:memogroup>`로 방출한다 (hwpx 전용, 실험적).
-/// memoShapeIDRef=0(기본). 작성자가 있으면 본문 앞에 `[작성자]`로 표기.
-fn write_memos(out: &mut String, memos: &[hwp_model::Memo]) {
-    if memos.is_empty() {
-        return;
-    }
-    out.push_str("<hp:memogroup>");
-    for memo in memos {
-        let body = match memo.author.as_deref().filter(|a| !a.is_empty()) {
-            Some(a) => format!("[{a}] {}", memo.text),
-            None => memo.text.clone(),
-        };
-        let _ = write!(
-            out,
-            r##"<hp:memo id="{}" memoShapeIDRef="0"><hp:paraList><hp:p id="0" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0"><hp:t>{}</hp:t></hp:run></hp:p></hp:paraList></hp:memo>"##,
-            memo.id,
-            esc(&body)
-        );
-    }
-    out.push_str("</hp:memogroup>");
 }
 
 #[derive(Default)]

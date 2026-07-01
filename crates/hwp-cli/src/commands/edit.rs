@@ -19,7 +19,6 @@ pub fn run(
     set_cells: &[String],
     set_fields: &[String],
     set_meta: &[String],
-    add_memos: &[String],
     create_fields: &[String],
     set_formats: &[String],
     set_aligns: &[String],
@@ -92,26 +91,8 @@ pub fn run(
     }
 
     for spec in set_meta {
-        let (key, value) = spec
-            .split_once('=')
-            .with_context(|| format!("--set-meta 형식은 \"키=값\" 입니다: {spec:?}"))?;
-        let val = (!value.is_empty()).then(|| value.to_string());
-        match key.trim() {
-            "title" => doc.metadata.title = val,
-            "author" => doc.metadata.author = val,
-            "subject" => doc.metadata.subject = val,
-            "keywords" => doc.metadata.keywords = val,
-            other => {
-                anyhow::bail!("--set-meta 키는 title|author|subject|keywords 입니다: {other:?}")
-            }
-        }
-        eprintln!("메타데이터 설정: {key} = {value:?}");
-        edits += 1;
-    }
-
-    for text in add_memos {
-        let id = hwp_convert::add_memo(&mut doc, 0, None, text);
-        eprintln!("메모 추가: #{id} {text:?}");
+        hwp_convert::apply_meta(&mut doc, spec).map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("메타데이터 설정: {spec}");
         edits += 1;
     }
 
@@ -200,7 +181,7 @@ pub fn run(
 
     if edits == 0 {
         eprintln!(
-            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--set-meta/--add-memo/--create-field/--set-format/--set-align/--insert-para/--delete-para/--add-row/--delete-row 확인)"
+            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--set-meta/--create-field/--set-format/--set-align/--insert-para/--delete-para/--add-row/--delete-row 확인)"
         );
     }
 

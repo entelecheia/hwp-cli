@@ -81,18 +81,9 @@ enum Cmd {
         /// 입력 markdown/JSON 파일 (생략 시 빈 문서)
         #[arg(long)]
         from: Option<PathBuf>,
-        /// 문서 스타일 프리셋 (markdown 입력에만 적용; JSON IR 입력은 무시)
-        #[arg(long, value_enum, default_value = "plain")]
-        preset: PresetArg,
-        /// 문서 제목 (요약 정보 / OPF 메타데이터)
-        #[arg(long)]
-        title: Option<String>,
-        /// 지은이
-        #[arg(long)]
-        author: Option<String>,
-        /// 주제
-        #[arg(long)]
-        subject: Option<String>,
+        /// 메타데이터 설정 "키=값" (키: title|author|subject|keywords, 반복 가능)
+        #[arg(long = "set-meta")]
+        set_meta: Vec<String>,
     },
 
     /// 렌더 결과를 한글 기준 PNG와 비교해 오차 측정 (위치 오프셋·픽셀 차이율)
@@ -134,9 +125,6 @@ enum Cmd {
         /// 메타데이터 설정 "키=값" (키: title|author|subject|keywords, 반복 가능)
         #[arg(long = "set-meta")]
         set_meta: Vec<String>,
-        /// 메모(주석) 추가 "텍스트" (hwpx 출력 전용, 실험적, 반복 가능)
-        #[arg(long = "add-memo")]
-        add_memo: Vec<String>,
         /// 누름틀 생성 "앵커=>이름" 또는 "앵커=>이름=값" — 앵커 텍스트 뒤에 %clk 필드 삽입 (반복 가능)
         #[arg(long = "create-field")]
         create_field: Vec<String>,
@@ -254,23 +242,6 @@ enum RenderFormat {
     Pdf,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum PresetArg {
-    Plain,
-    Gongmun,
-    Bogoseo,
-}
-
-impl From<PresetArg> for hwp_convert::Preset {
-    fn from(p: PresetArg) -> Self {
-        match p {
-            PresetArg::Plain => hwp_convert::Preset::Plain,
-            PresetArg::Gongmun => hwp_convert::Preset::Gongmun,
-            PresetArg::Bogoseo => hwp_convert::Preset::Bogoseo,
-        }
-    }
-}
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -324,18 +295,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::New {
             output,
             from,
-            preset,
-            title,
-            author,
-            subject,
-        } => commands::new::run(
-            &output,
-            from.as_deref(),
-            preset.into(),
-            title,
-            author,
-            subject,
-        ),
+            set_meta,
+        } => commands::new::run(&output, from.as_deref(), &set_meta),
         Cmd::Edit {
             input,
             output,
@@ -343,7 +304,6 @@ fn main() -> anyhow::Result<()> {
             set_cell,
             set_field,
             set_meta,
-            add_memo,
             create_field,
             set_format,
             set_align,
@@ -360,7 +320,6 @@ fn main() -> anyhow::Result<()> {
             &set_cell,
             &set_field,
             &set_meta,
-            &add_memo,
             &create_field,
             &set_format,
             &set_align,

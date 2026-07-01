@@ -42,14 +42,6 @@ pub struct WriteOptions {
 pub fn write_document(doc: &Document, path: &Path, opts: &WriteOptions) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
-    // 메모(주석)는 hwpx 출력에서만 지원 — hwp5 바이너리 메모 합성은 미지원.
-    let memo_count: usize = doc.sections.iter().map(|s| s.memos.len()).sum();
-    if memo_count > 0 {
-        warnings.push(format!(
-            "메모 {memo_count}개는 .hwpx 출력에서만 지원 — hwp 출력에서 생략"
-        ));
-    }
-
     // hwpx 출신 문서 정규화: hwp5 레코드(SHAPE_COMPONENT)가 없는 그림은
     // 쓸 수 없으므로 컨트롤과 확장 문자를 동기 제거한다
     //

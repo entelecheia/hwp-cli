@@ -99,22 +99,6 @@ pub struct Section {
     pub paragraphs: Vec<Paragraph>,
     /// 문단이 아닌 최상위 레코드 (잘 형성된 파일에서는 비어 있음)
     pub extras: Vec<crate::opaque::OpaqueRecord>,
-    /// 작성된 메모(주석). 비어 있으면 직렬화에서 제외 (왕복·바이트 동일성 보호).
-    /// hwpx 출력에서만 방출 (hwp5 바이너리 메모 합성은 미지원 — 경고 후 생략).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub memos: Vec<Memo>,
-}
-
-/// 문단에 단 메모(주석). hwpx `<hp:memogroup>`에 대응.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Memo {
-    /// 메모 id (섹션 내 고유).
-    pub id: u32,
-    /// 작성자 (선택).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub author: Option<String>,
-    /// 메모 본문 텍스트.
-    pub text: String,
 }
 
 impl Section {
