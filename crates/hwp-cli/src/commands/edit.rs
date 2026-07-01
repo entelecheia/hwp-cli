@@ -18,6 +18,7 @@ pub fn run(
     replaces: &[String],
     set_cells: &[String],
     set_fields: &[String],
+    set_meta: &[String],
     create_fields: &[String],
     insert_images: &[String],
     set_formats: &[String],
@@ -101,6 +102,12 @@ pub fn run(
             eprintln!("필드 설정: {name:?} = {value:?} ({n}건)");
         }
         edits += n;
+    }
+
+    for spec in set_meta {
+        hwp_convert::apply_meta(&mut doc, spec).map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("메타데이터 설정: {spec}");
+        edits += 1;
     }
 
     for spec in set_formats {
@@ -188,7 +195,7 @@ pub fn run(
 
     if edits == 0 {
         eprintln!(
-            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--create-field/--insert-image/--set-format/--set-align/--insert-para/--delete-para/--add-row/--delete-row 확인)"
+            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--set-meta/--create-field/--insert-image/--set-format/--set-align/--insert-para/--delete-para/--add-row/--delete-row 확인)"
         );
     }
 
@@ -209,12 +216,13 @@ fn write_output(doc: &hwp_model::Document, output: &Path, structural: bool) -> a
     {
         // 구조 편집은 삽입 문단/행에 불변식을 세우려 합성 경로를 강제한다.
         Some("hwp") if structural => crate::commands::convert::write_hwp_structural(doc, output)?,
-        Some("hwp") => crate::commands::convert::write_hwp_edited(doc, output)?,
+        Some("hwp") => {
+            let warnings = crate::commands::convert::write_hwp_edited(doc, output)?;
+            crate::commands::convert::print_warnings(&warnings);
+        }
         Some("hwpx") => {
             let warnings = hwpx::write_document(doc, output)?;
-            for w in &warnings {
-                eprintln!("경고: {w}");
-            }
+            crate::commands::convert::print_warnings(&warnings);
         }
         Some("json") => std::fs::write(output, hwp_convert::to_json(doc, true, true)?)?,
         Some("md") | Some("markdown") => {

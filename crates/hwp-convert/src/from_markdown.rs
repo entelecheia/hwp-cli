@@ -28,6 +28,9 @@ const BODY_WIDTH: i32 = 42520;
 
 /// `hwp new`용 기본 문서 헤더 — 한글 빈 문서에 준하는 최소 구성.
 pub fn default_header() -> hwp_model::DocHeader {
+    // 본문 함초롬바탕 10pt(1000 HWPUNIT). 헤딩 크기 = 본문 × 비율(1800/1500/1300/1200/1100/1100).
+    let body = 1000;
+    let h = |factor: i32| (body * factor) / 100;
     let mut header = hwp_model::DocHeader::default();
     for slot in 0..LANG_COUNT {
         header.fonts[slot] = vec![FaceName {
@@ -62,16 +65,16 @@ pub fn default_header() -> hwp_model::DocHeader {
         ..base.clone()
     };
     header.char_shapes = vec![
-        cs(1000, false, false), // 0 본문
-        cs(1000, true, false),  // 1 굵게
-        cs(1000, false, true),  // 2 기울임
-        cs(1000, true, true),   // 3 굵게+기울임
-        cs(1800, true, false),  // 4 H1
-        cs(1500, true, false),  // 5 H2
-        cs(1300, true, false),  // 6 H3
-        cs(1200, true, false),  // 7 H4
-        cs(1100, true, false),  // 8 H5
-        cs(1100, true, false),  // 9 H6
+        cs(body, false, false),  // 0 본문
+        cs(body, true, false),   // 1 굵게
+        cs(body, false, true),   // 2 기울임
+        cs(body, true, true),    // 3 굵게+기울임
+        cs(h(180), true, false), // 4 H1
+        cs(h(150), true, false), // 5 H2
+        cs(h(130), true, false), // 6 H3
+        cs(h(120), true, false), // 7 H4
+        cs(h(110), true, false), // 8 H5
+        cs(h(110), true, false), // 9 H6
     ];
 
     // 탭 정의 — 한글 기본 좌/중/우 자동 탭 3개. 정상 표본(hello_world 등
@@ -193,6 +196,7 @@ pub fn from_markdown(md: &str) -> Document {
             source_format: "markdown".to_string(),
             source_version: String::new(),
         },
+        metadata: Default::default(),
         header: default_header(),
         sections: vec![Section {
             paragraphs: b.paragraphs,
@@ -553,5 +557,17 @@ fn table_paragraph(tb: TableBuilder) -> Paragraph {
         char_shape_runs: vec![(0, CharShapeId(0))],
         controls: vec![Control::Table(table)],
         ..Paragraph::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_header_크기() {
+        let h = default_header();
+        assert_eq!(h.char_shapes[0].base_size, 1000); // 본문 10pt
+        assert_eq!(h.char_shapes[4].base_size, 1800); // H1 = 본문 × 1.8
     }
 }

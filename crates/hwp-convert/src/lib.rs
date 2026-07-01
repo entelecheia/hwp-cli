@@ -5,18 +5,24 @@ pub mod edit;
 pub mod field;
 pub mod format;
 pub mod from_markdown;
+pub mod html;
 pub mod image;
 pub mod markdown;
+pub mod odt;
 pub mod structure;
 
 use hwp_model::Document;
 
-pub use edit::{replace_text, set_cell};
-pub use field::{FieldInfo, create_field, list_fields, set_field};
+pub use edit::{add_rows, apply_meta, replace_text, set_cell, table_dims};
+pub use field::{
+    FieldInfo, PlaceholderInfo, create_field, list_fields, scan_placeholders, set_field,
+};
 pub use format::{CharFormat, set_char_format, set_para_align};
 pub use from_markdown::{default_header, from_markdown};
+pub use html::{to_html, to_html_fragment};
 pub use image::{ImageSize, insert_image};
 pub use markdown::to_markdown;
+pub use odt::to_odt;
 pub use structure::{add_table_row, delete_paragraph, delete_table_row, insert_paragraph};
 
 /// IR 전체를 JSON으로 직렬화 (구조 검사·디버깅·기계 소비용).

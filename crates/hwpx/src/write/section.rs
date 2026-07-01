@@ -199,7 +199,7 @@ fn write_paragraph(
                     }
                     Control::Generic(g) => {
                         warnings.push(format!(
-                            "hwpx 쓰기 미지원 컨트롤 드롭: {:?}",
+                            "DROP: hwpx 쓰기 미지원 컨트롤 드롭: {:?}",
                             String::from_utf8_lossy(&g.ctrl_id)
                         ));
                     }
@@ -442,7 +442,10 @@ fn write_picture(
     warnings: &mut Vec<String>,
 ) {
     let Some(item) = bins.register(doc, &pic.bin_ref) else {
-        warnings.push(format!("그림 데이터를 찾지 못해 드롭: {:?}", pic.bin_ref));
+        warnings.push(format!(
+            "DROP: 그림 데이터를 찾지 못해 드롭: {:?}",
+            pic.bin_ref
+        ));
         return;
     };
     let (w, h) = (pic.width.0.max(1), pic.height.0.max(1));
