@@ -326,8 +326,9 @@ fn draw_glyph_run(
             } else {
                 pixmap.fill_path(&path, &paint, FillRule::Winding, t, None);
                 if run.bold {
+                    // 합성 굵게 4.5% (한컴 굵게 대조 보정 — pdf.rs BOLD_STROKE와 동일)
                     let stroke = Stroke {
-                        width: run.size_pt * 0.03 / glyph_scale,
+                        width: run.size_pt * 0.045 / glyph_scale,
                         ..Stroke::default()
                     };
                     pixmap.stroke_path(&path, &paint, &stroke, t, None);

@@ -32,8 +32,8 @@ use crate::shape::ShapedRun;
 
 /// 합성 기울임 탄젠트 (png.rs/svg.rs와 동일, ≈12°).
 const ITALIC_SKEW: f32 = 0.2126;
-/// 합성 굵게 스트로크 굵기 (글자 크기 대비, png.rs와 동일).
-const BOLD_STROKE: f32 = 0.03;
+/// 합성 굵게 스트로크 굵기 (글자 크기 대비, png.rs와 동일). 한컴 굵게 대조 보정(4.5%).
+const BOLD_STROKE: f32 = 0.045;
 
 /// 문서 전체를 단일 멀티페이지 PDF 바이트로 렌더링한다.
 pub fn render_pdf(list: &DisplayList, warnings: &mut Vec<String>) -> Result<Vec<u8>, RenderError> {

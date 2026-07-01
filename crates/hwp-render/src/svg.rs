@@ -88,9 +88,10 @@ fn render_page(page: &PageList) -> String {
                         0.025 * upem
                     )
                 } else if run.bold {
+                    // 합성 굵게 4.5% (한컴 굵게 대조 보정 — pdf.rs BOLD_STROKE와 동일)
                     format!(
                         r#" fill="{color}" stroke="{color}" stroke-width="{:.1}""#,
-                        0.03 * upem
+                        0.045 * upem
                     )
                 } else {
                     format!(r#" fill="{color}""#)
