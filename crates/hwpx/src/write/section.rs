@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use hwp_model::{
     BinRef, Cell, Control, Document, GenericControl, HwpChar, PageDef, Paragraph, Picture, Section,
-    Table,
+    ShapeKind, Table,
 };
 
 use crate::write::templates::esc;
@@ -247,6 +247,20 @@ fn write_paragraph(
                             esc(&name)
                         );
                     }
+                    Control::Generic(g) if !g.gso_shapes.is_empty() => {
+                        // hwpx-출신 구조화 도형(rect/ellipse/line/…) — ShapeGeom 재직렬화.
+                        open_run!(cur_shape);
+                        flush_text(out, &mut text_buf);
+                        write_ir_shapes(out, doc, g, ids, bins, preserve_linesegs, warnings);
+                    }
+                    Control::Generic(g)
+                        if g.ctrl_id == *b"gso " && !g.paragraph_lists.is_empty() =>
+                    {
+                        // hwp5-출신 글상자 — <hp:rect>+<hp:drawText>로 텍스트/필드/책갈피 보존.
+                        open_run!(cur_shape);
+                        flush_text(out, &mut text_buf);
+                        write_gso_textbox(out, doc, g, ids, bins, preserve_linesegs, warnings);
+                    }
                     Control::Generic(g) => {
                         warnings.push(format!(
                             "DROP: hwpx 쓰기 미지원 컨트롤 드롭: {:?}",
@@ -393,6 +407,243 @@ fn write_header_footer(
         out.push_str("</hp:subList>");
     }
     let _ = write!(out, "</hp:{el}></hp:ctrl>");
+}
+
+/// hwp5 gso 공통 개체 헤더(20B+): attr(u32)@0, 세로 오프셋@4, 가로 오프셋@8, 폭@12, 높이@16.
+/// hwp5 `parse_picture_gso`/hwp-render `parse_gso_box`와 동일 레이아웃(역의존 불가라 로컬 복제).
+fn parse_gso_header(data: &[u8]) -> Option<(u32, i32, i32, i32, i32)> {
+    if data.len() < 20 {
+        return None;
+    }
+    let rd = |o: usize| i32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    Some((rd(0) as u32, rd(4), rd(8), rd(12), rd(16)))
+}
+
+/// COLORREF(0x00BBGGRR) → "#RRGGBB" (reader `parse_color`의 역).
+fn color_hex(c: u32) -> String {
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        c & 0xFF,
+        (c >> 8) & 0xFF,
+        (c >> 16) & 0xFF
+    )
+}
+
+// gso 배치/선 스타일 코드 → OWPML 이름 (reader의 vert_rel_to_code/line_style_code 등의 역).
+fn vert_rel_to_name(code: u8) -> &'static str {
+    match code {
+        1 => "PAGE",
+        2 => "PARA",
+        _ => "PAPER",
+    }
+}
+fn horz_rel_to_name(code: u8) -> &'static str {
+    match code {
+        1 => "PAGE",
+        2 => "COLUMN",
+        3 => "PARA",
+        _ => "PAPER",
+    }
+}
+fn vert_align_name(code: u8) -> &'static str {
+    match code {
+        1 => "CENTER",
+        2 => "BOTTOM",
+        _ => "TOP",
+    }
+}
+fn horz_align_name(code: u8) -> &'static str {
+    match code {
+        1 => "CENTER",
+        2 => "RIGHT",
+        _ => "LEFT",
+    }
+}
+fn line_style_name(code: u8) -> &'static str {
+    match code {
+        1 => "DASH",
+        2 => "DOT",
+        3 => "DASH_DOT",
+        4 => "DASH_DOT_DOT",
+        5 => "LONG_DASH",
+        _ => "SOLID",
+    }
+}
+fn arrow_name(code: u8) -> &'static str {
+    if code == 0 { "NORMAL" } else { "ARROW" }
+}
+
+/// 개체 공통 자식(offset/orgSz/curSz/flip/rotationInfo/단위행렬) — 정품 line/pic 스캐폴드 복제.
+fn write_obj_scaffold(out: &mut String, w: i32, h: i32) {
+    let _ = write!(
+        out,
+        r##"<hp:offset x="0" y="0"/><hp:orgSz width="{w}" height="{h}"/><hp:curSz width="{w}" height="{h}"/><hp:flip horizontal="0" vertical="0"/><hp:rotationInfo angle="0" centerX="{}" centerY="{}" rotateimage="1"/><hp:renderingInfo><hc:transMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:scaMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/></hp:renderingInfo>"##,
+        w / 2,
+        h / 2,
+    );
+}
+
+/// 글상자 텍스트: `<hp:drawText><hp:subList>문단들</hp:subList></hp:drawText>`.
+/// 모든 paragraph_lists를 하나의 subList로 병합(다단 글상자 v1 근사 — 텍스트 무손실).
+/// 필드/책갈피는 write_paragraph 안의 arm이 fieldBegin/bookmark로 함께 방출한다.
+#[allow(clippy::too_many_arguments)]
+fn write_draw_text(
+    out: &mut String,
+    doc: &Document,
+    g: &GenericControl,
+    ids: &mut IdSeq,
+    bins: &mut BinCollector,
+    preserve_linesegs: bool,
+    warnings: &mut Vec<String>,
+) {
+    if g.paragraph_lists.is_empty() {
+        return;
+    }
+    out.push_str(
+        r##"<hp:drawText name="" editable="0"><hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">"##,
+    );
+    for list in &g.paragraph_lists {
+        for para in &list.paragraphs {
+            write_paragraph(
+                out,
+                doc,
+                para,
+                ids,
+                bins,
+                false,
+                preserve_linesegs,
+                warnings,
+            );
+        }
+    }
+    out.push_str("</hp:subList></hp:drawText>");
+}
+
+/// hwp5-출신 글상자(gso + 문단) → `<hp:rect>` + drawText. 기하/배치는 gso 공통 헤더에서,
+/// 테두리는 v1 없음(NONE — SHAPE_COMPONENT 스타일 파싱은 렌더 전용, 후속 과제).
+#[allow(clippy::too_many_arguments)]
+fn write_gso_textbox(
+    out: &mut String,
+    doc: &Document,
+    g: &GenericControl,
+    ids: &mut IdSeq,
+    bins: &mut BinCollector,
+    preserve_linesegs: bool,
+    warnings: &mut Vec<String>,
+) {
+    let Some((attr, voff, hoff, w, h)) = parse_gso_header(&g.data) else {
+        warnings.push("DROP: gso 공통 헤더 파싱 실패 — 글상자 드롭".to_string());
+        return;
+    };
+    let treat = attr & 1;
+    let vrel = ((attr >> 3) & 0x3) as u8;
+    let valign = ((attr >> 5) & 0x7) as u8;
+    let hrel = ((attr >> 8) & 0x3) as u8;
+    let halign = ((attr >> 10) & 0x7) as u8;
+    let _ = write!(
+        out,
+        r##"<hp:rect id="{}" zOrder="0" numberingType="PICTURE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="{}" ratio="0">"##,
+        ids.next(),
+        ids.next(),
+    );
+    write_obj_scaffold(out, w, h);
+    out.push_str(
+        r##"<hp:lineShape color="#000000" width="0" style="NONE" endCap="FLAT" headStyle="NORMAL" tailStyle="NORMAL" headfill="1" tailfill="1" headSz="SMALL_SMALL" tailSz="SMALL_SMALL" outlineStyle="NORMAL" alpha="0"/>"##,
+    );
+    write_draw_text(out, doc, g, ids, bins, preserve_linesegs, warnings);
+    let _ = write!(
+        out,
+        r##"<hp:sz width="{w}" widthRelTo="ABSOLUTE" height="{h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="{treat}" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="{}" horzRelTo="{}" vertAlign="{}" horzAlign="{}" vertOffset="{voff}" horzOffset="{hoff}"/><hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:rect>"##,
+        vert_rel_to_name(vrel),
+        horz_rel_to_name(hrel),
+        vert_align_name(valign),
+        horz_align_name(halign),
+    );
+}
+
+/// hwpx-출신 구조화 도형(ShapeGeom) → OWPML 요소(reader `collect_shape`의 역).
+/// 텍스트(paragraph_lists)는 첫 도형에 drawText로 부착한다. 배치(relTo 등)는 ShapeGeom이
+/// 보존하지 않아 PAPER 절대 좌표로 근사(x/y는 reader가 pos 오프셋으로 왕복).
+#[allow(clippy::too_many_arguments)]
+fn write_ir_shapes(
+    out: &mut String,
+    doc: &Document,
+    g: &GenericControl,
+    ids: &mut IdSeq,
+    bins: &mut BinCollector,
+    preserve_linesegs: bool,
+    warnings: &mut Vec<String>,
+) {
+    for (i, s) in g.gso_shapes.iter().enumerate() {
+        let el = match s.kind {
+            ShapeKind::Rect => "rect",
+            ShapeKind::Ellipse => "ellipse",
+            ShapeKind::Line => "line",
+            ShapeKind::Polygon => "polygon",
+            ShapeKind::Curve => "curve",
+            ShapeKind::Arc => "arc",
+        };
+        let _ = write!(
+            out,
+            r##"<hp:{el} id="{}" zOrder="0" numberingType="PICTURE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="{}""##,
+            ids.next(),
+            ids.next(),
+        );
+        if matches!(s.kind, ShapeKind::Rect) {
+            let _ = write!(out, r##" ratio="{}""##, s.round_ratio);
+        }
+        out.push('>');
+        write_obj_scaffold(out, s.w, s.h);
+        let style = if s.border_width <= 0 {
+            "NONE"
+        } else {
+            line_style_name(s.border_style)
+        };
+        let _ = write!(
+            out,
+            r##"<hp:lineShape color="{}" width="{}" style="{style}" endCap="FLAT" headStyle="{}" tailStyle="{}" headfill="1" tailfill="1" headSz="SMALL_SMALL" tailSz="SMALL_SMALL" outlineStyle="NORMAL" alpha="0"/>"##,
+            color_hex(s.border_color),
+            s.border_width.max(0),
+            arrow_name(s.arrow_start),
+            arrow_name(s.arrow_end),
+        );
+        if s.fill != 0xFFFF_FFFF {
+            let _ = write!(
+                out,
+                r##"<hc:fillBrush><hc:winBrush faceColor="{}" hatchColor="#000000" alpha="0"/></hc:fillBrush>"##,
+                color_hex(s.fill),
+            );
+        }
+        match s.kind {
+            ShapeKind::Line => {
+                // 정품 형식은 startPt/endPt. 점 없으면 bbox 대각(reader는 sz/pos로 왕복).
+                let (p0, p1) = if s.points.len() >= 2 {
+                    (s.points[0], s.points[1])
+                } else {
+                    ((0, 0), (s.w, s.h))
+                };
+                let _ = write!(
+                    out,
+                    r##"<hc:startPt x="{}" y="{}"/><hc:endPt x="{}" y="{}"/>"##,
+                    p0.0, p0.1, p1.0, p1.1,
+                );
+            }
+            ShapeKind::Polygon | ShapeKind::Curve => {
+                for (pi, (px, py)) in s.points.iter().enumerate() {
+                    let _ = write!(out, r##"<hc:pt{pi} x="{px}" y="{py}"/>"##);
+                }
+            }
+            _ => {}
+        }
+        if i == 0 {
+            write_draw_text(out, doc, g, ids, bins, preserve_linesegs, warnings);
+        }
+        let _ = write!(
+            out,
+            r##"<hp:sz width="{}" widthRelTo="ABSOLUTE" height="{}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PAPER" horzRelTo="PAPER" vertAlign="TOP" horzAlign="LEFT" vertOffset="{}" horzOffset="{}"/><hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:{el}>"##,
+            s.w, s.h, s.y, s.x,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

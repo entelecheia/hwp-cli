@@ -458,3 +458,41 @@ fn fill_literal_tables_key_not_misrouted() {
         let _ = std::fs::remove_file(f);
     }
 }
+
+/// ★글상자 보존 기함 테스트: work_report.hwp의 글상자(gso) 안 텍스트와 %hlk 하이퍼링크가
+/// hwp→hwpx 변환에서 살아남는다 — 이전엔 글상자가 통째로 드롭돼 둘 다 소실(⑪의 알려진 한계).
+#[test]
+fn 변환_글상자_텍스트_필드_보존() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let src = fixture("hwp5/work_report.hwp");
+    if !src.exists() {
+        eprintln!("스킵: work_report.hwp 없음");
+        return;
+    }
+    let out = tmp("hwp_cli_textbox.hwpx");
+    let r = hwp()
+        .arg("convert")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(!stderr.contains("DROP"), "드롭 경고가 없어야: {stderr}");
+
+    // 글상자 안 텍스트 생존.
+    let cat = hwp().arg("cat").arg(&out).output().unwrap();
+    let text = String::from_utf8_lossy(&cat.stdout);
+    assert!(text.contains("나눔글꼴"), "글상자 텍스트 보존: {text}");
+
+    // 글상자 안 %hlk 하이퍼링크 생존.
+    let fields = hwp().args(["fields", "--json"]).arg(&out).output().unwrap();
+    let j = String::from_utf8_lossy(&fields.stdout);
+    assert!(j.contains("%hlk"), "글상자 안 하이퍼링크 보존: {j}");
+    assert!(j.contains("설치하기"), "하이퍼링크 표시값 보존: {j}");
+
+    let _ = std::fs::remove_file(&out);
+}

@@ -236,3 +236,172 @@ fn 하이퍼링크_생성_hwpx_왕복() {
         Some("https\\://example.com/a;1;0;0;")
     );
 }
+
+/// 문단 끝에 gso 컨트롤(ExtCtrl 코드 11 + Generic)을 부착한다.
+fn attach_gso(para: &mut hwp_model::Paragraph, g: hwp_model::GenericControl) {
+    use hwp_model::HwpChar;
+    let idx = para.controls.len() as u32;
+    para.chars.push(HwpChar::ExtCtrl {
+        code: 11,
+        ctrl_id: g.ctrl_id,
+        payload: hwp_convert::field::rev_payload(&g.ctrl_id),
+        ctrl_index: Some(idx),
+    });
+    para.controls.push(hwp_model::Control::Generic(g));
+    para.header.ctrl_mask = 0;
+}
+
+/// hwp5-출신 글상자(gso + 문단)가 hwpx `<hp:rect>+<hp:drawText>` 왕복을 통과한다 —
+/// 이전엔 통째로 드롭돼 안의 텍스트가 소실됐다.
+#[test]
+fn 글상자_hwp5출신_hwpx_왕복() {
+    use hwp_model::{CharShapeId, GenericControl, HwpChar, Paragraph, ParagraphList};
+
+    let mut doc = hwp_convert::from_markdown("본문 문단\n\n둘째 문단");
+    // hwp5형 gso: 40B 공통 헤더(attr bit0=글자처럼, 크기 4000x2000) + 글상자 문단 1개.
+    let mut data = vec![0u8; 40];
+    data[0] = 1; // treatAsChar
+    data[12..16].copy_from_slice(&4000i32.to_le_bytes());
+    data[16..20].copy_from_slice(&2000i32.to_le_bytes());
+    let boxed = Paragraph {
+        chars: "상자속글".chars().map(HwpChar::Text).collect(),
+        char_shape_runs: vec![(0, CharShapeId(0))],
+        ..Default::default()
+    };
+    let gso = GenericControl {
+        ctrl_id: *b"gso ",
+        data,
+        paragraph_lists: vec![ParagraphList {
+            header_data: Vec::new(),
+            paragraphs: vec![boxed],
+        }],
+        extras: Vec::new(),
+        raw_children: Vec::new(),
+        gso_shapes: Vec::new(),
+        equation: None,
+    };
+    attach_gso(&mut doc.sections[0].paragraphs[1], gso);
+
+    let out = tmp("gso_textbox.hwpx");
+    let warnings = hwpx::write_document(&doc, &out).unwrap();
+    assert!(
+        !warnings.iter().any(|w| w.contains("gso")),
+        "gso 드롭 경고가 없어야: {warnings:?}"
+    );
+
+    let bytes = std::fs::read(&out).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut xml = String::new();
+    {
+        use std::io::Read as _;
+        zip.by_name("Contents/section0.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+    }
+    assert!(xml.contains("<hp:rect "), "hp:rect 없음: {xml}");
+    assert!(xml.contains("<hp:drawText "), "hp:drawText 없음: {xml}");
+    assert!(xml.contains("상자속글"), "글상자 텍스트 없음: {xml}");
+    assert!(
+        xml.contains(r#"treatAsChar="1""#),
+        "treatAsChar 보존: {xml}"
+    );
+
+    // 재읽기: 텍스트 보존 + 도형 기하 복원(rect 4000x2000).
+    let reread = hwpx::read_document(&out).unwrap().document;
+    assert!(
+        reread.plain_text().contains("상자속글"),
+        "재읽기 텍스트: {}",
+        reread.plain_text()
+    );
+    let shape = reread.sections[0]
+        .paragraphs
+        .iter()
+        .flat_map(|p| &p.controls)
+        .find_map(|c| match c {
+            hwp_model::Control::Generic(g) if !g.gso_shapes.is_empty() => Some(&g.gso_shapes[0]),
+            _ => None,
+        })
+        .expect("재읽기 도형");
+    assert_eq!(shape.kind, hwp_model::ShapeKind::Rect);
+    assert_eq!((shape.w, shape.h), (4000, 2000));
+}
+
+/// hwpx-출신 구조화 도형(ShapeGeom)이 쓰기→읽기 왕복에서 기하·스타일을 보존한다 —
+/// 이전엔 드롭. Polygon 점(pt0..)·Rect 채움/테두리 색 왕복 확인.
+#[test]
+fn 도형_shapegeom_hwpx_왕복() {
+    use hwp_model::{GenericControl, ShapeGeom, ShapeKind};
+
+    let mut doc = hwp_convert::from_markdown("본문\n\n둘째");
+    let rect = ShapeGeom {
+        kind: ShapeKind::Rect,
+        x: 1000,
+        y: 2000,
+        w: 5000,
+        h: 3000,
+        points: Vec::new(),
+        fill: 0x00CC8040, // BGR
+        fill_gradient: None,
+        border_color: 0x000000FF, // 빨강(BGR)
+        border_width: 40,
+        round_ratio: 10,
+        border_style: 1, // DASH
+        arrow_start: 0,
+        arrow_end: 0,
+    };
+    let poly = ShapeGeom {
+        kind: ShapeKind::Polygon,
+        x: 0,
+        y: 0,
+        w: 200,
+        h: 100,
+        points: vec![(0, 0), (100, 50), (200, 0)],
+        fill: 0xFFFF_FFFF,
+        fill_gradient: None,
+        border_color: 0,
+        border_width: 12,
+        round_ratio: 0,
+        border_style: 0,
+        arrow_start: 0,
+        arrow_end: 0,
+    };
+    let gso = GenericControl {
+        ctrl_id: *b"rect",
+        data: Vec::new(),
+        paragraph_lists: Vec::new(),
+        extras: Vec::new(),
+        raw_children: Vec::new(),
+        gso_shapes: vec![rect.clone(), poly.clone()],
+        equation: None,
+    };
+    attach_gso(&mut doc.sections[0].paragraphs[1], gso);
+
+    let out = tmp("gso_shapes.hwpx");
+    let warnings = hwpx::write_document(&doc, &out).unwrap();
+    assert!(!warnings.iter().any(|w| w.contains("DROP")), "{warnings:?}");
+
+    let reread = hwpx::read_document(&out).unwrap().document;
+    let shapes: Vec<&ShapeGeom> = reread.sections[0]
+        .paragraphs
+        .iter()
+        .flat_map(|p| &p.controls)
+        .filter_map(|c| match c {
+            hwp_model::Control::Generic(g) if !g.gso_shapes.is_empty() => Some(&g.gso_shapes[0]),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shapes.len(), 2, "도형 2개 왕복");
+    let r = shapes.iter().find(|s| s.kind == ShapeKind::Rect).unwrap();
+    assert_eq!((r.x, r.y, r.w, r.h), (1000, 2000, 5000, 3000));
+    assert_eq!(r.fill, rect.fill);
+    assert_eq!(r.border_color, rect.border_color);
+    assert_eq!(r.border_width, rect.border_width);
+    assert_eq!(r.border_style, rect.border_style);
+    assert_eq!(r.round_ratio, rect.round_ratio);
+    let p = shapes
+        .iter()
+        .find(|s| s.kind == ShapeKind::Polygon)
+        .unwrap();
+    assert_eq!(p.points, poly.points, "폴리곤 점 왕복");
+}
