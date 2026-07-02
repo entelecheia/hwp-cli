@@ -262,6 +262,8 @@ pub fn layout_document(
                     // 문단 들여쓰기/여백/위 간격(폴백 전용 — 캐시는 col_start에 반영됨).
                     let left = body_left + geom.left;
                     let avail = (body_width - geom.left - geom.right).max(4.0);
+                    // 첫 줄 들여쓰기는 시작 x에만 적용(wrap 폭 미차감), 비정상 큰 값 방어 캡.
+                    let x0 = left + geom.first_indent.min(avail * 0.8);
                     let baseline_y = content_bottom + geom.spacing_top + max_size * 1.2;
                     para_top = Some(content_bottom + geom.spacing_top);
                     // 한 줄에 들어가는 가운데/오른쪽 정렬은 폴백에서도 보정한다.
@@ -274,7 +276,7 @@ pub fn layout_document(
                     let x = if natural <= avail && (align == 2 || align == 3) {
                         left + (avail - natural) * if align == 3 { 0.5 } else { 1.0 }
                     } else {
-                        left
+                        x0
                     };
                     if let Some(m) = &marker {
                         render_list_marker(&mut page, store, doc, m, left, baseline_y, max_size);
@@ -1224,6 +1226,8 @@ fn layout_box_para_iter<'a>(
                 let geom = para_geometry(doc, para);
                 let left = origin_x + geom.left;
                 let avail = (width - geom.left - geom.right).max(4.0);
+                // 첫 줄 들여쓰기는 시작 x에만(wrap 폭 미차감 — 좁은 셀 폭주 방지), 방어 캡.
+                let x0 = left + geom.first_indent.min(avail * 0.8);
                 let baseline_y = content_bottom + geom.spacing_top + max_size * 1.2;
                 para_top = Some(content_bottom + geom.spacing_top);
                 if let Some(m) = &marker {
@@ -1238,7 +1242,7 @@ fn layout_box_para_iter<'a>(
                 let x = if natural <= avail && (align == 2 || align == 3) {
                     left + (avail - natural) * if align == 3 { 0.5 } else { 1.0 }
                 } else {
-                    left
+                    x0
                 };
                 let last_y =
                     place_wrapped(page, items, x, baseline_y, avail, max_size * 1.6, &tabs);
@@ -1513,20 +1517,27 @@ fn justify_line(items: &mut [InlineItem], slack: f32) {
 /// (캐시 lineseg 경로는 col_start/v_pos에 이미 반영돼 있어 쓰지 않는다.)
 #[derive(Default, Clone, Copy)]
 struct ParaGeom {
-    /// 왼쪽 시작 가산(margin_left + 첫 줄 들여쓰기, 음수=내어쓰기 v1 무시).
+    /// 왼쪽 여백(margin_left만 — 들여쓰기는 first_indent로 분리).
     left: f32,
     right: f32,
+    /// 첫 줄 들여쓰기(양수만, 음수=내어쓰기 v1 무시). wrap 폭에선 빼지 않는다 —
+    /// 좁은 셀에서 avail이 붕괴해 글자마다 줄바꿈되는 폭주 방지(work_report 실측).
+    first_indent: f32,
     spacing_top: f32,
     spacing_bottom: f32,
 }
 
 fn para_geometry(doc: &Document, para: &Paragraph) -> ParaGeom {
+    // IR의 PARA_SHAPE 여백류(margin/indent/spacing)는 2×HWPUNIT — hwp5 저장 단위
+    // (hwpx reader 실측 규칙: OWPML left=1500 → hwp5 ml=3000, read/header.rs 참조).
+    // pt 환산은 /200.
     match doc.header.para_shapes.get(para.para_shape.0 as usize) {
         Some(p) => ParaGeom {
-            left: (p.margin_left as f32 / 100.0).max(0.0) + (p.indent as f32 / 100.0).max(0.0),
-            right: (p.margin_right as f32 / 100.0).max(0.0),
-            spacing_top: (p.spacing_top as f32 / 100.0).max(0.0),
-            spacing_bottom: (p.spacing_bottom as f32 / 100.0).max(0.0),
+            left: (p.margin_left as f32 / 200.0).max(0.0),
+            right: (p.margin_right as f32 / 200.0).max(0.0),
+            first_indent: (p.indent as f32 / 200.0).max(0.0),
+            spacing_top: (p.spacing_top as f32 / 200.0).max(0.0),
+            spacing_bottom: (p.spacing_bottom as f32 / 200.0).max(0.0),
         },
         None => ParaGeom::default(),
     }
@@ -1678,13 +1689,16 @@ mod para_geom_tests {
             ..Paragraph::default()
         };
         let g = para_geometry(&doc, &para);
-        assert_eq!(g.left, 70.0); // (margin_left 4000 + indent 3000)/100
-        assert_eq!(g.right, 20.0);
-        assert_eq!(g.spacing_top, 12.0);
-        assert_eq!(g.spacing_bottom, 6.0);
-        // 음수 들여쓰기(내어쓰기)는 v1에서 0 처리 → left = margin만.
+        // IR 여백류는 2×HWPUNIT → /200. 들여쓰기는 left와 분리(first_indent).
+        assert_eq!(g.left, 20.0); // margin_left 4000 / 200
+        assert_eq!(g.first_indent, 15.0); // indent 3000 / 200
+        assert_eq!(g.right, 10.0);
+        assert_eq!(g.spacing_top, 6.0);
+        assert_eq!(g.spacing_bottom, 3.0);
+        // 음수 들여쓰기(내어쓰기)는 v1에서 0 처리.
         doc.header.para_shapes[0].indent = -1000;
-        assert_eq!(para_geometry(&doc, &para).left, 40.0);
+        assert_eq!(para_geometry(&doc, &para).first_indent, 0.0);
+        assert_eq!(para_geometry(&doc, &para).left, 20.0);
         // para_shape 범위 밖이면 0.
         let p2 = Paragraph {
             para_shape: ParaShapeId(99),
