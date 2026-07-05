@@ -275,6 +275,11 @@ fn parse_text(
                     para.chars.push(HwpChar::Text(c));
                 }
             }
+            // <hp:t> 안의 강제 줄바꿈(정품 한글 구조: `앞<hp:lineBreak/>뒤`).
+            Event::Empty(e) | Event::Start(e) if e.local_name().as_ref() == b"lineBreak" => {
+                *wchar_pos += 1;
+                para.chars.push(HwpChar::CharCtrl(10));
+            }
             Event::End(e) if e.local_name().as_ref() == b"t" => break,
             Event::Eof => break,
             _ => {}
