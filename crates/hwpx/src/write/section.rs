@@ -187,10 +187,13 @@ fn write_paragraph(
                 text_buf.push(*c);
             }
             HwpChar::CharCtrl(code) => match *code {
+                // 강제 줄바꿈: 정품 한글은 <hp:lineBreak/>를 <hp:t> **안**에 둔다
+                // (`<hp:t>앞<hp:lineBreak/>뒤</hp:t>`). t 바깥에 두면 한글이 줄바꿈으로
+                // 인식하지 않는다(실기 확인). '\n' 센티넬을 버퍼에 넣고 flush_text가
+                // <hp:t> 안에서 <hp:lineBreak/>로 변환한다(정상 텍스트엔 '\n' 없음).
                 10 => {
                     open_run!(cur_shape);
-                    flush_text(out, &mut text_buf);
-                    out.push_str("<hp:lineBreak/>");
+                    text_buf.push('\n');
                 }
                 24 => text_buf.push('-'),
                 30 => text_buf.push('\u{00A0}'),
@@ -406,7 +409,15 @@ fn write_paragraph(
 
 fn flush_text(out: &mut String, buf: &mut String) {
     if !buf.is_empty() {
-        let _ = write!(out, r##"<hp:t xml:space="preserve">{}</hp:t>"##, esc(buf));
+        out.push_str(r##"<hp:t xml:space="preserve">"##);
+        // '\n' 센티넬(강제 줄바꿈)은 <hp:t> 안의 <hp:lineBreak/>로, 나머지는 XML 이스케이프.
+        for (i, part) in buf.split('\n').enumerate() {
+            if i > 0 {
+                out.push_str("<hp:lineBreak/>");
+            }
+            out.push_str(&esc(part));
+        }
+        out.push_str("</hp:t>");
         buf.clear();
     }
 }
