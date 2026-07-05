@@ -115,6 +115,7 @@ mod tests {
             raw_children: Vec::new(),
             gso_shapes: Vec::new(),
             equation: None,
+            column_def: None,
         }
     }
 

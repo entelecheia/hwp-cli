@@ -176,7 +176,7 @@ fn write_paragraph(
     if inject_secpr {
         open_run!(first_shape);
         write_default_sec_pr(out, None);
-        write_col_ctrl(out);
+        write_col_ctrl(out, None);
     }
 
     for ch in &para.chars {
@@ -233,7 +233,7 @@ fn write_paragraph(
                     Control::Generic(g) if g.ctrl_id == *b"cold" => {
                         open_run!(cur_shape);
                         flush_text(out, &mut text_buf);
-                        write_col_ctrl(out);
+                        write_col_ctrl(out, g.column_def.as_ref());
                     }
                     Control::Generic(g) if g.ctrl_id == *b"head" || g.ctrl_id == *b"foot" => {
                         open_run!(cur_shape);
@@ -470,9 +470,29 @@ fn write_default_sec_pr(out: &mut String, page: Option<&PageDef>) {
     );
 }
 
-fn write_col_ctrl(out: &mut String) {
-    out.push_str(
-        r##"<hp:ctrl><hp:colPr id="" type="NEWSPAPER" layout="LEFT" colCount="1" sameSz="1" sameGap="0"/></hp:ctrl>"##,
+fn write_col_ctrl(out: &mut String, col: Option<&hwp_model::ColumnDef>) {
+    // ColumnDef가 있으면 그 값을, 없으면 단일 단 기본값을 방출(왕복 보존).
+    let (ty, layout, count, same, gap) = match col {
+        Some(c) => (
+            match c.kind {
+                1 => "BALANCED",
+                2 => "PARALLEL",
+                _ => "NEWSPAPER",
+            },
+            match c.direction {
+                1 => "RIGHT",
+                2 => "MIRROR",
+                _ => "LEFT",
+            },
+            c.count.max(1),
+            u8::from(c.same_width),
+            c.gap,
+        ),
+        None => ("NEWSPAPER", "LEFT", 1, 1, 0),
+    };
+    let _ = write!(
+        out,
+        r##"<hp:ctrl><hp:colPr id="" type="{ty}" layout="{layout}" colCount="{count}" sameSz="{same}" sameGap="{gap}"/></hp:ctrl>"##,
     );
 }
 

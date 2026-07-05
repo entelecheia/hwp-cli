@@ -279,6 +279,7 @@ fn 글상자_hwp5출신_hwpx_왕복() {
         raw_children: Vec::new(),
         gso_shapes: Vec::new(),
         equation: None,
+        column_def: None,
     };
     attach_gso(&mut doc.sections[0].paragraphs[1], gso);
 
@@ -376,6 +377,7 @@ fn 도형_shapegeom_hwpx_왕복() {
         raw_children: Vec::new(),
         gso_shapes: vec![rect.clone(), poly.clone()],
         equation: None,
+        column_def: None,
     };
     attach_gso(&mut doc.sections[0].paragraphs[1], gso);
 
@@ -447,6 +449,7 @@ fn 장식_도형_hwp5출신_hwpx_왕복() {
         }],
         gso_shapes: Vec::new(),
         equation: None,
+        column_def: None,
     };
     attach_gso(&mut doc.sections[0].paragraphs[1], gso);
 
@@ -539,6 +542,7 @@ fn 쪽_컨트롤_hwpx_페이로드_왕복() {
             raw_children: Vec::new(),
             gso_shapes: Vec::new(),
             equation: None,
+            column_def: None,
         }));
     }
     para.header.ctrl_mask = 0;

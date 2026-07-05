@@ -211,6 +211,31 @@ pub struct GenericControl {
     /// 수식(hp:equation) — 렌더 전용(box+스크립트 근사). 없으면 None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equation: Option<Equation>,
+    /// 다단 정의(`cold`/hp:colPr) — 렌더러 단 배치·구분선용. 없으면 None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_def: Option<ColumnDef>,
+}
+
+/// 다단(multi-column) 정의 — COLDEF(`cold`)/hp:colPr. 렌더러가 단 배치·구분선에 사용.
+/// 근거: 한글문서파일형식 5.0 표138/139 + hwplib ControlColumnDefine(bit단위 대조).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnDef {
+    /// 단 수(1-255).
+    pub count: u16,
+    /// 종류: 0 일반, 1 배분, 2 평행.
+    pub kind: u8,
+    /// 방향: 0 왼쪽부터, 1 오른쪽부터, 2 맞쪽.
+    pub direction: u8,
+    /// 단 너비 동일 여부.
+    pub same_width: bool,
+    /// 단 간격(HWPUNIT).
+    pub gap: i32,
+    /// 단별 폭(HWPUNIT). same_width면 비어 있고 렌더러가 균등 분할.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub widths: Vec<i32>,
+    /// 단 사이 구분선(없으면 None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divider: Option<crate::header::BorderLine>,
 }
 
 /// 수식 개체 — 렌더러가 상자+스크립트 텍스트로 근사한다.

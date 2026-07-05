@@ -12,9 +12,9 @@
 
 use hwp_model::opaque::OpaqueRecord;
 use hwp_model::{
-    Cell, CharShapeId, Control, Equation, GenericControl, GradientSpec, HwpChar, HwpUnit, LineSeg,
-    PageDef, ParaShapeId, Paragraph, ParagraphList, Section, SectionDef, ShapeGeom, ShapeKind,
-    StyleId, Table,
+    Cell, CharShapeId, ColumnDef, Control, Equation, GenericControl, GradientSpec, HwpChar,
+    HwpUnit, LineSeg, PageDef, ParaShapeId, Paragraph, ParagraphList, Section, SectionDef,
+    ShapeGeom, ShapeKind, StyleId, Table,
 };
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -167,6 +167,7 @@ fn parse_paragraph(
                             raw_children: Vec::new(),
                             gso_shapes: Vec::new(),
                             equation: Some(eq),
+                            column_def: None,
                         }));
                     }
                     b"linesegarray" => {
@@ -200,6 +201,7 @@ fn parse_paragraph(
                             raw_children: Vec::new(),
                             gso_shapes: Vec::new(),
                             equation: None,
+                            column_def: None,
                         };
                         if !empty {
                             if let Some(kind) = shape_kind(&name) {
@@ -368,6 +370,32 @@ fn parse_sec_pr(reader: &mut XmlReader<'_>) -> Result<SectionDef> {
 /// hwpx `<hp:header/footer applyPageType id>` → hwp5 머리말/꼬리말 8B 페이로드.
 /// `적용쪽(u32)` + `id(u32)`. 적용쪽: BOTH=0, EVEN=1, ODD=2. 정품 실측:
 /// `<hp:header id="2" applyPageType="BOTH">` → `00000000 02000000`.
+/// hwpx `<hp:colPr type layout colCount sameSz sameGap>` → ColumnDef.
+/// 매핑(OWPML↔hwplib/HWP5): type NEWSPAPER=0 일반/BALANCED=1 배분/PARALLEL=2 평행,
+/// layout LEFT=0/RIGHT=1/MIRROR=2 맞쪽. 단별 폭(colSz)·구분선(colLine) 자식은 v1 미수집
+/// (등폭·구분선 없음 기준; 필요 시 정답지로 보강).
+fn parse_col_pr(e: &BytesStart<'_>) -> ColumnDef {
+    let kind = match attr(e, "type").as_deref() {
+        Some("BALANCED") => 1,
+        Some("PARALLEL") => 2,
+        _ => 0, // NEWSPAPER
+    };
+    let direction = match attr(e, "layout").as_deref() {
+        Some("RIGHT") => 1,
+        Some("MIRROR") => 2,
+        _ => 0, // LEFT
+    };
+    ColumnDef {
+        count: attr_u16(e, "colCount").unwrap_or(1),
+        kind,
+        direction,
+        same_width: attr_u16(e, "sameSz").unwrap_or(1) != 0,
+        gap: attr_i32(e, "sameGap").unwrap_or(0),
+        widths: Vec::new(),
+        divider: None,
+    }
+}
+
 fn head_foot_data(e: &BytesStart<'_>) -> Vec<u8> {
     let apply: u32 = match attr(e, "applyPageType").as_deref() {
         Some("EVEN") => 1,
@@ -513,6 +541,7 @@ fn parse_ctrl(
                         }],
                         gso_shapes: Vec::new(),
                         equation: None,
+                        column_def: None,
                     };
                     push_ext_ctrl(para, wchar_pos, 3, ctrl_id);
                     para.controls.push(Control::Generic(generic));
@@ -544,6 +573,7 @@ fn parse_ctrl(
                         }],
                         gso_shapes: Vec::new(),
                         equation: None,
+                        column_def: None,
                     };
                     push_ext_ctrl(para, wchar_pos, 22, *b"bokm");
                     para.controls.push(Control::Generic(generic));
@@ -572,6 +602,12 @@ fn parse_ctrl(
                         (id, 21, Vec::new())
                     }
                 };
+                // 다단(colPr): 속성을 ColumnDef로 캡처(렌더러 단 배치·구분선용).
+                let column_def = if name.as_slice() == b"colPr" {
+                    Some(parse_col_pr(e))
+                } else {
+                    None
+                };
                 let mut generic = GenericControl {
                     ctrl_id,
                     data,
@@ -580,6 +616,7 @@ fn parse_ctrl(
                     raw_children: Vec::new(),
                     gso_shapes: Vec::new(),
                     equation: None,
+                    column_def,
                 };
                 if matches!(event, Event::Start(_)) {
                     collect_sub_lists(reader, &name, &mut generic, warnings)?;
