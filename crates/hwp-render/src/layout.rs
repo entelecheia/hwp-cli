@@ -17,7 +17,7 @@
 
 use hwp_model::{Control, Document, HwpUnit, PageDef, Paragraph, Table};
 
-use crate::display::{DisplayList, Item, PageList, PathCmd, Stroke};
+use crate::display::{DisplayList, Item, PageList, PathCmd};
 use crate::fonts::FontStore;
 use crate::footnote::{self, Note};
 use crate::shape::{InlineItem, shape_range, shape_range_notes};
@@ -878,41 +878,21 @@ fn layout_para_objects(
                     }
                 }
             }
-            // 수식(hp:equation) — 상자+스크립트 텍스트로 근사.
+            // 수식(hp:equation) — 스크립트를 실제 math로 조판(equation.rs).
             Control::Generic(g) if g.equation.is_some() => {
                 let eq = g.equation.as_ref().expect("is_some");
-                let w = (eq.width as f32 / 100.0).max(24.0);
                 let h = (eq.height as f32 / 100.0).max(14.0);
                 let (bx, by, inline) = if eq.inline {
                     (x, object_y, true)
                 } else {
                     (eq.x as f32 / 100.0, eq.y as f32 / 100.0, false)
                 };
-                // 옅은 회색 점선 상자(수식 영역).
-                page.items.push(Item::Path {
-                    commands: vec![
-                        PathCmd::MoveTo(bx, by),
-                        PathCmd::LineTo(bx + w, by),
-                        PathCmd::LineTo(bx + w, by + h),
-                        PathCmd::LineTo(bx, by + h),
-                        PathCmd::Close,
-                    ],
-                    fill: None,
-                    stroke: Some(Stroke {
-                        color: 0x00C0_C0C0,
-                        width: 0.5,
-                        dash: vec![2.0, 2.0],
-                    }),
-                });
-                // 스크립트를 사람이 읽을 수 있게 근사 변환해 상자 안에 배치.
-                let text = prettify_equation(&eq.script);
-                if !text.is_empty() {
-                    let size = (h * 0.55).clamp(7.0, 14.0);
-                    if let Some(run) = crate::shape::shape_plain(store, doc, &text, size, 0) {
-                        let ty = by + h * 0.5 + size * 0.33;
-                        push_run(page, bx + 2.0, ty, run);
-                    }
-                }
+                // 기준 글자 크기: 수식 상자 높이의 60%(8~16pt). 스크립트를 조판해 배치.
+                let size = (h * 0.6).clamp(8.0, 16.0);
+                let ebox = crate::equation::typeset(store, doc, &eq.script, size);
+                // 세로 중앙정렬: 수식 중심을 상자 중심(by+h/2)에 맞춘 baseline.
+                let baseline_y = by + h * 0.5 + (ebox.ascent - ebox.descent) * 0.5;
+                crate::equation::render_into(page, ebox, bx + 2.0, baseline_y);
                 if inline {
                     object_y += h;
                     bottom = bottom.max(by + h);
@@ -1144,77 +1124,6 @@ fn diagonal_dirs(attr: u16) -> (bool, bool) {
     let slash = (attr >> 2) & 0x7 != 0;
     let backslash = (attr >> 5) & 0x7 != 0;
     (slash, backslash)
-}
-
-/// HWP 수식 스크립트를 사람이 읽을 수 있는 근사 문자열로 변환한다.
-/// 그룹 중괄호는 제거, 그리스/연산자 토큰을 유니코드 기호로 매핑한다.
-/// (정밀 수식 조판이 아닌 box+text 근사 — 가독성 우선.)
-fn prettify_equation(script: &str) -> String {
-    let spaced = script.replace(['{', '}'], " ");
-    spaced
-        .split_whitespace()
-        .map(map_eqn_token)
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// 수식 토큰 하나 → 유니코드 기호(모르면 원문). 빈 문자열=버림(글꼴 명령 등).
-fn map_eqn_token(tok: &str) -> String {
-    let mapped = match tok {
-        "over" => "/",
-        "times" => "×",
-        "div" => "÷",
-        "cdot" => "·",
-        "pm" => "±",
-        "mp" => "∓",
-        "sqrt" | "root" => "√",
-        "sum" | "SUM" => "Σ",
-        "int" | "INT" => "∫",
-        "prod" | "PROD" => "∏",
-        "inf" | "infinity" => "∞",
-        "partial" => "∂",
-        "nabla" => "∇",
-        "<=" | "leq" => "≤",
-        ">=" | "geq" => "≥",
-        "!=" | "neq" => "≠",
-        "~=" | "approx" => "≈",
-        "->" | "to" | "rightarrow" => "→",
-        "<-" | "leftarrow" => "←",
-        "in" => "∈",
-        "notin" => "∉",
-        "degree" => "°",
-        "dot" => "·",
-        "alpha" => "α",
-        "beta" => "β",
-        "gamma" => "γ",
-        "delta" => "δ",
-        "epsilon" => "ε",
-        "theta" => "θ",
-        "lambda" => "λ",
-        "mu" => "μ",
-        "nu" => "ν",
-        "pi" => "π",
-        "rho" => "ρ",
-        "sigma" => "σ",
-        "tau" => "τ",
-        "phi" => "φ",
-        "psi" => "ψ",
-        "omega" => "ω",
-        "GAMMA" => "Γ",
-        "DELTA" => "Δ",
-        "THETA" => "Θ",
-        "LAMBDA" => "Λ",
-        "PI" => "Π",
-        "SIGMA" => "Σ",
-        "PHI" => "Φ",
-        "PSI" => "Ψ",
-        "OMEGA" => "Ω",
-        // 글꼴/그룹 명령은 버린다.
-        "LEFT" | "RIGHT" | "rm" | "it" | "bold" | "ITALIC" => "",
-        other => return other.to_string(),
-    };
-    mapped.to_string()
 }
 
 /// 상자(셀) 안 문단들을 배치한다. origin은 텍스트 영역 좌상단(pt).
@@ -1697,7 +1606,7 @@ fn items_max_size(items: &[InlineItem]) -> Option<f32> {
 
 /// 글리프 런과 그 장식(밑줄/취소선)을 함께 배치한다.
 /// 장식 상수(0.10em/0.25em/0.05em)는 U5 실측 전 초기값.
-fn push_run(page: &mut PageList, x: f32, y: f32, run: crate::shape::ShapedRun) {
+pub(crate) fn push_run(page: &mut PageList, x: f32, y: f32, run: crate::shape::ShapedRun) {
     let w = run.width_pt;
     let em = run.size_pt;
     let underline = run.underline.then(|| {
@@ -1844,20 +1753,6 @@ mod para_geom_tests {
 #[cfg(test)]
 mod diagonal_tests {
     use super::diagonal_dirs;
-
-    #[test]
-    fn 수식_스크립트_근사() {
-        use super::prettify_equation;
-        // 중괄호 제거 + 그리스/연산자/기호 매핑.
-        assert_eq!(prettify_equation("x ^{2} + y"), "x ^ 2 + y");
-        assert_eq!(prettify_equation("alpha + beta times gamma"), "α + β × γ");
-        assert_eq!(prettify_equation("sqrt {x over y}"), "√ x / y");
-        assert_eq!(prettify_equation("a <= b >= c != d"), "a ≤ b ≥ c ≠ d");
-        // 글꼴/그룹 명령은 버림.
-        assert_eq!(prettify_equation("LEFT ( a RIGHT )"), "( a )");
-        // 모르는 토큰은 원문 유지.
-        assert_eq!(prettify_equation("foo_bar"), "foo_bar");
-    }
 
     #[test]
     fn 대각선_방향_비트() {

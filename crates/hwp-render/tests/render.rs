@@ -232,6 +232,62 @@ fn 빈_문서_렌더() {
     assert_eq!(dark_pixels(&out.pages[0]), 0, "빈 문서는 흰 페이지");
 }
 
+/// 수식 조판(equation.rs): 스크립트를 실제 math로 배치한다. 분수(over)는 분수선(Item::Line)을,
+/// 첨자(^/_)·근호(sqrt)·기호는 글리프를 만든다. 폰트 유무와 무관하게 분수선은 그려져야 한다.
+#[test]
+fn 수식_조판_렌더() {
+    use hwp_model::{Control, Equation, GenericControl};
+    let mut doc = hwp_convert::from_markdown("수식:\n");
+    let scripts = [
+        "a over b",
+        "x^2 + y_i",
+        "sqrt {a+b}",
+        "E=mc^2",
+        "alpha + beta over 2",
+    ];
+    for (i, sc) in scripts.iter().enumerate() {
+        doc.sections[0]
+            .paragraphs
+            .first_mut()
+            .unwrap()
+            .controls
+            .push(Control::Generic(GenericControl {
+                ctrl_id: *b"eqed",
+                data: vec![],
+                paragraph_lists: vec![],
+                extras: vec![],
+                raw_children: vec![],
+                gso_shapes: vec![],
+                equation: Some(Equation {
+                    script: sc.to_string(),
+                    width: 12000,
+                    height: 3500,
+                    inline: false,
+                    x: 8000,
+                    y: 6000 + i as i32 * 5000,
+                }),
+                column_def: None,
+            }));
+    }
+    let out = render_document(
+        &doc,
+        &RenderOptions {
+            dpi: 120.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // 분수 2개(over) → 분수선 Item::Line ≥ 2, 그리고 글리프 픽셀.
+    if std::env::var_os("HWP_EQ_PNG").is_some() {
+        out.pages[0].save_png("/tmp/eq_test.png").ok();
+    }
+    assert!(
+        dark_pixels(&out.pages[0]) > 200,
+        "수식 글리프가 그려져야: {}",
+        dark_pixels(&out.pages[0])
+    );
+}
+
 /// 연결 다단 글상자: annual_report "At a Glance"(5쪽)는 월 텍스트가 왼쪽→오른쪽 단으로
 /// 흐른다. (1) 글자 베이스라인이 페이지 하단을 넘지 않아야 하고(흐름 드리프트/잘림 회귀
 /// 방지), (2) 오른쪽 단(x≈300pt)에 본문이 배치돼야 한다(다단 흐름). 폰트 무관 — 배치는

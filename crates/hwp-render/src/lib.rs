@@ -9,6 +9,7 @@
 
 pub mod diff;
 pub mod display;
+pub mod equation;
 pub mod error;
 pub mod fonts;
 pub mod footnote;
