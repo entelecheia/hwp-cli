@@ -58,12 +58,15 @@ raw DEFLATE(zlib 헤더/Adler32 없음)를 뜻한다.
 ├── PrvText                        미리보기 텍스트 UTF-16LE (비압축)
 ├── PrvImage                       미리보기 이미지 PNG/BMP (비압축)
 ├── DocOptions/                    스토리지
-│   └── _LinkDoc                   문서 연결 옵션
+│   ├── _LinkDoc                   문서 연결 옵션
+│   └── (DrmLicense·DrmRootSect·CertDrmHeader·CertDrmInfo·
+│        DigitalSignature·PublicKeyInfo — 옵션 스트림, 미해석·미방출)
 ├── Scripts/                       스토리지
 │   ├── JScriptVersion             (레코드 스트림 규칙 — 압축 대상)
 │   └── DefaultJScript
 ├── XMLTemplate/                   XML 템플릿 스토리지 (미지원 — 통과)
-└── DocHistory/                    문서 이력 관리 (미지원 — 통과)
+├── DocHistory/                    문서 이력 관리 (미지원 — 통과)
+└── Bibliography/                  참고문헌 XML (미지원 — 통과)
 ```
 
 | 스트림/스토리지 | 스펙 § | 읽기 | 쓰기(합성) | 압축 | 근거 코드 |
@@ -77,9 +80,11 @@ raw DEFLATE(zlib 헤더/Adler32 없음)를 뜻한다.
 | `/PrvText` | 3.2.6 | 미해석 | 본문 발췌 생성 | 아니오 | `write.rs:225` |
 | `/PrvImage` | 3.2.7 | 미해석 | 옵션 제공 시 | 아니오 | `write.rs:226` |
 | `/DocOptions/_LinkDoc` | 3.2.8 | 미해석 | 상수 방출 | 아니오 | `write.rs:209` |
+| `/DocOptions/{Drm*,CertDrm*,DigitalSignature,PublicKeyInfo}` | 3.2.8 | 미해석 | **미방출** | 아니오 | (분기 없음 — [12](12-feature-gaps.md) GE-β3) |
 | `/Scripts/*` | 3.2.9 | 미해석 | 표본 상수 방출 | 예(규칙상) | `write.rs:213`, `container.rs:114` |
 | `/XMLTemplate/*` | 3.2.10 | 미지원(통과) | 없음 | — | — |
 | `/DocHistory/*` | 3.2.11 | 미지원(통과) | 없음 | — | — |
+| `/Bibliography/*` | 3.2.12 | 미지원(통과) | 없음 | — | (분기 없음 — [12](12-feature-gaps.md) GB-12) |
 
 **압축 판정** `is_record_stream(path)` (`container.rs:114`): `/DocInfo`, `/BodyText/`, `/ViewText/`,
 `/Scripts/`로 시작하는 스트림만 압축 대상이다. FileHeader·PrvText·PrvImage·BinData·요약정보는

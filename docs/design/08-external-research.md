@@ -91,3 +91,57 @@ owpml-model은 전부 **파서/객체모델**(layout/draw/paint 패키지 없음
 - 한컴 help: equation(script/explanation/font), page_border, vertical
 - neolord0/hwplib·hwpxlib, hancom-io/hwpx-owpml-model, docs.rs `hwp` 크레이트, hahnlee/hwp.js
 - 한컴테크 블로그(tech.hancom.com): hwpxformat, python-hwp-parsing (장평·자간)
+
+---
+
+# 생태계 기능 대조 (2026-07-08, deep-research 102 에이전트)
+
+> hwp-cli에 없는, 실사용자가 필요로 하는 기능을 타 구현체·수요 근거로 발굴. 91개 주장 추출 →
+> 25개 적대 검증 → **21 확정(전부 3-0)·4 반증**. [12-feature-gaps.md](12-feature-gaps.md) §10 GJ와
+> §14 로드맵 재평가(GA-2·GB-1★)의 근거가 이 절이다.
+
+## (a) 타 구현체가 이미 지원 — 구현 선례 존재
+
+| 발견 | 함의(12번 항목) | 근거 |
+|---|---|---|
+| **배포용 문서 읽기** — pyhwp 0.1b7(2014)~, H2Orestart v0.7.11(2026-04)~. 한컴 공식 스펙 「배포용문서 rev1.2」가 복호화 전체(DISTRIBUTE_DOC_DATA 256B, 난수 배열, SHA1 유도 키, AES-128 ECB)를 공개 — **역설계 불요** | GA-2 난이도 L→**M** 재평가 | pypi pyhwp changelog, H2Orestart #42, 한컴 스펙 PDF 실물 열람 |
+| **HWP 3.x 파싱** — rhwp(Rust, 렌더링까지·763페이지 오라클 검증), kordoc v2.7.1(텍스트 추출), LibreOffice hwpfilter(V30SIGNATURE). 공식 스펙 「3.0/HWPML rev1.2」 Part I이 구조 전부 문서화 | GJ-3 착수 가능 | rhwp README·PR#506, kordoc CHANGELOG, LibreOffice docs |
+| **HWPML(.hml) 입력** — kordoc 전용 파서 상용화. 같은 스펙 Part II가 XML 요소 레퍼런스 | GJ-2 착수 가능 | kordoc src/hwpml/parser.ts |
+| **세로쓰기·수식 행렬** — 동일 언어(Rust) rhwp가 둘 다 구현(글상자 vertical-rl/lr, MATRIX/PMATRIX/BMATRIX/DMATRIX + 수식 테스트 114건) | GC-1·GD-1 참조 구현 존재 | rhwp src/paint/font.rs·renderer/equation/parser.rs |
+| **HWPX 네이티브 차트 생성** — kordoc v3.16: 차트는 OLE가 아니라 `Chart/chartN.xml`(OOXML chartSpace) + manifest + `hp:chart chartIDRef`. 20종 차트를 XML 조작만으로 생성 | GB-1 hwpx 경로 L→**M** 재평가 | kordoc CHANGELOG·src/hwpx/chart-gen.ts |
+| **양식 개체·글맵시·OLE 객체모델 조작** — hwplib(Java)이 읽기/쓰기 지원(렌더링 아님) | GB-2·GB-4·GB-5 객체모델 선례 | neolord0/hwplib changelog |
+| **도장 자동 날인·문서 비교·서식 보존 패치** — kordoc seal("(인)" 앵커에 도장 PNG 부유 배치)·compare_documents·patch_document | GM-7·GM-8 선례 | kordoc README·MCP 도구표 |
+
+## (b) 수요는 확실하나 OSS가 잘 못 하는 것 — 무주공산
+
+| 발견 | 함의 | 근거 |
+|---|---|---|
+| **HWP→DOCX** — Microsoft가 공식 변환기(HwpConverter + 폴더 일괄 BATCHHWPCONV.exe)를 배포할 정도의 수요. OSS 출력 구현은 사실상 부재(pyhwp=ODT/HTML/txt만, kordoc은 DOCX 입력만) | GJ-1 = 수요 최상 | microsoft.com id=36772·49153 |
+| **독립 실행형 문서 병합/분할** — pyhwpx 쿡북의 정식 챕터(33개 병합·100쪽 분할)일 만큼 실무 빈출인데, 현행 해법은 Windows+한글 COM 전용에 클립보드 에러로 취약 | GM-3·GM-4 | wikidocs 8956(pyhwpx 쿡북) |
+| **HWPX 배포용 문서** — H2Orestart(#42 오픈)조차 미지원, 어느 구현체도 못 읽음. HWP5용 공식 배포 스펙이 HWPX 변형을 커버하는지 미확인 | GJ-8 (L) | H2Orestart #42 |
+
+## 경쟁 맥락·기타 확정
+
+- **pyhwp는 HWP5 전용·변환 3종(ODT/HTML/txt)·공식 "실험적" 표기·0.1b15(2020) 정체** — hwp-cli의
+  변환 스위트가 이 생태계 최광폭. hwpx 지원 요청(#135)은 2013년부터 오픈 → HWPX 수요의 깊이.
+- **H2Orestart + LibreOffice headless**가 사실상의 CLI HWP→PDF로 프로덕션 채택(Dangerzone).
+  JRE+LO 의존 없는 단일 바이너리가 hwp-cli의 차별점.
+- **hwp.js 미해결 이슈 3건은 정합 테스트 소재**: 한글 2018산 5.1.0.1.1 파싱(#59), 첨자(#55),
+  단 정의 스펙 14B vs 실파일 16B 불일치(#58 — ★스펙-실파일 불일치의 실증 사례).
+
+## 한계
+
+- 접근성(alt text)·전자서명·PDF/A **규제 수요는 검증 통과 근거 없음**(수요 부재가 아니라 근거 미생존).
+  표→CSV 수요도 직접 근거 미생존(kordoc XLS/XLSX는 입력 방향).
+- rhwp·kordoc은 2026-03 말 생성된 신생 프로젝트 — 기능은 코드 수준 검증했으나 렌더 정합 품질은
+  자체 보고(오라클/aHash) 기반. kordoc HWP3.x는 텍스트 추출 한정.
+- 반증 4건 폐기: hwplib 미지원 목록(0-3), hwp-rs read-only 단정(0-3), hwp.js 정체 단정(1-2),
+  LibreOffice HWP 2.0/2.1 계보(0-3).
+
+## 참고 출처 (생태계)
+
+- pypi.org/project/pyhwp, pyhwp.readthedocs.io(converters), github.com/mete0r/pyhwp#135
+- github.com/ebandal/H2Orestart(#42), extensions.libreoffice.org/27504, freedomofpress/dangerzone
+- github.com/edwardkim/rhwp, github.com/chrisryugj/kordoc, github.com/neolord0/hwplib
+- github.com/hahnlee/hwp.js(#55·#58·#59), microsoft.com HwpConverter(id=36772·49153)
+- store.hancom.com/etc/hwpDownload.do(배포용문서 rev1.2·3.0/HWPML rev1.2), wikidocs.net/book/8956
