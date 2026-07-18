@@ -65,6 +65,19 @@ pub fn parse_section(xml: &str) -> Result<(Section, Vec<String>)> {
             _ => {}
         }
     }
+    // secPr 원문 에코를 문서 순서대로 SectionDef에 대입한다 — 비-기본 secPr
+    // (각주 모양·쪽 테두리 커스텀 등)의 무손실 왕복용. secPr는 본문 문단에만
+    // 오므로 생성 순서와 스캔 순서가 일치한다.
+    let mut raws = crate::read::xml::echo_elements(xml, "hp", "secPr").into_iter();
+    for para in &mut section.paragraphs {
+        for ctrl in &mut para.controls {
+            if let Control::SectionDef(def) = ctrl
+                && def.hwpx_raw.is_none()
+            {
+                def.hwpx_raw = raws.next();
+            }
+        }
+    }
     Ok((section, warnings))
 }
 
@@ -139,6 +152,7 @@ fn parse_paragraph(
                                 data: Vec::new(),
                                 page: None,
                                 extras: Vec::new(),
+                                hwpx_raw: None,
                             }
                         } else {
                             parse_sec_pr(reader)?
@@ -314,6 +328,7 @@ fn parse_sec_pr(reader: &mut XmlReader<'_>) -> Result<SectionDef> {
         data: Vec::new(),
         page: None,
         extras: Vec::new(),
+        hwpx_raw: None,
     };
     let mut page = PageDef {
         width: HwpUnit(0),

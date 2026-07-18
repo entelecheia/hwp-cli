@@ -228,7 +228,12 @@ fn write_paragraph(
                     Control::SectionDef(def) => {
                         open_run!(cur_shape);
                         flush_text(out, &mut text_buf);
-                        write_default_sec_pr(out, def.page.as_ref());
+                        if let Some(raw) = &def.hwpx_raw {
+                            // 원문 secPr verbatim 방출 (비-기본 secPr 왕복 보존).
+                            out.push_str(raw);
+                        } else {
+                            write_default_sec_pr(out, def.page.as_ref());
+                        }
                     }
                     Control::Generic(g) if g.ctrl_id == *b"cold" => {
                         open_run!(cur_shape);

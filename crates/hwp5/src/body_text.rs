@@ -344,6 +344,7 @@ fn parse_section_def(
         data,
         page: None,
         extras: Vec::new(),
+        hwpx_raw: None,
     };
     for child in children {
         if child.tag == tag::PAGE_DEF {

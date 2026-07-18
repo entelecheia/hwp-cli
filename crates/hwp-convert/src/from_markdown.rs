@@ -698,6 +698,7 @@ fn inject_section_controls(para: &mut Paragraph) {
             data: Vec::new(),
             page: Some(page),
             extras: Vec::new(),
+            hwpx_raw: None,
         }),
     );
     para.controls.insert(

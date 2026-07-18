@@ -77,6 +77,10 @@ pub struct SectionDef {
     pub page: Option<PageDef>,
     /// FOOTNOTE_SHAPE, PAGE_BORDER_FILL 등 미해석 자식
     pub extras: Vec<OpaqueRecord>,
+    /// hwpx 출신이면 원본 `<hp:secPr>` XML 전문 — 비-기본 secPr(각주 모양·쪽
+    /// 테두리 커스텀 등)의 무손실 왕복용. 있으면 hwpx writer가 템플릿 대신 verbatim 방출.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwpx_raw: Option<String>,
 }
 
 /// PAGE_DEF (40바이트) — 용지 정의.
