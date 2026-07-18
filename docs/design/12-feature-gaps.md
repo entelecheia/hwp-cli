@@ -147,9 +147,9 @@ XML 파트**(`Chart/chartN.xml` + manifest 등재 + `hp:chart chartIDRef`)여서
 |---|---|---|---|---|---|---|
 | GC-1 | **세로쓰기 미지원** — 방향이 항상 가로로 고정 방출 | hwpx `write/header.rs:335`(`textDir="LTR"` 상수), `write/section.rs:460`(`textDirection="HORIZONTAL"` 상수) | OWPML `secPr@textDirection`, `paraPr@textDir` | 근사(가로 고정) | 합성·렌더 | M |
 | GC-2 | **쪽 테두리/배경 미반영** — hwp5는 Opaque, hwpx read는 skip, write는 상수 방출 | hwp5 `body_text.rs:357`(secd 자식 Opaque), hwpx `read/section.rs:353`(`_ => {}` skip), `write/section.rs:460`(`pageBorderFill` 상수) | §4.3.10.1.3 `PAGE_BORDER_FILL` / `hp:pageBorderFill` | hwp5=Opaque 보존 / hwpx=드롭+상수 | 왕복(hwpx만)·합성·렌더 | M |
-| GC-3 | **각주/미주 모양 미반영**(번호형식·구분선·간격) — 각주 참조는 렌더하나 모양은 상수 | hwp5 `body_text.rs:357`(secd 자식 Opaque), hwpx `read/section.rs:353`(skip), `write/section.rs:460`(`footNotePr`·`endNotePr` 상수) | §4.3.10.1.2 `FOOTNOTE_SHAPE` / `hp:footNotePr`·`endNotePr` | hwp5=Opaque 보존 / hwpx=드롭+상수 | 왕복(hwpx만)·합성·렌더 | M |
-| GC-4 | **탭 정의 손실**(사용자 탭 위치·채움문자) — hwp5 raw보존, hwpx는 빈 상수 방출 | hwp5 `doc_info.rs:112`(`TAB_DEF` raw), hwpx `read/header.rs`(tabPrIDRef만)·`write/header.rs:263`(`write_tab_properties` 빈 `tabPr`) | §4.2.7 `TAB_DEF` / `hh:tabPr` | hwp5=raw보존 / hwpx=드롭+상수 | 왕복(hwpx만)·렌더 | S |
-| GC-5 | **구역 속성 skip**(grid/startNum/visibility/lineNumberShape) — read가 흔적 없이 버림 | hwpx `read/section.rs:353`(`parse_sec_pr` 미매칭 skip), `write/section.rs:460`(상수 재합성) | OWPML `secPr` 자식 | skip → 상수 | 왕복(hwpx만)·합성 | S |
+| GC-3 | **각주/미주 모양 미반영**(번호형식·구분선·간격) — 각주 참조는 렌더하나 모양은 상수 | hwpx `SectionDef.hwpx_raw`(secPr 전문 보존) | §4.3.10.1.2 `FOOTNOTE_SHAPE` / `hp:footNotePr`·`endNotePr` | ✅ **해소(2026-07-19, hwpx)** — secPr raw 보존으로 모양 왕복 + `write_footnote`로 각주/미주 본문 방출(기존 DROP). **잔여: hwp5 출력 fn/en 본문 드롭**(범위 외) | 왕복(hwpx만)·합성·렌더 | M |
+| GC-4 | **탭 정의 손실**(사용자 탭 위치·채움문자) — hwp5 raw보존, hwpx는 빈 상수 방출 | hwpx `DocHeader.hwpx_tab_defs_raw` | §4.2.7 `TAB_DEF` / `hh:tabPr` | ✅ **해소(2026-07-19, hwpx)** — `<hh:tabPr>` 전문 에코 보존·verbatim 방출(상수 폴림) | 왕복(hwpx만)·렌더 | S |
+| GC-5 | **구역 속성 skip**(grid/startNum/visibility/lineNumberShape) — read가 흔적 없이 버림 | hwpx `SectionDef.hwpx_raw` | OWPML `secPr` 자식 | ✅ **해소(2026-07-19, hwpx)** — secPr 전문 보존으로 grid/startNum/visibility/lineNumberShape 왕복 | 왕복(hwpx만)·합성 | S |
 | GC-6 | **글상자 다단 미지원** — 연결/다단 글상자를 단일 단으로 근사 렌더 | `hwp-render/src/layout.rs:864`(`v1 단일 단 — hwp5 arm의 다단은 미지원`), `:788` | §4.3.10.2 단 정의 | 근사(단일 단) | 렌더 | S |
 | GC-7 | **홀/짝수 조정 미해석** — 별도 의미 파싱 없이 Generic 통과 | hwpx `read/section.rs:597`(미지 ctrl → 코드 21 Generic), [10](10-hwp5-structure-map.md) §6.1 각주 | §4.3.10.8 | Generic 보존(미해석) | 합성·렌더 | S |
 | GC-8 | **내어쓰기(음수 들여쓰기) 렌더 무시** — 음수 first-indent를 0으로 클램프 | `hwp-render/src/layout.rs:1493`(`음수=내어쓰기 v1 무시`), `:1578`(`.max(0.0)`) | §4.2.10 문단모양 들여쓰기 | 근사(0 클램프) | 렌더 | S |
@@ -400,7 +400,7 @@ validate·mcp·dump) 기준 부재 목록. 수요 근거는 [08](08-external-res
 
 | | **난이도 S**(자료구조만) | **난이도 M**(정답지 필요) | **난이도 L**(실기 반복) |
 |---|---|---|---|
-| **가치 高**(빈출) | GC-4·GC-5(탭·구역속성), GC-8·GC-9(내어쓰기·문단배경) — ✅해소(2026-07-15): ~~GE-α1~α5·α7, GH-1·GH-2, GL-1, GA-5, GE-β4~~ / ✅해소(2026-07-18, md): ~~GH-3·GH-4·GH-5·GH-6, GH-8~~ | GC-2·GC-3(쪽테두리·각주모양), GG-3·GG-4(양쪽정렬·자간), GF-2(찾아보기·겹침), **GA-2★**(배포용 읽기 — 공식 스펙 공개), **GJ-1**(DOCX 출력 — 수요 최상·무주공산), **GK-1**(셀 병합), **GK-2**(열 삭제 — 추가는 해소) | GG-1·GG-2(글상자 드롭·오버플로) |
+| **가치 高**(빈출) | GC-8·GC-9(내어쓰기·문단배경) — ✅해소(2026-07-15): ~~GE-α1~α5·α7, GH-1·GH-2, GL-1, GA-5, GE-β4~~ / ✅해소(2026-07-18, md): ~~GH-3·GH-4·GH-5·GH-6, GH-8~~ / ✅해소(2026-07-19, hwpx): ~~GC-3·GC-4·GC-5~~ | GC-2(쪽테두리 — 각주모양 GC-3은 해소), GG-3·GG-4(양쪽정렬·자간), GF-2(찾아보기·겹침), **GA-2★**(배포용 읽기 — 공식 스펙 공개), **GJ-1**(DOCX 출력 — 수요 최상·무주공산), **GK-1**(셀 병합), **GK-2**(열 삭제 — 추가는 해소) | GG-1·GG-2(글상자 드롭·오버플로) |
 | **가치 中** | GC-6(글상자 다단), GE-2~GE-6(그림 드롭·단·번호 합성), GF-1(%unk), **GB-12**(참고문헌), **GE-β1·β2·β5**(미리보기·스크립트·설정), **GG-5·GG-6·GG-8~GG-11·GG-16·GG-17·GG-20**(렌더 국소), **GH-3·GH-4·GH-5**(html/odt 각주 마커·병합셀·셀 블록 — md는 2026-07-18 해소), **GI-1~GI-4**(md 들여오기), **GJ-5·GJ-6**(csv·txt), **GK-3·GK-4·GK-6·GK-8**(표 삽입·문단모양·페이지설정·삭제), **GM-1·GM-2·GM-5~GM-7**(배치·파이프·검색·메타·날인) | GB-4~GB-7·GB-10(글맵시·양식·묶음·메모·바탕쪽), GC-1(세로쓰기), GD-1~GD-3(수식 — rhwp 선례), GE-α6(그러데이션), GF-3(필드 생성), **GB-1 hwpx 차트 생성★**(chartSpace — kordoc 선례), **GJ-2·GJ-3**(hml·HWP3.x — 공식 스펙 공개), **GG-7·GG-12~GG-15·GG-18·GG-19**(렌더 픽셀 대조), **GE-β3·β6**(DocOptions·임베디드 폰트), **GH-7**(ODT 레이아웃), **GK-5·GK-7**(머리말 편집·스타일), **GM-3·GM-4·GM-8**(병합·분할·비교) | GB-2·GB-3(OLE·동영상), **GJ-1 완전 왕복**(docx 들여오기 포함 시) |
 | **가치 低**(드묾) | GA-3·GA-4(거부 메시지), **GI-5**(embed-bin), **GL-2·GL-3**(추출 세분) | **GJ-4**(rtf) | GA-1(암호화), GB-8·GB-9·GB-11(변경추적 등), **GJ-7**(역방향 입력), **GJ-8**(HWPX 배포용) |
 
@@ -461,7 +461,7 @@ validate·mcp·dump) 기준 부재 목록. 수요 근거는 [08](08-external-res
 
 **요약:** 초판의 저비용·고가치 진입점(GE-α 글자효과, GH-1·GH-2 링크·이미지, GL-1 추출 옵션,
 GA-5 버전 게이트, GE-β4 요약정보)은 **2026-07-15에 일괄 해소**됐다(§0.5). 다음 진입점은
-**GC-4·GC-5·GC-8·GC-9**(탭·구역속성·내어쓰기·문단배경, S)와 **GE-β5·GM-7**(설정 pass-through·
+**GC-8·GC-9**(내어쓰기·문단배경, S)와 **GE-β5·GM-7**(설정 pass-through·
 도장 날인, S)이고, 고가치·고난도의 정공법은 **GC-2·GC-3**(공문서 빈출 쪽테두리·각주모양)과
 **GA-2**(배포용 읽기 — 공식 스펙 공개로 재평가된 M), 상품 관점의 최대 수요는 **GJ-1**(DOCX 출력
 — OSS 무주공산)이다.

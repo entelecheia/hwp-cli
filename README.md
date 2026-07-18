@@ -215,6 +215,22 @@ HWP 요소 → markdown 매핑:
 한계: 헤딩 인식은 `개요 N` 스타일뿐이고(사용자 정의 제목 스타일은 본문 취급), 떠 있는(floating)
 개체의 위치·z-order는 반영하지 않으며, 역방향(md → hwp)은 표·굵게 등 기본 구문만 복원된다.
 
+## JSON IR로 문서 재생성 (regen)
+
+기존 문서를 편집하지 않고 **처음부터 똑같이 신규 생성**할 수 있다 — JSON IR이 무손실
+왕복을 보장하고, hwpx read/write 경계의 손실(secPr·tabPr·각주/미주)은 원문 보존으로 해소됐다.
+
+```sh
+hwp convert report.hwpx -o report.json   # hwp/hwpx → JSON IR (--embed-bin: 이미지까지 임베드)
+hwp new --from report.json -o regen.hwpx # JSON IR → 신규 문서
+```
+
+재생성 검증(자동, `crates/hwp-cli/tests/regen.rs`): validate 통과, `hwp cat` 출력 전문 동일,
+표 지도(개수·행/열·병합·셀 폭) 동일, secPr·tabProperties 슬라이스 바이트 동일.
+차이가 남는 것은 설계상 재생성 대상인 줄 배치 캐시(linesegarray — 한글이 열 때 재계산),
+미리보기 이미지, settings.xml뿐이다. markdown 경로(`hwp new --from md`)는 병합 표·폰트·
+글자 색 같은 표현력 밖 요소를 재현하지 않는다(RISE 스타일 veneer까지).
+
 ## MCP 서버 (AI 에이전트 연동)
 
 `hwp mcp`는 tokio나 SDK 없이 `serde_json`만으로 동기 JSON-RPC 2.0(stdio, 줄 단위)을 구현한 **MCP

@@ -362,7 +362,7 @@ read가 버리므로(§3의 skip) IR엔 없다. write가 sz/좌표 등에서 재
 | `hp:imgRect`, `hp:imgClip`, `hp:imgDim` | bbox 상수 | skip(parse_picture) | 이미지 크롭·치수 재합성 | :1079 |
 | `hp:drawText`>`hp:textMargin` | 여백 283 상수 | 텍스트(subList)만 수집 | 글상자 여백 상수화 | :622 |
 | lineShape `headfill`/`tailfill`/`headSz`/`tailSz`/`endCap`/`outlineStyle`/`alpha` | 상수 | color/width/style/head/tail만 | 화살표 크기·꼬리 상수 | :748 |
-| `hp:pageBorderFill`, `hp:footNotePr`, `hp:endNotePr`, `hp:grid`, `hp:startNum`, `hp:visibility`, `hp:lineNumberShape` | 구역 상수 | skip(secPr 자식) | 각주/미주/쪽테두리 상수 재합성 | :460 |
+| `hp:pageBorderFill`, `hp:footNotePr`, `hp:endNotePr`, `hp:grid`, `hp:startNum`, `hp:visibility`, `hp:lineNumberShape` | 구역 상수 | skip(secPr 자식) | ✅ **해소(2026-07-19)** — `SectionDef.hwpx_raw`로 원본 secPr 전문 보존·verbatim 방출(없으면 기존 상수 템플릿 폴림) | `read/xml.rs::echo_elements` ↔ `write/section.rs SectionDef arm` |
 | `hh:beginNum`, `hh:compatibleDocument`, `hh:docOption`, `hh:autoSpacing` | 상수 | skip(header) | 호환·문서옵션 상수 | `write/header.rs:51,71` |
 
 ### (b) read만 해석·write는 상수/근사/미방출 — 읽었으나 hwpx로 되돌리지 못함
@@ -378,9 +378,10 @@ IR엔 값이 있으나(hwp5로는 나감) hwpx write가 상수/근사로 눌러 
 | `hh:underline shape` | type/**shape**/color 해석(IR `underline_shape` 신설) | ✅ `underline_shape` 기반(0=SOLID) | **해소(2026-07-15)** | `:204` ↔ 동상 |
 | colPr `colSz`/`colLine`(단별폭·구분선) | 미수집(등폭 가정) | 값 방출하나 단별폭 없음 | 불균등 단·구분선 손실 | `parse_col_pr :377` ↔ `write_col_ctrl :473` |
 | `hc:gradation angle`·중심·step | angle만(라디안 근사) | angle round + centerX/Y/step 상수 | 그러데이션 중심·단계 근사 | `parse_gradation :1217` ↔ `:764` |
-| `hp:pagePr landscape` | attr bit0 | default_sec_pr에서 재방출 | 보존(단 secPr 다른 상수와 함께) | `:340` ↔ `:453` |
+| `hp:pagePr landscape` | attr bit0 | default_sec_pr에서 재방출 | 보존(단 secPr 다른 상수와 함께 — raw 우선) | `:340` ↔ `:453` |
+| `hp:footNote`/`hp:endNote` | fn/en + subList 수집 | ✅ **해소(2026-07-19)** — `write_footnote`로 subList 스캐폴드 방출(기존 DROP). 한컴 저장 정답지 부재 — OWPML 스펙 형태, 실기 게이트 필요 | `:589` ↔ `write/section.rs::write_footnote` |
 | numbering `paraHead` 형식 | template/start/numFormat 수집 | ✅ `numbering_levels` 기반(없으면 기존 상수) | **해소(2026-07-15)** — 다중 번호정의 itemCnt 뭉개짐도 함께 수정 | `:333` ↔ `write_numberings` |
-| tab `tabPr`(위치·채움) | tabPrIDRef만 | tabPr 빈 상수 | 사용자 탭 정의 손실 | `:291` ↔ `write_tab_properties :263` |
+| tab `tabPr`(위치·채움) | tabPrIDRef만 | ✅ **해소(2026-07-19)** — `DocHeader.hwpx_tab_defs_raw`로 `<hh:tabPr>` 전문 보존·verbatim 방출(없으면 기존 상수 폴림, tab-count 클램프 반영) | `read/header.rs`(에코) ↔ `write_tab_properties` |
 | paraPr `heading`(문단↔번호 연결) | attr1 bits23‑27 + numbering_id | ✅ OUTLINE/NUMBER/BULLET 역방출 | **해소(2026-07-15 2차)** — [12](12-feature-gaps.md) GE-α8 | `:309` ↔ `write_para_properties` |
 
 ### (c) 양쪽 없음(미구현) — read·write 모두 의미 처리 없음
