@@ -15,7 +15,7 @@
 //!   겹침만 아래로 밀어낸다.
 //! - lineseg가 아예 없는 문단은 본문 폭 기준 폴백 배치.
 
-use hwp_model::{Control, Document, HwpUnit, PageDef, Paragraph, Table};
+use hwp_model::{BorderFill, Control, Document, HwpUnit, PageDef, Paragraph, Section, Table};
 
 use crate::display::{DisplayList, Item, PageList, PathCmd};
 use crate::fonts::FontStore;
@@ -87,6 +87,131 @@ fn default_page() -> PageDef {
     }
 }
 
+/// 쪽 테두리 정의(PAGE_BORDER_FILL 14바이트, gc23 실측으로 확정한 레이아웃).
+/// 속성 u32(위치기준 bit0·머리말 bit1·꼬리말 bit2·채울영역 bit3-4) + gap u16×4
+/// (왼/오/위/아래, HWPUNIT16) + 테두리ID u16(1-기반, BORDER_FILL 참조).
+struct PageBorderFill {
+    /// 위치기준 bit0: false=쪽(본문) 기준, true=종이 기준. 정품 실측 기본값=종이.
+    paper_relative: bool,
+    /// gap 왼/오/위/아래 (HWPUNIT — 정품 기본 1417 ≈ 5mm).
+    gap: [u16; 4],
+    /// BORDER_FILL 참조 id(1-기반). 1 = 전 변 무테두리 관례.
+    border_fill_id: u16,
+}
+
+/// PAGE_BORDER_FILL 14바이트 원문을 해석한다. 길이 부족이면 None.
+fn parse_page_border_fill(raw: &[u8]) -> Option<PageBorderFill> {
+    if raw.len() < 14 {
+        return None;
+    }
+    let attr = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let g = |o: usize| u16::from_le_bytes([raw[o], raw[o + 1]]);
+    Some(PageBorderFill {
+        paper_relative: attr & 1 != 0,
+        gap: [g(4), g(6), g(8), g(10)],
+        border_fill_id: g(12),
+    })
+}
+
+/// 구역의 PAGE_BORDER_FILL 중 BOTH를 찾는다.
+///
+/// 데이터 소스: `SectionDef.page_border_fills_raw`(과제 1)를 소비한다. 등장 순서가
+/// 곧 BOTH/EVEN/ODD이므로 BOTH = 첫 원소다. EVEN/ODD 분기는 범위 밖(정품 표본 부재).
+fn section_page_border_fill(section: &Section) -> Option<PageBorderFill> {
+    let sd = section.section_def()?;
+    let raw = sd.page_border_fills_raw.first()?;
+    parse_page_border_fill(raw)
+}
+
+/// 쪽 테두리 한 변(페이지 좌표, pt).
+struct PageBorderEdge {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    color: u32,
+    width: f32,
+}
+
+/// 쪽 테두리 사각형의 4변 중 그릴 변(line_type≠0)만 계산한다.
+/// 테두리ID 유효범위 밖(0 포함)이거나 참조 BorderFill이 전 변 무테두리면 빈 벡터.
+#[allow(clippy::too_many_arguments)]
+fn build_page_border_edges(
+    pbf: &PageBorderFill,
+    border_fills: &[BorderFill],
+    paper_w: f32,
+    paper_h: f32,
+    body_left: f32,
+    body_top: f32,
+    body_right: f32,
+    body_bottom: f32,
+) -> Vec<PageBorderEdge> {
+    // id는 1-기반. 0이거나 범위 밖이면 무출력(기본 문서 불변).
+    let Some(bf) = (pbf.border_fill_id as usize)
+        .checked_sub(1)
+        .and_then(|i| border_fills.get(i))
+    else {
+        return Vec::new();
+    };
+    // gap HWPUNIT → pt (/100). 순서: 왼/오/위/아래.
+    let (gl, gr, gt, gb) = (
+        pbf.gap[0] as f32 / 100.0,
+        pbf.gap[1] as f32 / 100.0,
+        pbf.gap[2] as f32 / 100.0,
+        pbf.gap[3] as f32 / 100.0,
+    );
+    let (x1, y1, x2, y2) = if pbf.paper_relative {
+        // 종이 기준: 용지 가장자리에서 gap만큼 안쪽 사각형(정품 실측 경로).
+        (gl, gt, paper_w - gr, paper_h - gb)
+    } else {
+        // 쪽(본문) 기준: 본문 영역 가장자리에서 gap만큼 바깥(여백 쪽). 정품 표본
+        // 부재 — 근사 구현(EVEN/ODD와 함께 후속 실측으로 정밀화).
+        (body_left - gl, body_top - gt, body_right + gr, body_bottom + gb)
+    };
+    // sides: [왼, 오른, 위, 아래]. 각 변을 해당 line_type≠0일 때만 긋는다.
+    let seg = [
+        (x1, y1, x1, y2), // 왼
+        (x2, y1, x2, y2), // 오른
+        (x1, y1, x2, y1), // 위
+        (x1, y2, x2, y2), // 아래
+    ];
+    let mut edges = Vec::new();
+    for (side, (sx1, sy1, sx2, sy2)) in bf.sides.iter().zip(seg) {
+        if side.is_visible() {
+            edges.push(PageBorderEdge {
+                x1: sx1,
+                y1: sy1,
+                x2: sx2,
+                y2: sy2,
+                color: side.color,
+                width: side.width_mm() * 72.0 / 25.4, // mm → pt
+            });
+        }
+    }
+    edges
+}
+
+/// 계산된 쪽 테두리 변들을 페이지 아이템 맨 앞에 삽입한다(텍스트/개체 뒤 = 뒤에 그림).
+/// 변 기하는 구역당 1회 계산하고, Item::Line은 페이지마다 새로 만든다(Item는 Clone 불가).
+fn prepend_page_borders(page: &mut PageList, edges: &[PageBorderEdge]) {
+    if edges.is_empty() {
+        return;
+    }
+    let mut items: Vec<Item> = edges
+        .iter()
+        .map(|e| Item::Line {
+            x1: e.x1,
+            y1: e.y1,
+            x2: e.x2,
+            y2: e.y2,
+            color: e.color,
+            width: e.width,
+        })
+        .collect();
+    items.append(&mut page.items);
+    page.items = items;
+}
+
 pub fn layout_document(
     doc: &Document,
     store: &mut FontStore,
@@ -95,6 +220,8 @@ pub fn layout_document(
     let mut pages = Vec::new();
 
     for section in &doc.sections {
+        // 이 구역의 첫 페이지 인덱스 — 구역 끝에서 쪽 테두리를 전 페이지에 소급 삽입한다.
+        let section_first_page = pages.len();
         let page_def = section
             .section_def()
             .and_then(|d| d.page)
@@ -117,6 +244,23 @@ pub fn layout_document(
             (paper_w_hu - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
         // 본문 영역 하한 (넘침 분할 기준)
         let body_bottom = h - (page_def.margin_bottom.0 + page_def.margin_footer.0) as f32 / 100.0;
+
+        // 쪽 테두리(PAGE_BORDER_FILL BOTH): 변 기하를 구역당 1회 계산해 두고,
+        // 구역의 모든 페이지에 소급 삽입한다(테두리ID 무테두리·미존재면 빈 벡터).
+        let page_border_edges = section_page_border_fill(section)
+            .map(|pbf| {
+                build_page_border_edges(
+                    &pbf,
+                    &doc.header.border_fills,
+                    w,
+                    h,
+                    body_left,
+                    body_top,
+                    body_left + body_width,
+                    body_bottom,
+                )
+            })
+            .unwrap_or_default();
 
         let mut page = PageList {
             width_pt: w,
@@ -524,6 +668,13 @@ pub fn layout_document(
         page_notes.clear();
         furniture.render(doc, store, &mut page, warnings);
         pages.push(page);
+
+        // 쪽 테두리를 이 구역의 모든 페이지 맨 앞(뒤에 그림)에 소급 삽입한다.
+        if !page_border_edges.is_empty() {
+            for p in &mut pages[section_first_page..] {
+                prepend_page_borders(p, &page_border_edges);
+            }
+        }
     }
 
     DisplayList { pages }

@@ -617,6 +617,9 @@ fn gc5_슬롯_없으면_기본상수_불변() {
         page: Some(page),
         extras: Vec::new(),
         secpr_raw_children: Vec::new(), // 슬롯 없음(hwp5 출신)
+        footnote_shape_raw: None,
+        endnote_shape_raw: None,
+        page_border_fills_raw: Vec::new(),
     }));
     let section = Section {
         paragraphs: vec![para],
@@ -639,6 +642,104 @@ fn gc5_슬롯_없으면_기본상수_불변() {
     assert!(out.contains(r##"<hp:pageBorderFill type="ODD""##), "상수 pageBorderFill ODD");
     // 페이지 정의는 반영된다.
     assert!(out.contains(r##"<hp:pagePr landscape="WIDELY" width="59528" height="84186""##), "pagePr 반영");
+}
+
+/// GI-XC(교차변환 손실 차단): hwp5 출신 구역의 FOOTNOTE_SHAPE/PAGE_BORDER_FILL raw가
+/// 있으면 hwpx writer가 상수 대신 실측 값을 재구성한다.
+///
+/// raw 바이트는 **정답지 실측**이다(11.19 제안요청서 hwp, gc23 조사 보고서 확정 레이아웃):
+/// PAGE_BORDER_FILL 3종이 순서로 BOTH(테두리ID=7 실선)/EVEN(1)/ODD(1)이고, FOOTNOTE_SHAPE
+/// 2개가 각주/미주다. BOTH의 borderFillIDRef가 실테두리(BF#7)를 승계하는지 단언한다.
+#[test]
+fn gixc_hwp5_raw_secpr_실측값_방출_정답지대조() {
+    use hwp_model::{Control, HwpChar, HwpUnit, PageDef, Paragraph, Section, SectionDef};
+    let page = PageDef {
+        width: HwpUnit(59528),
+        height: HwpUnit(84186),
+        margin_left: HwpUnit(8504),
+        margin_right: HwpUnit(8504),
+        margin_top: HwpUnit(5668),
+        margin_bottom: HwpUnit(4252),
+        margin_header: HwpUnit(4252),
+        margin_footer: HwpUnit(4252),
+        gutter: HwpUnit(0),
+        attr: 0,
+    };
+    // 정답지 실측 raw (dump BodyText/Section0 --raw).
+    let foot: Vec<u8> = vec![
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x00, 0x01, 0x00, 0xff, 0xff, 0xff,
+        0xff, 0x52, 0x03, 0x37, 0x02, 0x1b, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let end: Vec<u8> = vec![
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x00, 0x01, 0x00, 0xf8, 0x2f, 0xe0,
+        0x00, 0x52, 0x03, 0x37, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+    ];
+    // BOTH=테두리ID 7(실선), EVEN/ODD=1(무테두리). gap 0x0589=1417.
+    let pbf_both: Vec<u8> = vec![
+        0x01, 0x00, 0x00, 0x00, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x07, 0x00,
+    ];
+    let pbf_even: Vec<u8> = vec![
+        0x01, 0x00, 0x00, 0x00, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x01, 0x00,
+    ];
+    let pbf_odd = pbf_even.clone();
+
+    let mut para = Paragraph::default();
+    para.chars.push(HwpChar::ExtCtrl {
+        code: 2,
+        ctrl_id: *b"secd",
+        payload: vec![0u8; 12],
+        ctrl_index: Some(0),
+    });
+    para.controls.push(Control::SectionDef(SectionDef {
+        data: Vec::new(),
+        page: Some(page),
+        extras: Vec::new(),
+        secpr_raw_children: Vec::new(),
+        footnote_shape_raw: Some(foot),
+        endnote_shape_raw: Some(end),
+        page_border_fills_raw: vec![pbf_both, pbf_even, pbf_odd],
+    }));
+    let section = Section {
+        paragraphs: vec![para],
+        extras: Vec::new(),
+    };
+
+    let doc = hwp_model::Document::default();
+    let mut bins = hwpx::write::section::BinCollector::default();
+    let mut warns = Vec::new();
+    let out = hwpx::write::section::write_section(&doc, &section, false, &mut bins, &mut warns);
+
+    // 핵심: BOTH가 실테두리(BF#7)를 승계한다 — 상수 "1"로 대체되지 않았다.
+    assert!(
+        out.contains(
+            r##"<hp:pageBorderFill type="BOTH" borderFillIDRef="7" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill>"##
+        ),
+        "BOTH가 실테두리 id=7 승계: {out}"
+    );
+    assert!(
+        out.contains(r##"<hp:pageBorderFill type="EVEN" borderFillIDRef="1""##),
+        "EVEN=무테두리 id=1"
+    );
+    assert!(
+        out.contains(r##"<hp:pageBorderFill type="ODD" borderFillIDRef="1""##),
+        "ODD=무테두리 id=1"
+    );
+
+    // 각주/미주 실측값 재구성(구분선 길이가 각주 -1, 미주 14692344로 구분됨).
+    assert!(
+        out.contains(
+            r##"<hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="283" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="EACH_COLUMN" beneathText="0"/></hp:footNotePr>"##
+        ),
+        "footNotePr 실측 재구성: {out}"
+    );
+    assert!(
+        out.contains(r##"<hp:endNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="14692344" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="END_OF_DOCUMENT" beneathText="0"/></hp:endNotePr>"##),
+        "endNotePr 실측 재구성: {out}"
+    );
+    // secPr 유효성: 파싱 왕복이 성공하고 페이지 정의가 유지된다.
+    let (section2, w2) = hwpx::read::section::parse_section(&out).unwrap();
+    assert!(w2.is_empty(), "{w2:?}");
+    assert_eq!(section2.section_def().unwrap().page.unwrap().width.0, 59528);
 }
 
 /// 문단 끝에 gso 컨트롤(ExtCtrl 코드 11 + Generic)을 부착한다.

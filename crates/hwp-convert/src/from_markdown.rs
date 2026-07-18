@@ -995,6 +995,9 @@ fn inject_section_controls(para: &mut Paragraph) {
             page: Some(page),
             extras: Vec::new(),
             secpr_raw_children: Vec::new(),
+            footnote_shape_raw: None,
+            endnote_shape_raw: None,
+            page_border_fills_raw: Vec::new(),
         }),
     );
     para.controls.insert(

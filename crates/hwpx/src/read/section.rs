@@ -140,6 +140,9 @@ fn parse_paragraph(
                                 page: None,
                                 extras: Vec::new(),
                                 secpr_raw_children: Vec::new(),
+                                footnote_shape_raw: None,
+                                endnote_shape_raw: None,
+                                page_border_fills_raw: Vec::new(),
                             }
                         } else {
                             parse_sec_pr(reader)?
@@ -351,6 +354,9 @@ fn parse_sec_pr(reader: &mut XmlReader<'_>) -> Result<SectionDef> {
         page: None,
         extras: Vec::new(),
         secpr_raw_children: Vec::new(),
+        footnote_shape_raw: None,
+        endnote_shape_raw: None,
+        page_border_fills_raw: Vec::new(),
     };
     let mut page = PageDef {
         width: HwpUnit(0),

@@ -9,10 +9,10 @@ use std::fmt::Write as _;
 
 use hwp_model::{
     BinRef, Cell, Control, Document, GenericControl, HwpChar, PageDef, Paragraph, Picture, Section,
-    ShapeKind, Table,
+    SectionDef, ShapeKind, Table,
 };
 
-use crate::write::templates::esc;
+use crate::write::templates::{color_attr, esc};
 
 /// 동봉할 바이너리(이미지) 수집기.
 #[derive(Default)]
@@ -182,7 +182,7 @@ fn write_paragraph(
 
     if inject_secpr {
         open_run!(first_shape);
-        write_default_sec_pr(out, None, &[]);
+        write_default_sec_pr(out, None);
         write_col_ctrl(out, None);
     }
 
@@ -238,7 +238,7 @@ fn write_paragraph(
                     Control::SectionDef(def) => {
                         open_run!(cur_shape);
                         flush_text(out, &mut text_buf, &mut pending_tabs);
-                        write_default_sec_pr(out, def.page.as_ref(), &def.secpr_raw_children);
+                        write_default_sec_pr(out, Some(def));
                     }
                     Control::Generic(g) if g.ctrl_id == *b"cold" => {
                         open_run!(cur_shape);
@@ -590,38 +590,18 @@ fn write_page_pr(out: &mut String, p: &PageDef) {
     );
 }
 
-/// `<hp:secPr>`를 방출한다.
-///
-/// - `raw_children`가 있으면(hwpx 출신) 원문 자식을 등장 순서대로 그대로 방출하고,
-///   [`SECPR_PAGEPR_SLOT`] 자리에서만 페이지 정의로부터 pagePr을 재생성한다(pass-through).
-/// - 비어 있으면(hwp5 출신·구형 IR·secPr 주입) 기존 상수 템플릿을 방출한다 — 출력 바이트 불변.
-fn write_default_sec_pr(out: &mut String, page: Option<&PageDef>, raw_children: &[String]) {
-    let fallback = default_page();
-    let p = page.unwrap_or(&fallback);
-
-    if !raw_children.is_empty() {
-        // 원문 pass-through: 캡처된 자식을 순서대로 방출(pagePr만 페이지 정의로 재생성).
-        out.push_str(SEC_PR_OPEN);
-        for child in raw_children {
-            if child == hwp_model::SECPR_PAGEPR_SLOT {
-                write_page_pr(out, p);
-            } else {
-                out.push_str(child);
-            }
-        }
-        out.push_str("</hp:secPr>");
-        return;
-    }
-
-    // 상수 템플릿(원문 없음) — 기존 출력과 바이트 동일.
+/// `<hp:secPr>`의 머리(grid/startNum/visibility/lineNumberShape/pagePr)를 방출한다.
+/// 상수 템플릿 경로와 hwp5 raw 해석 경로가 공유한다(출력 바이트 동일 형식).
+fn write_sec_pr_head(out: &mut String, p: &PageDef) {
     let landscape = if p.attr & 1 != 0 {
         "NARROWLY"
     } else {
         "WIDELY"
     };
+    out.push_str(SEC_PR_OPEN);
     let _ = write!(
         out,
-        r##"<hp:secPr id="" textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" tabStopVal="4000" tabStopUnit="HWPUNIT" outlineShapeIDRef="1" memoShapeIDRef="0" textVerticalWidthHead="0" masterPageCnt="0"><hp:grid lineGrid="0" charGrid="0" wonggojiFormat="0"/><hp:startNum pageStartsOn="BOTH" page="0" pic="0" tbl="0" equation="0"/><hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="0" hideFirstEmptyLine="0" showLineNumber="0"/><hp:lineNumberShape restartType="0" countBy="0" distance="0" startNumber="0"/><hp:pagePr landscape="{landscape}" width="{}" height="{}" gutterType="LEFT_ONLY"><hp:margin header="{}" footer="{}" gutter="{}" left="{}" right="{}" top="{}" bottom="{}"/></hp:pagePr><hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="283" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="EACH_COLUMN" beneathText="0"/></hp:footNotePr><hp:endNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="14692344" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="END_OF_DOCUMENT" beneathText="0"/></hp:endNotePr><hp:pageBorderFill type="BOTH" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill><hp:pageBorderFill type="EVEN" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill><hp:pageBorderFill type="ODD" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill></hp:secPr>"##,
+        r##"<hp:grid lineGrid="0" charGrid="0" wonggojiFormat="0"/><hp:startNum pageStartsOn="BOTH" page="0" pic="0" tbl="0" equation="0"/><hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="0" hideFirstEmptyLine="0" showLineNumber="0"/><hp:lineNumberShape restartType="0" countBy="0" distance="0" startNumber="0"/><hp:pagePr landscape="{landscape}" width="{}" height="{}" gutterType="LEFT_ONLY"><hp:margin header="{}" footer="{}" gutter="{}" left="{}" right="{}" top="{}" bottom="{}"/></hp:pagePr>"##,
         p.width.0,
         p.height.0,
         p.margin_header.0,
@@ -632,6 +612,220 @@ fn write_default_sec_pr(out: &mut String, page: Option<&PageDef>, raw_children: 
         p.margin_top.0,
         p.margin_bottom.0,
     );
+}
+
+/// 상수 각주 모양(hello_world 표본 실측) — hwp5 raw가 없을 때의 안전값.
+const CONST_FOOT_NOTE_PR: &str = r##"<hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="283" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="EACH_COLUMN" beneathText="0"/></hp:footNotePr>"##;
+
+/// 상수 미주 모양(hello_world 표본 실측) — hwp5 raw가 없을 때의 안전값.
+const CONST_END_NOTE_PR: &str = r##"<hp:endNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="14692344" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="END_OF_DOCUMENT" beneathText="0"/></hp:endNotePr>"##;
+
+/// 상수 쪽 테두리/배경 3종(BOTH/EVEN/ODD) — hwp5 raw가 없을 때의 안전값.
+const CONST_PAGE_BORDER_FILL: [&str; 3] = [
+    r##"<hp:pageBorderFill type="BOTH" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill>"##,
+    r##"<hp:pageBorderFill type="EVEN" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill>"##,
+    r##"<hp:pageBorderFill type="ODD" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill>"##,
+];
+
+/// `<hp:secPr>`를 방출한다.
+///
+/// 출처별 단일 방출(이중 방출 금지):
+/// 1. `secpr_raw_children`가 있으면(hwpx 출신) 원문 자식을 등장 순서대로 pass-through하고
+///    [`SECPR_PAGEPR_SLOT`] 자리에서만 페이지 정의로 pagePr을 재생성한다(GC-5).
+/// 2. hwp5 raw 필드(FOOTNOTE_SHAPE·PAGE_BORDER_FILL)가 있으면(hwp5 출신) 상수 대신
+///    실측 footNotePr/endNotePr/pageBorderFill을 재구성해 방출한다 — 교차 변환 손실 차단.
+/// 3. 둘 다 없으면(합성·구형 IR·secPr 주입) 기존 상수 템플릿을 방출한다 — 출력 바이트 불변.
+fn write_default_sec_pr(out: &mut String, def: Option<&SectionDef>) {
+    let fallback = default_page();
+    let p = def.and_then(|d| d.page.as_ref()).unwrap_or(&fallback);
+
+    // 1) hwpx 출신 원문 pass-through.
+    if let Some(d) = def
+        && !d.secpr_raw_children.is_empty()
+    {
+        out.push_str(SEC_PR_OPEN);
+        for child in &d.secpr_raw_children {
+            if child == hwp_model::SECPR_PAGEPR_SLOT {
+                write_page_pr(out, p);
+            } else {
+                out.push_str(child);
+            }
+        }
+        out.push_str("</hp:secPr>");
+        return;
+    }
+
+    // 2) hwp5 출신 raw 해석.
+    if let Some(d) = def
+        && (d.footnote_shape_raw.is_some()
+            || d.endnote_shape_raw.is_some()
+            || !d.page_border_fills_raw.is_empty())
+    {
+        write_sec_pr_head(out, p);
+        write_note_pr(out, "hp:footNotePr", d.footnote_shape_raw.as_deref(), false);
+        write_note_pr(out, "hp:endNotePr", d.endnote_shape_raw.as_deref(), true);
+        write_page_border_fills(out, &d.page_border_fills_raw);
+        out.push_str("</hp:secPr>");
+        return;
+    }
+
+    // 3) 상수 템플릿 — 기존 출력과 바이트 동일.
+    write_sec_pr_head(out, p);
+    out.push_str(CONST_FOOT_NOTE_PR);
+    out.push_str(CONST_END_NOTE_PR);
+    for s in CONST_PAGE_BORDER_FILL {
+        out.push_str(s);
+    }
+    out.push_str("</hp:secPr>");
+}
+
+/// FOOTNOTE_SHAPE(28B) raw를 `<hp:footNotePr>`/`<hp:endNotePr>`로 재구성한다.
+/// 레이아웃(gc23 조사 보고서 확정, 정품 전수 실측): 속성 u32, WCHAR×3(사용자기호/앞/뒤장식),
+/// 시작번호 u16, 구분선 길이 HWPUNIT(i32), 여백 u16×3(위/아래/주석사이), 구분선 종류 u8,
+/// 굵기 u8, 색 COLORREF. raw가 없거나 손상되면 상수 기본값으로 대체(secPr 유효성 보장).
+fn write_note_pr(out: &mut String, tag: &str, raw: Option<&[u8]>, is_end: bool) {
+    let Some(r) = raw.filter(|b| b.len() >= 28) else {
+        out.push_str(if is_end {
+            CONST_END_NOTE_PR
+        } else {
+            CONST_FOOT_NOTE_PR
+        });
+        return;
+    };
+    let attr = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+    let user_char = u16::from_le_bytes([r[4], r[5]]);
+    let prefix_char = u16::from_le_bytes([r[6], r[7]]);
+    let suffix_char = u16::from_le_bytes([r[8], r[9]]);
+    let start_num = u16::from_le_bytes([r[10], r[11]]);
+    let line_len = i32::from_le_bytes([r[12], r[13], r[14], r[15]]);
+    let above = u16::from_le_bytes([r[16], r[17]]);
+    let below = u16::from_le_bytes([r[18], r[19]]);
+    let between = u16::from_le_bytes([r[20], r[21]]);
+    let line_type = r[22];
+    let line_width = r[23];
+    let color = u32::from_le_bytes([r[24], r[25], r[26], r[27]]);
+
+    let num_fmt = note_num_format(attr & 0xFF);
+    let supscript = (attr >> 12) & 1;
+    let numbering = match (attr >> 10) & 0x3 {
+        1 => "ON_SECTION",
+        2 => "ON_PAGE",
+        _ => "CONTINUOUS",
+    };
+    // 미주는 배치가 다단(bits8-9)이 아니라 문서 끝 관례 — 정품 실측 END_OF_DOCUMENT.
+    let place = if is_end {
+        "END_OF_DOCUMENT"
+    } else {
+        match (attr >> 8) & 0x3 {
+            1 => "MERGED_COLUMN",
+            2 => "RIGHT_MARGIN",
+            _ => "EACH_COLUMN",
+        }
+    };
+    let _ = write!(
+        out,
+        r##"<{tag}><hp:autoNumFormat type="{num_fmt}" userChar="{}" prefixChar="{}" suffixChar="{}" supscript="{supscript}"/><hp:noteLine length="{line_len}" type="{}" width="{}" color="{}"/><hp:noteSpacing betweenNotes="{between}" belowLine="{below}" aboveLine="{above}"/><hp:numbering type="{numbering}" newNum="{start_num}"/><hp:placement place="{place}" beneathText="0"/></{tag}>"##,
+        wchar_attr(user_char),
+        wchar_attr(prefix_char),
+        wchar_attr(suffix_char),
+        note_line_type(line_type),
+        note_line_width_mm(line_width),
+        note_line_color(color),
+    );
+}
+
+/// PAGE_BORDER_FILL(14B) raw 목록을 `<hp:pageBorderFill>` 3종(BOTH/EVEN/ODD)으로 방출한다.
+/// 레이아웃(gc23 확정): 속성 u32(bit0 위치기준=종이·bit1 머리말·bit2 꼬리말·bits3-4 채울영역)
+/// 다음에 gap u16×4(left/right/top/bottom), 끝에 테두리ID u16(1-기반). 순서가 곧 BOTH/EVEN/ODD.
+/// 테두리ID는 hwpx borderFillIDRef와 1:1 대응(표 셀 테두리 승계 규약과 동일 — GE-7 전례).
+/// raw가 없거나 3개 미만이면 부족분은 상수로 채워 3종을 항상 방출한다.
+fn write_page_border_fills(out: &mut String, raws: &[Vec<u8>]) {
+    const TYPES: [&str; 3] = ["BOTH", "EVEN", "ODD"];
+    for (i, ty) in TYPES.iter().enumerate() {
+        let Some(r) = raws.get(i).filter(|b| b.len() >= 14) else {
+            out.push_str(CONST_PAGE_BORDER_FILL[i]);
+            continue;
+        };
+        let attr = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+        let left = u16::from_le_bytes([r[4], r[5]]);
+        let right = u16::from_le_bytes([r[6], r[7]]);
+        let top = u16::from_le_bytes([r[8], r[9]]);
+        let bottom = u16::from_le_bytes([r[10], r[11]]);
+        let bf_id = u16::from_le_bytes([r[12], r[13]]).max(1);
+        let text_border = if attr & 1 != 0 { "PAPER" } else { "PAGE" };
+        let header_inside = (attr >> 1) & 1;
+        let footer_inside = (attr >> 2) & 1;
+        let fill_area = match (attr >> 3) & 0x3 {
+            1 => "PAGE",
+            2 => "BORDER",
+            _ => "PAPER",
+        };
+        let _ = write!(
+            out,
+            r##"<hp:pageBorderFill type="{ty}" borderFillIDRef="{bf_id}" textBorder="{text_border}" headerInside="{header_inside}" footerInside="{footer_inside}" fillArea="{fill_area}"><hp:offset left="{left}" right="{right}" top="{top}" bottom="{bottom}"/></hp:pageBorderFill>"##,
+        );
+    }
+}
+
+/// hwp5 번호 모양 코드 → hwpx autoNumFormat@type. 확신 가능한 흔한 값만 매핑하고
+/// 그 밖은 DIGIT으로 강등(한글 유효성 우선).
+fn note_num_format(fmt: u32) -> &'static str {
+    match fmt {
+        0 => "DIGIT",
+        1 => "CIRCLE_DIGIT",
+        2 => "ROMAN_CAPITAL",
+        3 => "ROMAN_SMALL",
+        4 => "LATIN_CAPITAL",
+        5 => "LATIN_SMALL",
+        _ => "DIGIT",
+    }
+}
+
+/// 구분선 종류 코드 → hwpx noteLine@type. 미상/0은 SOLID로 강등(구분선은 항상 그려짐).
+fn note_line_type(code: u8) -> &'static str {
+    match code {
+        2 => "DASH",
+        3 => "DOT",
+        4 => "DASH_DOT",
+        5 => "DASH_DOT_DOT",
+        6 => "LONG_DASH",
+        _ => "SOLID",
+    }
+}
+
+/// 구분선 굵기 인덱스 → "N mm" (한글 굵기 표 재사용). 정수는 "0.4 mm", 소수는 "0.12 mm".
+fn note_line_width_mm(code: u8) -> String {
+    let line = hwp_model::BorderLine {
+        line_type: 1,
+        width: code,
+        color: 0,
+    };
+    let mm = line.width_mm();
+    if (mm - mm.round()).abs() < f32::EPSILON {
+        format!("{} mm", mm.round() as i32)
+    } else {
+        format!("{mm} mm")
+    }
+}
+
+/// 구분선 색 COLORREF → "#rrggbb". 없음(0xFFFFFFFF)은 검정으로 대체(구분선은 색이 필요).
+fn note_line_color(c: u32) -> String {
+    if c == 0xFFFF_FFFF {
+        "#000000".to_string()
+    } else {
+        color_attr(c)
+    }
+}
+
+/// WCHAR(u16) → 속성값. 0(없음)은 빈 문자열, 그 외는 문자로 변환 후 XML 이스케이프.
+fn wchar_attr(wc: u16) -> String {
+    if wc == 0 {
+        return String::new();
+    }
+    match char::from_u32(u32::from(wc)) {
+        Some(c) => esc(&c.to_string()),
+        None => String::new(),
+    }
 }
 
 fn write_col_ctrl(out: &mut String, col: Option<&hwp_model::ColumnDef>) {
@@ -1184,7 +1378,9 @@ fn write_table(
     table: &Table,
     ids: &mut IdSeq,
     bins: &mut BinCollector,
-    preserve_linesegs: bool,
+    // 표 셀 줄 배치는 전역 옵션과 무관하게 항상 방출한다(아래 참조). 시그니처는
+    // 다른 write_* 와 대칭 유지를 위해 남긴다.
+    _preserve_linesegs: bool,
     warnings: &mut Vec<String>,
 ) {
     let cols = table.cols.max(1) as usize;
@@ -1205,9 +1401,45 @@ fn write_table(
     let total_h: i64 = row_h.iter().sum();
 
     let m = table.inner_margins;
+    // 표 개체 속성(attr, 표 75): bits0-1=쪽 경계에서 나눔(NONE=0/TABLE=1/CELL=2),
+    // bit2=제목 줄 자동 반복, bit3=자동 너비 조정 안 함. 원본(hwp5/hwpx 출신)의 값을
+    // 그대로 방출한다 — 하드코딩(CELL/1/0)은 원본이 "나누지 않음(0)"인 표까지 CELL로
+    // 강제해 충실도를 깬다. 합성 표(md/synth 출신 — common_data·placement 모두 비어
+    // attr=0)만 정품 기본값(CELL+제목반복)으로 폴백한다.
+    let synthesized = table.common_data.is_empty() && table.placement.is_none();
+    let (page_break, repeat_header, no_adjust) = if synthesized {
+        ("CELL", 1u32, 0u32)
+    } else {
+        let pb = match table.attr & 0b11 {
+            1 => "TABLE",
+            2 => "CELL",
+            _ => "NONE",
+        };
+        (pb, (table.attr >> 2) & 1, (table.attr >> 3) & 1)
+    };
+    // 배치 승계(GsoPlacement): hwp5/hwpx 출신은 원본 개체 공통 속성이 담겨 있다.
+    // treatAsChar=0(부유) 표만 페이지에 걸쳐 분할되고, treatAsChar=1(글자처럼)은
+    // "한 글자"로 배치돼 분할 불가라 하단을 관통한다(정답지 직대조 확정 — GE-8 진범).
+    // sz도 원본 개체 폭/높이를 유지한다(행높이 합산 재계산은 페이지 걸침 표에서 과다).
+    // 합성 표(md/synth — placement=None)만 인라인 기본값·재계산으로 폴백한다.
+    let pl = table.placement.as_ref();
+    let sz_w = pl.map(|p| p.width).filter(|&w| w > 0).map_or(total_w, i64::from);
+    let sz_h = pl
+        .map(|p| p.height)
+        .filter(|&h| h > 0)
+        .map_or(total_h, i64::from);
+    let treat_as_char = pl.map_or(1, |p| u32::from(p.treat_as_char));
+    let affect_lspacing = pl.map_or(0, |p| u32::from(p.affect_line_spacing));
+    let flow_with_text = pl.map_or(1, |p| u32::from(p.flow_with_text));
+    let vert_rel = pl.map_or("PARA", |p| vert_rel_to_name(p.vert_rel_to));
+    let horz_rel = pl.map_or("PARA", |p| horz_rel_to_name(p.horz_rel_to));
+    let vert_align = pl.map_or("TOP", |p| vert_align_name(p.vert_align));
+    let horz_align = pl.map_or("LEFT", |p| horz_align_name(p.horz_align));
+    let vert_offset = pl.map_or(0, |p| p.vert_offset);
+    let horz_offset = pl.map_or(0, |p| p.horz_offset);
     let _ = write!(
         out,
-        r##"<hp:tbl id="{}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="1" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="0"><hp:sz width="{total_w}" widthRelTo="ABSOLUTE" height="{total_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/><hp:outMargin left="283" right="283" top="283" bottom="283"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
+        r##"<hp:tbl id="{}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="{page_break}" repeatHeader="{repeat_header}" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="{no_adjust}"><hp:sz width="{sz_w}" widthRelTo="ABSOLUTE" height="{sz_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="{treat_as_char}" affectLSpacing="{affect_lspacing}" flowWithText="{flow_with_text}" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="{vert_rel}" horzRelTo="{horz_rel}" vertAlign="{vert_align}" horzAlign="{horz_align}" vertOffset="{vert_offset}" horzOffset="{horz_offset}"/><hp:outMargin left="283" right="283" top="283" bottom="283"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
         ids.next(),
         table.rows,
         table.cols,
@@ -1233,16 +1465,14 @@ fn write_table(
                 cell.border_fill.0.max(1),
             );
             for para in &cell.paragraphs {
-                write_paragraph(
-                    out,
-                    doc,
-                    para,
-                    ids,
-                    bins,
-                    false,
-                    preserve_linesegs,
-                    warnings,
-                );
+                // 표 셀 문단은 항상 linesegarray를 방출한다(정품 실측 — 한글 자신의
+                // hwp→hwpx 변환·정품 hwpx 모두 표 셀에 줄 배치를 100% 담는다). 쪽에
+                // 걸치는 긴 표를 한글이 셀 안에서 나누려면 각 줄의 세로 위치(vertpos)가
+                // 필요하다. 이게 없으면 셀이 통째로 원자 취급돼 페이지 하단을 넘쳐
+                // 잘린다(GE-8 실기 결함). write_paragraph 내부 가드가 line_segs가 있을
+                // 때만 방출하므로, 편집으로 줄 배치를 지운 문단(edit.rs가 clear)·md
+                // 출신(줄 배치 없음)은 자동으로 비게 돼 "변조" 경고 위험이 없다.
+                write_paragraph(out, doc, para, ids, bins, false, true, warnings);
             }
             let cm = cell.margins;
             let _ = write!(

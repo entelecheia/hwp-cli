@@ -878,6 +878,236 @@ def i1_md_image_code(dest):
     return out, "md 이미지(인라인 Picture+bin 무손실)+인라인 코드(함초롬돋움 face run)"
 
 
+# ── J 시리즈: 쪽 테두리 교차변환 + 렌더(GC-2·GC-3) ───────────────────────────
+# 정답지(11.19 제안요청서 hwp)를 우리 hwpx로 변환한 실기본. 세 층위로 검증한다:
+#   ① validate 통과, ② 교차변환이 실테두리를 승계했는가(pageBorderFill BOTH의
+#      borderFillIDRef가 '빈 테두리'(id1)가 아니라 실선 BORDER_FILL을 가리키는가),
+#   ③ 우리 렌더가 이 문서의 쪽 테두리를 실제로 그리는가(원본 hwp5 PNG의 종이
+#      가장자리 4변에 연속 잉크선이 있는가 — 픽셀 검사).
+# 주의: 렌더 잉크 검사는 **원본 hwp5**를 대상으로 한다. 쪽 테두리 렌더는 hwp5
+# 읽기 경로(page_border_fills_raw, 정품 실측 확정)로만 구동되고, hwpx 읽기는
+# 이 필드를 채우지 않기(pass-through=secpr_raw_children) 때문이다. 산출물(hwpx)은
+# ①②로 구조 검증하고, 렌더 정합은 같은 문서의 hwp5 원본으로 확인한다.
+# 이 파일은 정답지 유래이므로 산출물만 dest(~/Downloads/hwp-실기검증)에 두고,
+# 원본·중간 PNG는 저장소·fixtures에 남기지 않는다(PNG는 WORK에만 쓴다).
+
+
+class Skip(Exception):
+    """정답지 코퍼스 입력이 없을 때 케이스를 건너뛴다(⏭)."""
+
+
+def find_page_border_src():
+    """11.19 제안요청서 hwp(쪽 테두리 실테두리 표본)를 코퍼스에서 찾는다."""
+    root = os.path.expanduser("~/Documents/hwp_samples")
+    if not os.path.isdir(root):
+        return None
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            if (fn.endswith(".hwp") and fn.startswith("제안요청서")
+                    and "11.19" in fn):
+                return os.path.join(dirpath, fn)
+    return None
+
+
+def _repo_font_dir():
+    """HWP 바이너리 경로에서 저장소 fonts/ 디렉터리를 유도(없으면 None)."""
+    # HWP = <repo>/target/{debug,release}/hwp → repo = dirname×3.
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(HWP))))
+    fd = os.path.join(repo, "fonts")
+    return fd if os.path.isdir(fd) else None
+
+
+def _paeth(a, b, c):
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    return a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+
+
+def decode_png_rgba(path):
+    """8bit RGBA(color type 6) PNG를 (w, h, bytearray)로 디코드(stdlib만)."""
+    d = open(path, "rb").read()
+    if d[:8] != b"\x89PNG\r\n\x1a\n":
+        raise Fail("PNG 시그니처 불일치")
+    w = h = None
+    idat = bytearray()
+    o = 8
+    while o < len(d):
+        ln = struct.unpack(">I", d[o:o + 4])[0]
+        typ = d[o + 4:o + 8]
+        chunk = d[o + 8:o + 8 + ln]
+        if typ == b"IHDR":
+            w, h, bd, ct = struct.unpack(">IIBB", chunk[:10])
+            if bd != 8 or ct != 6:
+                raise Fail(f"PNG 형식 미지원(bd={bd} ct={ct})")
+        elif typ == b"IDAT":
+            idat += chunk
+        elif typ == b"IEND":
+            break
+        o += 12 + ln
+    raw = zlib.decompress(bytes(idat))
+    stride = w * 4
+    out = bytearray(w * h * 4)
+    pos = 0
+    for y in range(h):
+        ft = raw[pos]
+        pos += 1
+        base = y * stride
+        for x in range(stride):
+            v = raw[pos + x]
+            a = out[base + x - 4] if x >= 4 else 0
+            b = out[base - stride + x] if y > 0 else 0
+            c = out[base - stride + x - 4] if (y > 0 and x >= 4) else 0
+            if ft == 0:
+                r = v
+            elif ft == 1:
+                r = (v + a) & 255
+            elif ft == 2:
+                r = (v + b) & 255
+            elif ft == 3:
+                r = (v + ((a + b) >> 1)) & 255
+            else:
+                r = (v + _paeth(a, b, c)) & 255
+            out[base + x] = r
+        pos += stride
+    return w, h, out
+
+
+def _is_dark(px, i):
+    """흰 배경 알파합성 후 luma<128이면 잉크(어두움)."""
+    r, g, b, a = px[i], px[i + 1], px[i + 2], px[i + 3]
+    luma = (r * 0.299 + g * 0.587 + b * 0.114) * a / 255 + 255 * (1 - a / 255)
+    return luma < 128
+
+
+def page_edge_ink(path, band=40, thresh=0.5):
+    """4변(위/아래/왼/오)에서 가장자리 band픽셀 안에 '연속 잉크선'이 있는지.
+    각 변에서 폭(높이)의 thresh 비율 이상이 어두운 행(열)이 하나라도 있으면 True.
+    글자 획은 변의 극히 일부만 덮으므로 통과하지 못하고, 테두리 선만 잡힌다."""
+    w, h, px = decode_png_rgba(path)
+
+    def row_frac(y):
+        return sum(_is_dark(px, (y * w + x) * 4) for x in range(w)) / w
+
+    def col_frac(x):
+        return sum(_is_dark(px, (y * w + x) * 4) for y in range(h)) / h
+
+    top = max(row_frac(y) for y in range(0, band))
+    bot = max(row_frac(y) for y in range(h - band, h))
+    left = max(col_frac(x) for x in range(0, band))
+    right = max(col_frac(x) for x in range(w - band, w))
+    return {
+        "위": top >= thresh, "아래": bot >= thresh,
+        "왼": left >= thresh, "오": right >= thresh,
+    }, (top, bot, left, right)
+
+
+def _border_side_types(hx, bf_id):
+    """header.xml에서 borderFill id의 4변(left/right/top/bottom) type 목록."""
+    m = re.search(rf'<hh:borderFill id="{bf_id}".*?</hh:borderFill>', hx, re.S)
+    if not m:
+        return None
+    block = m.group(0)
+    types = []
+    for side in ("leftBorder", "rightBorder", "topBorder", "bottomBorder"):
+        sm = re.search(rf'<hh:{side} type="([^"]+)"', block)
+        types.append(sm.group(1) if sm else "NONE")
+    return types
+
+
+def j1_page_border(dest):
+    out = os.path.join(dest, "J1_쪽테두리.hwpx")
+    src = find_page_border_src()
+    if not src:
+        raise Skip("정답지 11.19 제안요청서 hwp 없음(코퍼스 미보유)")
+
+    # ① 교차변환 + validate.
+    p = subprocess.run([HWP, "convert", src, "-o", out],
+                       capture_output=True, text=True)
+    if not os.path.exists(out) or os.path.getsize(out) == 0:
+        raise Fail("convert 실패: " + p.stderr.strip()[-160:])
+    ok, _ = validate_ok(out)
+    if not ok:
+        raise Fail("validate 실패")
+
+    # ② 실테두리 승계: section0.xml의 pageBorderFill(BOTH/EVEN/ODD) borderFillIDRef가
+    #    header.xml에서 실제 BORDER_FILL로 해소되고, BOTH는 실선(NONE 아님)·EVEN/ODD는
+    #    빈 테두리(전 변 NONE)여야 한다 — 홀짝 빈 테두리 vs 본문 실선 구분 승계 확인.
+    with zipfile.ZipFile(out) as z:
+        sx = z.read("Contents/section0.xml").decode("utf-8")
+        hx = z.read("Contents/header.xml").decode("utf-8")
+    refs = dict(re.findall(
+        r'<hp:pageBorderFill type="(BOTH|EVEN|ODD)" borderFillIDRef="(\d+)"', sx))
+    for t in ("BOTH", "EVEN", "ODD"):
+        if t not in refs:
+            raise Fail(f"pageBorderFill {t} 소실")
+    both_types = _border_side_types(hx, refs["BOTH"])
+    if both_types is None:
+        raise Fail(f"BOTH borderFillIDRef={refs['BOTH']} dangling(BORDER_FILL 미정의)")
+    solid = [t for t in both_types if t != "NONE"]
+    if not solid:
+        raise Fail(f"BOTH 테두리 실선 없음(전 변 NONE): id={refs['BOTH']}")
+    even_types = _border_side_types(hx, refs["EVEN"])
+    if even_types is None:
+        raise Fail(f"EVEN borderFillIDRef={refs['EVEN']} dangling")
+    if any(t != "NONE" for t in even_types):
+        raise Fail(f"EVEN이 빈 테두리가 아님(승계 구분 실패): {even_types}")
+
+    # ③ 렌더 잉크 검사: 원본 hwp5를 렌더해 종이 4변에 연속 테두리선이 있는지.
+    png = os.path.join(WORK, "j1_border.png")
+    rargs = [HWP, "render", src, "-o", png, "--pages", "1", "--dpi", "96"]
+    fd = _repo_font_dir()
+    if fd:
+        rargs += ["--font-dir", fd]
+    rp = subprocess.run(rargs, capture_output=True, text=True)
+    if not os.path.exists(png) or os.path.getsize(png) == 0:
+        raise Fail("render 실패: " + rp.stderr.strip()[-160:])
+    edges, fracs = page_edge_ink(png)
+    missing = [k for k, v in edges.items() if not v]
+    if missing:
+        raise Fail(f"쪽 테두리 잉크 없는 변: {missing} (변별 어두움비율 위/아래/왼/오="
+                   + "/".join(f"{f:.2f}" for f in fracs) + ")")
+
+    # ④ 페이지 걸침 표 분할 충실도(GE-8): 4쪽 "세부 과업내용"(26행 3열, "해커톤")·
+    #    6쪽 "주차/교육내용/비고"(6행 3열, "주차")가, 사용자가 한글에서 저장한
+    #    정답지(표분할정답지.hwpx) 실측값과 일치해야 한다:
+    #    (a) treatAsChar="0"(부유) — 글자처럼("1")이면 표가 "한 글자"로 배치돼 페이지
+    #        분할이 불가하고 하단을 관통한다(정답지 직대조로 확정된 GE-8 진범).
+    #    (b) hp:sz width×height = 원본 개체 공통 속성 높이(행높이 합산 재계산 금지).
+    #    (c) pageBreak="CELL" 유지, (d) 각 셀에 줄 배치(linesegarray) 존재.
+    #    상수는 정답지 파일 실측(코퍼스 유래이므로 파일 비동봉 — 값만 단언).
+    def _find_tbl(rows, cols, kw):
+        for m in re.finditer(r'<hp:tbl .*?</hp:tbl>', sx, re.S):
+            b = m.group(0)
+            if (re.search(rf'\browCnt="{rows}"', b)
+                    and re.search(rf'\bcolCnt="{cols}"', b) and kw in b):
+                return b
+        return None
+    for label, rows, kw, w_exp, h_exp in (
+            ("세부 과업내용(4쪽)", 26, "해커톤", 47339, 54801),
+            ("주차/교육내용/비고(6쪽)", 6, "주차", 47622, 17021)):
+        blk = _find_tbl(rows, 3, kw)
+        if blk is None:
+            raise Fail(f"페이지 걸침 표 미발견: {label} ({rows}행 3열 '{kw}')")
+        pb = re.search(r'pageBreak="([^"]*)"', blk).group(1)
+        if pb != "CELL":
+            raise Fail(f"{label} pageBreak={pb}(정답지 CELL 기대)")
+        pos = re.search(r'<hp:pos [^>]*/>', blk).group(0)
+        tc = re.search(r'treatAsChar="(\d)"', pos).group(1)
+        if tc != "0":
+            raise Fail(f"{label} treatAsChar={tc}(정답지 0=부유 기대 — 1이면 페이지 분할 불가)")
+        szm = re.search(r'<hp:sz width="(\d+)"[^>]*?height="(\d+)"', blk)
+        w, h = int(szm.group(1)), int(szm.group(2))
+        if (w, h) != (w_exp, h_exp):
+            raise Fail(f"{label} sz={w}×{h}(정답지 {w_exp}×{h_exp} 기대 — 원본 개체 높이 승계)")
+        if "<hp:linesegarray>" not in blk:
+            raise Fail(f"{label} 표 셀 줄 배치(linesegarray) 없음 — 한글이 셀 분할 불가")
+
+    return out, (f"교차변환 실테두리 승계(BOTH id={refs['BOTH']} 실선 {len(solid)}변 / "
+                 f"EVEN·ODD id={refs['EVEN']} 빈테두리) + 렌더 종이 4변 연속 잉크선"
+                 f"(위/아래/왼/오={'/'.join(f'{f:.2f}' for f in fracs)}) + "
+                 f"페이지 걸침 표 2개 정답지 정합(treatAsChar=0·sz·CELL·줄배치, GE-8)")
+
+
 CASES = [
     ("C1_그림자.hwpx", c1_shadow),
     ("C2_외곽선.hwpx", c2_outline),
@@ -894,6 +1124,7 @@ CASES = [
     ("H1_md왕복.hwpx", h1_md_hwpx),
     ("H2_md왕복.hwp", h2_md_hwp),
     ("I1_md이미지코드.hwpx", i1_md_image_code),
+    ("J1_쪽테두리.hwpx", j1_page_border),
 ]
 
 
@@ -913,6 +1144,8 @@ def main():
         try:
             _, detail = fn(a.dest)
             print(f"✅ {label} — {detail}")
+        except Skip as s:  # 코퍼스 입력 부재: 실패가 아니라 건너뜀(⏭)
+            print(f"⏭  {label} — {s}")
         except Exception as e:  # noqa: BLE001 (검증 게이트: 어떤 실패든 ❌ 처리)
             fails += 1
             print(f"❌ {label} — {e}")

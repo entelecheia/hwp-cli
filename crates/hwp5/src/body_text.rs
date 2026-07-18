@@ -346,6 +346,9 @@ fn parse_section_def(
         extras: Vec::new(),
         // hwp5 출신 구역은 hwpx 원문 자식이 없다(writer가 기존 상수 템플릿 방출).
         secpr_raw_children: Vec::new(),
+        footnote_shape_raw: None,
+        endnote_shape_raw: None,
+        page_border_fills_raw: Vec::new(),
     };
     for child in children {
         if child.tag == tag::PAGE_DEF {
@@ -357,6 +360,18 @@ fn parse_section_def(
                 }
             }
         } else {
+            // FOOTNOTE_SHAPE·PAGE_BORDER_FILL은 extras에 그대로 보존하면서(identity
+            // 정본) 교차 변환용으로 raw 필드에 **병행** 사본을 둔다. 정품 실측 순서상
+            // 첫 FOOTNOTE_SHAPE가 각주, 둘째가 미주다.
+            if child.tag == tag::FOOTNOTE_SHAPE {
+                if def.footnote_shape_raw.is_none() {
+                    def.footnote_shape_raw = Some(child.data.clone());
+                } else if def.endnote_shape_raw.is_none() {
+                    def.endnote_shape_raw = Some(child.data.clone());
+                }
+            } else if child.tag == tag::PAGE_BORDER_FILL {
+                def.page_border_fills_raw.push(child.data.clone());
+            }
             def.extras.push(to_opaque(child));
         }
     }
@@ -432,7 +447,46 @@ fn parse_table(common_data: Vec<u8>, children: &[RecordNode], warnings: &mut Vec
     if let Some(done) = current_cell.take() {
         table.cells.push(done);
     }
+    // 개체 공통 속성(표 69)을 배치(GsoPlacement)로 승계한다 — hwpx write가
+    // treatAsChar·sz·pos를 이 값에서 방출하도록. 하드코딩 treatAsChar=1(글자처럼)은
+    // 원본이 부유(0)인 긴 표까지 "한 글자"로 배치해 페이지 분할을 막고 하단을 관통시킨다
+    // (정답지 직대조 확정 — GE-8). hwp5→hwp5 재직렬화는 common_data 원문을 그대로 쓰므로
+    // 무손실 왕복(identity)에는 영향이 없다.
+    table.placement = parse_gso_common_placement(&table.common_data);
     table
+}
+
+/// 개체 공통 속성(표 69, ctrl_id 제외 페이로드)을 배치로 파싱한다.
+/// 레이아웃: 속성 u32(표 70), 세로/가로 오프셋 i32, 폭/높이 i32, z-order i32,
+/// 바깥 여백 u16×4. 24바이트 미만이면 None(합성·손상 — writer가 기본값 폴백).
+fn parse_gso_common_placement(common: &[u8]) -> Option<hwp_model::GsoPlacement> {
+    if common.len() < 24 {
+        return None;
+    }
+    let mut r = ByteReader::new(common);
+    let attr = r.read_u32().ok()?;
+    let vert_offset = r.read_i32().ok()?;
+    let horz_offset = r.read_i32().ok()?;
+    let width = r.read_i32().ok()?;
+    let height = r.read_i32().ok()?;
+    let z_order = r.read_i32().ok()?;
+    let out_margins = r.read_u16_array::<4>().unwrap_or([0; 4]);
+    Some(hwp_model::GsoPlacement {
+        treat_as_char: attr & 1 != 0,
+        affect_line_spacing: (attr >> 2) & 1 != 0,
+        flow_with_text: (attr >> 13) & 1 != 0,
+        hold_anchor: false,
+        vert_rel_to: ((attr >> 3) & 0x3) as u8,
+        horz_rel_to: ((attr >> 8) & 0x3) as u8,
+        vert_align: ((attr >> 5) & 0x7) as u8,
+        horz_align: ((attr >> 10) & 0x7) as u8,
+        vert_offset,
+        horz_offset,
+        z_order,
+        width,
+        height,
+        out_margins,
+    })
 }
 
 fn parse_table_record(data: &[u8], table: &mut Table) -> Result<()> {
