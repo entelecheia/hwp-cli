@@ -759,3 +759,106 @@ fn convert_md_media_dir_figs() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 최소 유효 PNG(시그니처+IHDR)를 만든다 — image_pixel_size가 치수를 읽고
+/// writer가 바이트를 그대로 임베드한다(디코딩은 하지 않음).
+fn write_min_png(path: &std::path::Path, w: u32, h: u32) {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend([0, 0, 0, 13]);
+    png.extend(b"IHDR");
+    png.extend(w.to_be_bytes());
+    png.extend(h.to_be_bytes());
+    png.extend([8, 6, 0, 0, 0]); // bit depth/color type 등
+    png.extend([0, 0, 0, 0]); // CRC 자리(검증 안 함)
+    std::fs::write(path, &png).unwrap();
+}
+
+/// ★도장 날인(GM-7): edit --seal 로 앵커 "(인)" 위에 부유 그림을 얹고, hwpx 저장·
+/// 재읽기에서 Picture가 살아있으며 validate가 통과한다. hwp5 저장 경로도 왕복 스모크.
+#[test]
+fn edit_seal_floating_image_roundtrip() {
+    let md = tmp("hwp_cli_seal.md");
+    std::fs::write(&md, "결재 (인) 란\n").unwrap();
+    let src = tmp("hwp_cli_seal_src.hwpx");
+    assert!(
+        hwp()
+            .args(["new", "--from"])
+            .arg(&md)
+            .arg("-o")
+            .arg(&src)
+            .status()
+            .unwrap()
+            .success(),
+        "hwp new"
+    );
+    let png = tmp("hwp_cli_seal.png");
+    write_min_png(&png, 100, 50);
+
+    // hwpx 경로: 앵커 위에 도장 부유 배치(18mm).
+    let out_hwpx = tmp("hwp_cli_seal_out.hwpx");
+    let seal_arg = format!("(인)=>{}@18mm", png.display());
+    let ed = hwp()
+        .arg("edit")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out_hwpx)
+        .args(["--seal", &seal_arg])
+        .output()
+        .expect("hwp edit --seal");
+    assert!(
+        ed.status.success(),
+        "edit --seal 성공 (stderr: {})",
+        String::from_utf8_lossy(&ed.stderr)
+    );
+
+    // validate 통과(구조 유효).
+    assert!(
+        hwp().arg("validate").arg(&out_hwpx).status().unwrap().success(),
+        "도장 삽입 hwpx는 validate 통과"
+    );
+
+    // 재읽기 IR(JSON)에 Picture 컨트롤이 존재.
+    let cj = hwp()
+        .arg("cat")
+        .args(["--format", "json"])
+        .arg(&out_hwpx)
+        .output()
+        .expect("cat json");
+    assert!(cj.status.success(), "cat json 성공");
+    let j = String::from_utf8_lossy(&cj.stdout);
+    assert!(j.contains("Picture"), "재읽기 IR에 Picture 존재: {j:.200}");
+
+    // 앵커 텍스트는 유지되어야 한다.
+    let ct = hwp().arg("cat").arg(&out_hwpx).output().expect("cat");
+    assert!(
+        String::from_utf8_lossy(&ct.stdout).contains("(인)"),
+        "앵커 텍스트 유지"
+    );
+
+    // hwp5 저장 경로 왕복 스모크(합성 규격 준수 — 재읽기가 성공).
+    let out_hwp = tmp("hwp_cli_seal_out.hwp");
+    let seal_arg2 = format!("(인)=>{}", png.display()); // 기본 20mm
+    let ed5 = hwp()
+        .arg("edit")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out_hwp)
+        .args(["--seal", &seal_arg2])
+        .output()
+        .expect("hwp edit --seal hwp");
+    assert!(
+        ed5.status.success(),
+        "hwp5 저장 성공 (stderr: {})",
+        String::from_utf8_lossy(&ed5.stderr)
+    );
+    let ct5 = hwp().arg("cat").arg(&out_hwp).output().expect("cat hwp");
+    assert!(ct5.status.success(), "hwp5 재읽기 성공");
+    assert!(
+        String::from_utf8_lossy(&ct5.stdout).contains("(인)"),
+        "hwp5 왕복 후 앵커 유지"
+    );
+
+    for f in [&md, &src, &png, &out_hwpx, &out_hwp] {
+        let _ = std::fs::remove_file(f);
+    }
+}

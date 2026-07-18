@@ -13,11 +13,11 @@
 use hwp_model::opaque::OpaqueRecord;
 use hwp_model::{
     Cell, CharShapeId, ColumnDef, Control, Equation, GenericControl, GradientSpec, HwpChar,
-    HwpUnit, LineSeg, PageDef, ParaShapeId, Paragraph, ParagraphList, Section, SectionDef,
-    ShapeGeom, ShapeKind, StyleId, Table,
+    HwpUnit, LineSeg, PageDef, ParaShapeId, Paragraph, ParagraphList, SECPR_PAGEPR_SLOT, Section,
+    SectionDef, ShapeGeom, ShapeKind, StyleId, Table,
 };
-use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, Writer};
 
 use crate::error::{HwpxError, Result};
 use crate::read::xml::{attr, attr_i32, attr_offset_i32, attr_u16, attr_u32, parse_color};
@@ -139,6 +139,7 @@ fn parse_paragraph(
                                 data: Vec::new(),
                                 page: None,
                                 extras: Vec::new(),
+                                secpr_raw_children: Vec::new(),
                             }
                         } else {
                             parse_sec_pr(reader)?
@@ -239,6 +240,29 @@ fn parse_paragraph(
     Ok(para)
 }
 
+/// `<hp:t>` 텍스트 문자 하나를 IR로 적재한다.
+///
+/// raw 탭(0x09)은 과거 오염 파일(탭이 Text로 잘못 저장된 hwpx) 하위호환을 위해
+/// `InlineCtrl(9)`로 정규화한다(§3.2.3 표 6: 탭 = 8 WCHAR 인라인 컨트롤 — IR 불변식).
+/// 그 외 C0 제어문자는 제거한다(문서 손상 방지; 강제 줄바꿈은 `<hp:lineBreak/>` 요소로
+/// 별도 도착한다). 일반 문자는 `Text`로 적재한다.
+fn push_text_char(para: &mut Paragraph, wchar_pos: &mut u32, c: char) {
+    match c {
+        '\t' => {
+            para.chars.push(HwpChar::InlineCtrl {
+                code: 9,
+                payload: vec![0; 12],
+            });
+            *wchar_pos += 8;
+        }
+        c if (c as u32) < 0x20 => {}
+        c => {
+            *wchar_pos += c.len_utf16() as u32;
+            para.chars.push(HwpChar::Text(c));
+        }
+    }
+}
+
 /// `<hp:t>` 내부의 텍스트를 수집한다 (중첩 마크업은 무시).
 fn parse_text(
     reader: &mut XmlReader<'_>,
@@ -254,8 +278,7 @@ fn parse_text(
                     message: e.to_string(),
                 })?;
                 for c in s.chars() {
-                    *wchar_pos += c.len_utf16() as u32;
-                    para.chars.push(HwpChar::Text(c));
+                    push_text_char(para, wchar_pos, c);
                 }
             }
             // 엔티티 참조(&amp; &#x...;)는 별도 이벤트로 온다
@@ -273,14 +296,24 @@ fn parse_text(
                         _ => None,
                     });
                 if let Some(c) = resolved {
-                    *wchar_pos += c.len_utf16() as u32;
-                    para.chars.push(HwpChar::Text(c));
+                    push_text_char(para, wchar_pos, c);
                 }
             }
             // <hp:t> 안의 강제 줄바꿈(정품 한글 구조: `앞<hp:lineBreak/>뒤`).
             Event::Empty(e) | Event::Start(e) if e.local_name().as_ref() == b"lineBreak" => {
                 *wchar_pos += 1;
                 para.chars.push(HwpChar::CharCtrl(10));
+            }
+            // <hp:t> 안의 중첩 탭(정품 mixed content: `앞<hp:tab width leader type/>뒤`)
+            // → InlineCtrl(9). 속성값은 한글이 재계산·재유도하므로 보존하지 않고 payload는
+            // 0으로 둔다(왕복 시 writer가 문단 탭 정의에서 종류/채움을 다시 뽑는다). 구형
+            // bare 탭(hp:run 직속 <hp:tab/>)은 parse_paragraph의 b"tab" arm이 처리(하위호환).
+            Event::Empty(e) | Event::Start(e) if e.local_name().as_ref() == b"tab" => {
+                para.chars.push(HwpChar::InlineCtrl {
+                    code: 9,
+                    payload: vec![0; 12],
+                });
+                *wchar_pos += 8;
             }
             Event::End(e) if e.local_name().as_ref() == b"t" => break,
             Event::Eof => break,
@@ -308,12 +341,16 @@ fn push_ext_ctrl(para: &mut Paragraph, wchar_pos: &mut u32, code: u16, ctrl_id: 
     *wchar_pos += 8;
 }
 
-/// `<hp:secPr>` — pagePr/margin만 의미 파싱.
+/// `<hp:secPr>` — pagePr/margin은 의미 파싱하고, 그 외 자식(grid/startNum/visibility/
+/// lineNumberShape/footNotePr/endNotePr/pageBorderFill 등)은 **원문 XML을 등장 순서대로**
+/// 보존한다(저비용 pass-through). pagePr 자리는 [`SECPR_PAGEPR_SLOT`] 마커로 표시해
+/// writer가 페이지 정의에서 재생성한 pagePr을 같은 위치에 방출하게 한다.
 fn parse_sec_pr(reader: &mut XmlReader<'_>) -> Result<SectionDef> {
     let mut def = SectionDef {
         data: Vec::new(),
         page: None,
         extras: Vec::new(),
+        secpr_raw_children: Vec::new(),
     };
     let mut page = PageDef {
         width: HwpUnit(0),
@@ -330,28 +367,33 @@ fn parse_sec_pr(reader: &mut XmlReader<'_>) -> Result<SectionDef> {
     let mut has_page = false;
 
     loop {
-        match next_event(reader)? {
-            Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
-                b"pagePr" => {
-                    has_page = true;
-                    page.width = HwpUnit(attr_i32(&e, "width").unwrap_or(0));
-                    page.height = HwpUnit(attr_i32(&e, "height").unwrap_or(0));
-                    // OWPML landscape="NARROWLY"(세로)/"WIDELY"(가로) — 가로면 bit0
-                    if attr(&e, "landscape").as_deref() == Some("NARROWLY") {
-                        page.attr |= 1;
+        let event = next_event(reader)?;
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                let empty = matches!(event, Event::Empty(_));
+                match e.local_name().as_ref() {
+                    b"pagePr" => {
+                        // pagePr은 의미 파싱(페이지 정의). 자식 margin은 pagePr 서브트리
+                        // 안에서 읽고, 순서 표시용 마커를 원문 목록에 남긴다.
+                        has_page = true;
+                        page.width = HwpUnit(attr_i32(e, "width").unwrap_or(0));
+                        page.height = HwpUnit(attr_i32(e, "height").unwrap_or(0));
+                        // OWPML landscape="NARROWLY"(세로)/"WIDELY"(가로) — 가로면 bit0
+                        if attr(e, "landscape").as_deref() == Some("NARROWLY") {
+                            page.attr |= 1;
+                        }
+                        if !empty {
+                            parse_page_pr_children(reader, &mut page)?;
+                        }
+                        def.secpr_raw_children.push(SECPR_PAGEPR_SLOT.to_string());
+                    }
+                    // 그 외 자식은 서브트리 원문을 그대로 캡처(의미 미해석 — 무손실 왕복).
+                    _ => {
+                        def.secpr_raw_children
+                            .push(capture_element(reader, e, empty)?);
                     }
                 }
-                b"margin" if has_page => {
-                    page.margin_left = HwpUnit(attr_i32(&e, "left").unwrap_or(0));
-                    page.margin_right = HwpUnit(attr_i32(&e, "right").unwrap_or(0));
-                    page.margin_top = HwpUnit(attr_i32(&e, "top").unwrap_or(0));
-                    page.margin_bottom = HwpUnit(attr_i32(&e, "bottom").unwrap_or(0));
-                    page.margin_header = HwpUnit(attr_i32(&e, "header").unwrap_or(0));
-                    page.margin_footer = HwpUnit(attr_i32(&e, "footer").unwrap_or(0));
-                    page.gutter = HwpUnit(attr_i32(&e, "gutter").unwrap_or(0));
-                }
-                _ => {}
-            },
+            }
             Event::End(e) if e.local_name().as_ref() == b"secPr" => break,
             Event::Eof => break,
             _ => {}
@@ -361,6 +403,61 @@ fn parse_sec_pr(reader: &mut XmlReader<'_>) -> Result<SectionDef> {
         def.page = Some(page);
     }
     Ok(def)
+}
+
+/// `<hp:pagePr>` 내부의 `<hp:margin>`을 읽어 페이지 여백을 채운다(pagePr 닫힐 때까지).
+fn parse_page_pr_children(reader: &mut XmlReader<'_>, page: &mut PageDef) -> Result<()> {
+    loop {
+        match next_event(reader)? {
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"margin" => {
+                page.margin_left = HwpUnit(attr_i32(&e, "left").unwrap_or(0));
+                page.margin_right = HwpUnit(attr_i32(&e, "right").unwrap_or(0));
+                page.margin_top = HwpUnit(attr_i32(&e, "top").unwrap_or(0));
+                page.margin_bottom = HwpUnit(attr_i32(&e, "bottom").unwrap_or(0));
+                page.margin_header = HwpUnit(attr_i32(&e, "header").unwrap_or(0));
+                page.margin_footer = HwpUnit(attr_i32(&e, "footer").unwrap_or(0));
+                page.gutter = HwpUnit(attr_i32(&e, "gutter").unwrap_or(0));
+            }
+            Event::End(e) if e.local_name().as_ref() == b"pagePr" => break,
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// 시작(또는 빈) 요소 하나의 서브트리를 quick-xml 이벤트 재직렬화로 원문 XML 문자열로
+/// 캡처한다. Empty면 단일 요소, Start면 짝 닫는 태그까지 포함한다(중첩 임의 깊이).
+fn capture_element(reader: &mut XmlReader<'_>, start: &BytesStart<'_>, empty: bool) -> Result<String> {
+    let mut writer = Writer::new(Vec::new());
+    let to_xml_err = |e: std::io::Error| HwpxError::Xml {
+        entry: "secPr".to_string(),
+        message: e.to_string(),
+    };
+    if empty {
+        writer
+            .write_event(Event::Empty(start.borrow()))
+            .map_err(to_xml_err)?;
+    } else {
+        writer
+            .write_event(Event::Start(start.borrow()))
+            .map_err(to_xml_err)?;
+        let mut depth = 1u32;
+        loop {
+            let ev = next_event(reader)?;
+            match &ev {
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth -= 1,
+                Event::Eof => break,
+                _ => {}
+            }
+            writer.write_event(ev).map_err(to_xml_err)?;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&writer.into_inner()).into_owned())
 }
 
 /// `<hp:ctrl>` — colPr/머리말/꼬리말/각주 등 컨트롤 묶음.
@@ -1371,6 +1468,41 @@ mod page_ctrl_tests {
         assert!(g.radial);
         assert_eq!(g.stops.len(), 3);
         assert!((g.stops[1].0 - 0.5).abs() < 0.001);
+    }
+
+    /// 과거 오염 파일 하위호환: `<hp:t>` 안 raw 0x09를 InlineCtrl(9)로 정규화하고
+    /// 그 외 C0 제어문자는 제거한다(Text('\t')로 되읽으면 재저장 시 다시 깨진다).
+    #[test]
+    fn 오염_raw탭_읽기_인라인컨트롤_정규화() {
+        let xml = concat!(
+            r##"<?xml version="1.0"?><hs:sec><hp:p paraPrIDRef="0" styleIDRef="0">"##,
+            "<hp:run charPrIDRef=\"0\"><hp:t xml:space=\"preserve\">앞\t뒤\u{0001}끝</hp:t></hp:run>",
+            r##"</hp:p></hs:sec>"##,
+        );
+        let (section, _) = parse_section(xml).unwrap();
+        let chars = &section.paragraphs[0].chars;
+        // raw 탭 → InlineCtrl(9), 제어문자 0x01 제거, 나머지 텍스트 보존.
+        assert!(
+            chars
+                .iter()
+                .any(|c| matches!(c, HwpChar::InlineCtrl { code: 9, .. })),
+            "raw 탭이 InlineCtrl(9)로 정규화돼야: {chars:?}"
+        );
+        assert!(
+            !chars.iter().any(|c| matches!(c, HwpChar::Text('\t'))),
+            "Text('\\t')로 남으면 안 됨"
+        );
+        assert!(
+            !chars
+                .iter()
+                .any(|c| matches!(c, HwpChar::Text(x) if (*x as u32) < 0x20)),
+            "C0 제어문자가 Text로 남으면 안 됨"
+        );
+        assert_eq!(
+            section.paragraphs[0].wchar_len(),
+            1 + 8 + 1 + 1,
+            "앞(1)+탭(8)+뒤(1)+끝(1) WCHAR"
+        );
     }
 
     /// 색이 1개 이하면 그러데이션 없음(None).

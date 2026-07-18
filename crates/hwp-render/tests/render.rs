@@ -455,3 +455,95 @@ fn 그러데이션_채움_백엔드() {
         right.blue()
     );
 }
+
+/// GC-8 내어쓰기(음수 first-line indent): 첫 줄이 나머지 줄보다 왼쪽에 놓여야 한다.
+/// 폴백(캐시 없는) 문단 경로를 탄다 — 합성 문서(line_segs 없음)라 layout이 그리디
+/// 줄바꿈한다. 픽셀 골든이 아니라 DisplayList의 글리프 x를 줄별로 비교한다.
+#[test]
+fn 내어쓰기_첫줄이_왼쪽() {
+    use hwp_render::display::Item;
+    // 여러 줄로 넘치도록 충분히 긴 한 문단.
+    let mut doc = hwp_convert::from_markdown(&"가".repeat(400));
+    // 이 문단의 문단모양에 좌여백(60pt) + 내어쓰기(-40pt) 설정. IR 여백류는 2×HWPUNIT.
+    let psid = doc.sections[0].paragraphs[0].para_shape.0 as usize;
+    doc.header.para_shapes[psid].margin_left = 12000; // /200 = 60pt
+    doc.header.para_shapes[psid].indent = -8000; // /200 = -40pt (내어쓰기)
+
+    let mut store = hwp_render::FontStore::new();
+    let mut warns = Vec::new();
+    let list = hwp_render::layout::layout_document(&doc, &mut store, &mut warns);
+
+    // (y=베이스라인, x) 글리프 목록.
+    let glyphs: Vec<(f32, f32)> = list.pages[0]
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Glyphs { x, y, .. } => Some((*y, *x)),
+            _ => None,
+        })
+        .collect();
+    assert!(glyphs.len() >= 2, "여러 줄로 줄바꿈돼야: {}", glyphs.len());
+
+    let min_y = glyphs.iter().map(|(y, _)| *y).fold(f32::INFINITY, f32::min);
+    // 첫 줄(min_y)의 최소 x.
+    let first_x = glyphs
+        .iter()
+        .filter(|(y, _)| (*y - min_y).abs() < 0.5)
+        .map(|(_, x)| *x)
+        .fold(f32::INFINITY, f32::min);
+    // 더 아래 줄(둘째 줄 이후)의 최소 x.
+    let rest_x = glyphs
+        .iter()
+        .filter(|(y, _)| *y > min_y + 0.5)
+        .map(|(_, x)| *x)
+        .fold(f32::INFINITY, f32::min);
+    assert!(rest_x.is_finite(), "둘째 줄이 있어야 한다(줄바꿈 발생)");
+    assert!(
+        first_x < rest_x - 1.0,
+        "내어쓰기: 첫 줄 x({first_x:.1})이 나머지 줄 x({rest_x:.1})보다 왼쪽이어야"
+    );
+}
+
+/// GC-9 페이지 걸친 문단 배경: 배경 border_fill을 가진 긴 문단이 페이지를 넘기면
+/// 각 페이지에 배경 조각(Rect)이 그려져야 한다(통째 생략 금지). 합성 line_segs로
+/// 멀티페이지를 만들고, 두 페이지 모두에 그 채움색 Rect가 있는지 DisplayList로 확인한다.
+#[test]
+fn 페이지_걸친_문단배경_조각() {
+    use hwp_model::BorderFill;
+    use hwp_render::display::{Item, PageList};
+
+    // 여러 페이지를 넘길 만큼 아주 긴 한 문단.
+    let mut doc = hwp_convert::from_markdown(&"가".repeat(4000));
+
+    // 가시 배경 border_fill 추가 → 첫 문단 문단모양이 참조(id는 1-based).
+    let fill_color = 0x00FF_EEDDu32;
+    doc.header.border_fills.push(BorderFill {
+        bg_color: Some(fill_color),
+        fill_type: 1,
+        ..BorderFill::default()
+    });
+    let bf_id = doc.header.border_fills.len() as u16;
+    let psid = doc.sections[0].paragraphs[0].para_shape.0 as usize;
+    doc.header.para_shapes[psid].border_fill_id = bf_id;
+
+    let mut store = hwp_render::FontStore::new();
+    let mut warns = Vec::new();
+    hwp_render::lineseg::synthesize_linesegs(&mut doc, &mut store, &mut warns);
+    let list = hwp_render::layout::layout_document(&doc, &mut store, &mut warns);
+
+    assert!(
+        list.pages.len() >= 2,
+        "문단이 페이지를 걸쳐야 한다: {}쪽",
+        list.pages.len()
+    );
+    let has_bg = |p: &PageList| {
+        p.items
+            .iter()
+            .any(|it| matches!(it, Item::Rect { fill, .. } if *fill == fill_color))
+    };
+    assert!(has_bg(&list.pages[0]), "1쪽에 배경 조각(Rect)이 있어야 한다");
+    assert!(
+        has_bg(&list.pages[1]),
+        "2쪽에도 배경 조각(Rect)이 있어야 한다 — 페이지 걸친 배경 통째 생략 금지"
+    );
+}

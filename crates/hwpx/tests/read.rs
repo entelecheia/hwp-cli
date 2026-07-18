@@ -162,6 +162,42 @@ fn 합성_섹션_표와_컨트롤문자() {
     assert_eq!(table.row_cell_counts, vec![1, 2]);
 }
 
+/// 정품 형식: `<hp:t>` **안**에 중첩된 `<hp:tab width leader type/>`(mixed content)를
+/// InlineCtrl(9)로 읽고, 앞/뒤 텍스트와의 WCHAR 순서가 보존돼야 한다. 정품 한글이 목차
+/// 문단을 이 형식(`<hp:t>. 개요<hp:tab width leader type/> 1</hp:t>`)으로 저장한다.
+#[test]
+fn 정품_중첩탭_hp_t안_인라인컨트롤9() {
+    let xml = r##"<?xml version="1.0"?>
+<hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0"><hp:t>. 개요<hp:tab width="33718" leader="3" type="2"/> 1</hp:t></hp:run>
+  </hp:p>
+</hs:sec>"##;
+    let (section, warnings) = hwpx::read::section::parse_section(xml).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let para = &section.paragraphs[0];
+    // 텍스트 순서 보존(탭은 평문에서 '\t').
+    assert_eq!(para.plain_text().trim_end(), ". 개요\t 1");
+    // 탭이 정확히 1개, InlineCtrl(9)로 복원.
+    let tabs = para
+        .chars
+        .iter()
+        .filter(|c| matches!(c, HwpChar::InlineCtrl { code: 9, .. }))
+        .count();
+    assert_eq!(tabs, 1, "중첩 탭이 InlineCtrl(9) 1개로 읽혀야: {:?}", para.chars);
+    // 탭 앞에 텍스트 문자(Text), 뒤에도 텍스트가 오는 순서.
+    let tab_at = para
+        .chars
+        .iter()
+        .position(|c| matches!(c, HwpChar::InlineCtrl { code: 9, .. }))
+        .unwrap();
+    assert!(
+        matches!(para.chars[tab_at - 1], HwpChar::Text('요')),
+        "탭 직전은 '요': {:?}",
+        para.chars
+    );
+}
+
 /// 표 개체 공통 속성(<hp:pos>/<hp:sz>/<hp:outMargin>/zOrder)이 GsoPlacement로 보존되는지.
 /// 글자처럼 취급(treatAsChar)을 잃으면 인라인 표가 떠 있는 개체가 돼 본문 흐름에서
 /// 빠지고 한글이 재배치(겹침/빈 페이지)한다 — 정품 한라대 실측 기반 회귀 방지.

@@ -154,6 +154,9 @@ enum Cmd {
         /// 이미지 삽입 "앵커=>경로" 또는 "앵커=>경로@너비x높이"(mm) — 앵커 뒤에 그림 삽입 (반복 가능)
         #[arg(long = "insert-image")]
         insert_image: Vec<String>,
+        /// 도장 날인 "앵커=>경로" 또는 "앵커=>경로@크기mm" — 앵커 문구 위에 도장 부유 배치 (반복 가능)
+        #[arg(long = "seal")]
+        seal: Vec<String>,
         /// 글자 서식 "찾기:속성=값,…" (예: "제목:bold=on,size=16,color=#FF0000")
         #[arg(long = "set-format")]
         set_format: Vec<String>,
@@ -363,6 +366,7 @@ fn main() -> anyhow::Result<()> {
             create_bookmark,
             create_hyperlink,
             insert_image,
+            seal,
             set_format,
             set_align,
             insert_para,
@@ -382,6 +386,7 @@ fn main() -> anyhow::Result<()> {
             &create_bookmark,
             &create_hyperlink,
             &insert_image,
+            &seal,
             &set_format,
             &set_align,
             &insert_para,

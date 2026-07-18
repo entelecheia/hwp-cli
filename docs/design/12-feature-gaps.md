@@ -77,6 +77,18 @@
   전체 테스트 247 통과. **★실기 게이트 통과(2026-07-15)**: 1차 실기에서 C1~C5·C7(글자효과)
   정상, C6·C8·C9 결함 발견 → 2차 수정 후 재검에서 **C6 번호 표시·C8 날짜·C9 주제/날짜 모두
   정상 확인**. 이 단락의 해소 항목 전체가 실기 확정됐다.
+- **2026-07-15 (3차 — 저비용 배치)**: **GC-4**(탭 정의 — IR TabDef 신설, hwp5 §4.2.7 의미
+  파싱+raw 병행, hwpx tabPr 왕복; 렌더 반영은 잔존), **GC-5**(secPr 미해석 자식 원문
+  pass-through), **GC-8·GC-9**(내어쓰기 음수 렌더, 페이지 걸친 문단 배경 분할),
+  **GE-β5**(settings.xml·version.xml 원문 pass-through; hp:switch 잔존), **GM-7**(`edit --seal`
+  도장 날인 — 부유·글 앞 배치) 구현. 전체 테스트 260 통과, clippy 0.
+  ~~⚠ GM-7(D1/D2 도장)·GC-4(D3 사용자 탭)는 실기 확인 대기~~ → **전부 실기 확정(2026-07-18)**.
+- **2026-07-18 (4차 — Phase 2 스펙 감사)**: 사용자 재구성 스펙 md 기반 전면 감사(15건 확정,
+  적대 검증 반증 4건) → 수정: **C15**(탭 raw 0x09 — A11 먹통 원인, 탭=InlineCtrl(9) 불변식 3중
+  방어), **탭 in-t 방출**(A12 — bare 탭 폭0 무시, 정품 91개 역산으로 type/leader 대응표 확정),
+  **C9**(표 공통속성 44B→46B), **C10**(쪽나눔 자리 holdAnchor 오기록 제거). 나머지 11건은
+  주석·설계문서·스펙md 오류로 정정(TODO.md §1.4). 실기 4라운드 끝에 **D1·D2·D3 전부 통과** —
+  도장 날인·사용자 탭 실기 확정. 전체 테스트 268 통과.
 
 ---
 
@@ -148,12 +160,12 @@ XML 파트**(`Chart/chartN.xml` + manifest 등재 + `hp:chart chartIDRef`)여서
 | GC-1 | **세로쓰기 미지원** — 방향이 항상 가로로 고정 방출 | hwpx `write/header.rs:335`(`textDir="LTR"` 상수), `write/section.rs:460`(`textDirection="HORIZONTAL"` 상수) | OWPML `secPr@textDirection`, `paraPr@textDir` | 근사(가로 고정) | 합성·렌더 | M |
 | GC-2 | **쪽 테두리/배경 미반영** — hwp5는 Opaque, hwpx read는 skip, write는 상수 방출 | hwp5 `body_text.rs:357`(secd 자식 Opaque), hwpx `read/section.rs:353`(`_ => {}` skip), `write/section.rs:460`(`pageBorderFill` 상수) | §4.3.10.1.3 `PAGE_BORDER_FILL` / `hp:pageBorderFill` | hwp5=Opaque 보존 / hwpx=드롭+상수 | 왕복(hwpx만)·합성·렌더 | M |
 | GC-3 | **각주/미주 모양 미반영**(번호형식·구분선·간격) — 각주 참조는 렌더하나 모양은 상수 | hwp5 `body_text.rs:357`(secd 자식 Opaque), hwpx `read/section.rs:353`(skip), `write/section.rs:460`(`footNotePr`·`endNotePr` 상수) | §4.3.10.1.2 `FOOTNOTE_SHAPE` / `hp:footNotePr`·`endNotePr` | hwp5=Opaque 보존 / hwpx=드롭+상수 | 왕복(hwpx만)·합성·렌더 | M |
-| GC-4 | **탭 정의 손실**(사용자 탭 위치·채움문자) — hwp5 raw보존, hwpx는 빈 상수 방출 | hwp5 `doc_info.rs:112`(`TAB_DEF` raw), hwpx `read/header.rs`(tabPrIDRef만)·`write/header.rs:263`(`write_tab_properties` 빈 `tabPr`) | §4.2.7 `TAB_DEF` / `hh:tabPr` | hwp5=raw보존 / hwpx=드롭+상수 | 왕복(hwpx만)·렌더 | S |
-| GC-5 | **구역 속성 skip**(grid/startNum/visibility/lineNumberShape) — read가 흔적 없이 버림 | hwpx `read/section.rs:353`(`parse_sec_pr` 미매칭 skip), `write/section.rs:460`(상수 재합성) | OWPML `secPr` 자식 | skip → 상수 | 왕복(hwpx만)·합성 | S |
+| GC-4 | **탭 정의 손실**(사용자 탭 위치·채움문자) | IR `TabDef/TabItem` 신설, hwp5 `parse_tab_def`(§4.2.7, raw 병행 보존·identity 불변), hwpx `tabPr/tabItem` 왕복 — ★1차 실기에서 naked tabItem이 **한글 먹통** 유발 → 정품 `hp:switch` 구조로 교정([07](07-hangul-compat-rules.md) **A11**) | §4.2.7 `TAB_DEF` / `hh:tabPr` | ✅ **해소·실기 확정(2026-07-18, 4차)** — 실기 결함 2건을 이분탐색·정답지 대조로 해소: raw 0x09 먹통([07](07-hangul-compat-rules.md) **A11**)과 bare 탭 폭0 무시(**A12** in-t 방출·속성 유도). 렌더 반영은 잔존 | 왕복(hwpx만)·렌더 | S |
+| GC-5 | **구역 속성 skip**(grid/startNum/visibility/lineNumberShape) | hwpx `parse_sec_pr`가 미해석 자식 **원문 XML pass-through**(`secpr_raw_children`+pagePr 센티넬), write는 원문 재방출(없으면 기존 상수) | OWPML `secPr` 자식 | ✅ **해소(2026-07-15 3차)** — 의미 파싱이 아닌 원문 보존 | 왕복(hwpx만)·합성 | S |
 | GC-6 | **글상자 다단 미지원** — 연결/다단 글상자를 단일 단으로 근사 렌더 | `hwp-render/src/layout.rs:864`(`v1 단일 단 — hwp5 arm의 다단은 미지원`), `:788` | §4.3.10.2 단 정의 | 근사(단일 단) | 렌더 | S |
 | GC-7 | **홀/짝수 조정 미해석** — 별도 의미 파싱 없이 Generic 통과 | hwpx `read/section.rs:597`(미지 ctrl → 코드 21 Generic), [10](10-hwp5-structure-map.md) §6.1 각주 | §4.3.10.8 | Generic 보존(미해석) | 합성·렌더 | S |
-| GC-8 | **내어쓰기(음수 들여쓰기) 렌더 무시** — 음수 first-indent를 0으로 클램프 | `hwp-render/src/layout.rs:1493`(`음수=내어쓰기 v1 무시`), `:1578`(`.max(0.0)`) | §4.2.10 문단모양 들여쓰기 | 근사(0 클램프) | 렌더 | S |
-| GC-9 | **문단 배경이 페이지를 걸치면 생략** — `broke`면 배경 Rect 미삽입 | `hwp-render/src/layout.rs:1502`(주석), `:1516`(`if broke { return; }`) | §4.2.5 테두리/배경 | 근사(생략) | 렌더 | S |
+| GC-8 | **내어쓰기(음수 들여쓰기) 렌더 무시** | `hwp-render/src/layout.rs` 본문·셀 양 경로에서 음수 허용(경계 클램프만), 테스트 `내어쓰기_첫줄이_왼쪽` | §4.2.10 문단모양 들여쓰기 | ✅ **해소(2026-07-15 3차)** | 렌더 | S |
+| GC-9 | **문단 배경이 페이지를 걸치면 생략** | 배경을 페이지별 조각 Rect로 분할, 테스트 `페이지_걸친_문단배경_조각` | §4.2.5 테두리/배경 | ✅ **해소(2026-07-15 3차)** | 렌더 | S |
 
 **GC 교훈:** GC-2·GC-3(쪽 테두리·각주 모양)은 **공문서에 빈출**하므로 가치가 높다. 셋 다 hwp5는
 이미 무손실 보존(Opaque)이라 **정보는 갖고 있고**, 막힌 지점은 "그 페이로드를 의미로 해석해
@@ -231,7 +243,7 @@ stale 갭이 아니다 — 갭은 아래 항목들이다.
 | GE-β2 | **Scripts(매크로)** — 원본 JScript를 버리고 한글 빈 문서 표본 상수로 대체 | hwp5 `write.rs:213-221`(표본 바이트 상수), hwpx `patch.rs:4` | 드롭→상수 | 되쓰기 | S |
 | GE-β3 | **DocOptions 부속 스트림** — `_LinkDoc`은 524B 0 상수, DRM·서명 6스트림은 미방출 | `write.rs:208-210`, [10](10-hwp5-structure-map.md) §1 | 드롭/상수 | 되쓰기 | M |
 | GE-β4 | **요약정보 필드 소실** — 작성/수정일시·마지막저장자·설명 | `summary.rs`·`write.rs`·`hwp-model/src/document.rs`·hwpx `templates.rs` | ✅ **해소(2026-07-15)** — Metadata에 description/last_saved_by/create_time/modify_time(raw FILETIME u64) 추가, read/write 왕복. 인쇄일시·통계는 잔존(기본값 방출) | 되쓰기 | S |
-| GE-β5 | **hwpx settings.xml·version.xml·`hp:switch`** — 앱 설정·캐럿·버전 메타·2016 호환 블록을 상수로 대체/소실 | `templates.rs:10-22`(상수), `write/mod.rs:81,114`, `patch.rs:3-4` | 드롭→상수 | 되쓰기 | S |
+| GE-β5 | **hwpx settings.xml·version.xml** 상수 대체 | `Document.hwpx_settings_xml/hwpx_version_xml` 원문 pass-through(없으면 기존 상수), JSON 왕복 포함 | ✅ **해소(2026-07-15 3차)** — `hp:switch`(section 내부)는 잔존 | 되쓰기 | S |
 | GE-β6 | **임베디드 폰트** — `isEmbedded="0"` 하드코딩, 폰트 BinData·hwp5 typeInfo 소실 | hwpx `write/header.rs:84,98,105`, `read/header.rs:132-135`, hwp5 `doc_info.rs:201`(`type_info: None`) | 드롭(플래그·바이너리) | 되쓰기·렌더 | M |
 
 **GE 교훈:** GE-1(도형 저하)은 07§F1과 같은 뿌리(gso 무손실 재합성 미확보)라 L이다. 반면
@@ -388,7 +400,7 @@ validate·mcp·dump) 기준 부재 목록. 수요 근거는 [08](08-external-res
 | GM-4 | **문서 분할/페이지 추출 없음** — render `--pages`는 이미지용 | pyhwpx 쿡북(100쪽→1쪽씩 분할 저장) | M |
 | GM-5 | **텍스트 검색(grep) 명령 없음** — edit `--replace`만 존재 | — | S |
 | GM-6 | **메타데이터 일괄 편집/덤프 없음** — `--set-meta`는 new/edit 국소 | — | S |
-| GM-7 | **도장/서명 자동 날인 없음** — "(인)" 앵커에 도장 이미지 배치 | kordoc seal 구현 선례(공공 실무 빈출). insert-image 프리미티브는 기존재 | S |
+| GM-7 | **도장/서명 자동 날인** — `edit --seal "앵커=>이미지@크기mm"` 구현(부유·글 앞 Picture, 앵커 텍스트 유지, 기본 20mm) | `hwp-convert/src/image.rs insert_seal` | ✅ **실기 확정(2026-07-16, D1·D2 통과)** — 실기 3회 반복으로 확정: hwpx=`IN_FRONT_OF_TEXT`+`allowOverlap=1`+오프셋, hwp5=attr `0x04aa4310`(글앞·PARA·본문제한 해제, §4.3.9.1 비트 표 대조) |
 | GM-8 | **문서 내용 비교 없음** — `diff`는 렌더 픽셀 비교 전용, 텍스트/구조 비교 없음 | kordoc compare_documents 선례 | M |
 
 ## 14. 로드맵 — 난이도 × 가치 + 의존 그래프
@@ -422,12 +434,10 @@ validate·mcp·dump) 기준 부재 목록. 수요 근거는 [08](08-external-res
    │                              (단, 스펙-실파일 불일치 사례가 있어 실파일 코퍼스 검증은 별도)
    │
 [독립·즉시 착수] ──▶ GE-α6     (그러데이션 중심·step — α1~α5·α7·α8은 ✅해소 2026-07-15)
-                    GC-8/GC-9  (hwp-render/layout.rs 국소, 렌더 전용)
                     GE-2       (write.rs 국소, 그림 드롭 경고→복구)
                     GA-3/GA-4  (거부 메시지 — GA-5 버전 게이트는 ✅해소)
-                    GE-β5      (settings/version pass-through — β4는 ✅해소)
-                    GM-7       (도장 날인 — insert_image 프리미티브 재사용)
-                    (✅해소: GH-1/GH-2, GL-1)
+                    GC-4 렌더  (탭 위치·채움을 hwp-render/tab.rs에 반영 — 왕복은 ✅해소)
+                    (✅해소: GH-1/GH-2, GL-1, GC-4/5/8/9, GE-β5 · GM-7 구현=실기 대기)
    │
 [수요 최상] ──▶ GJ-1(DOCX 출력) ──품질 선행──▶ GH-1/GH-2/GH-4 (링크·이미지·병합셀 정리가
                                                DOCX 매핑의 기초 데이터가 됨)

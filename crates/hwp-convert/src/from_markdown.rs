@@ -259,6 +259,8 @@ pub fn from_markdown(md: &str) -> Document {
             extras: Vec::new(),
         }],
         bin_streams: Vec::new(),
+        hwpx_settings_xml: None,
+        hwpx_version_xml: None,
     }
 }
 
@@ -313,8 +315,26 @@ impl Builder {
             self.runs.push((self.wchar_pos, shape));
         }
         for c in text.chars() {
-            self.wchar_pos += c.len_utf16() as u32;
-            self.chars.push(HwpChar::Text(c));
+            match c {
+                // 탭: HWP는 코드 9를 8 WCHAR 인라인 컨트롤로 저장한다(§3.2.3 표 6).
+                // Text('\t')(1 WCHAR)로 적재하면 hwp5 PARA_TEXT/hwpx <hp:t>가 모두
+                // 깨지므로 IR 불변식대로 InlineCtrl로 분리 적재한다.
+                '\t' => {
+                    self.wchar_pos += 8;
+                    self.chars.push(HwpChar::InlineCtrl {
+                        code: hwp_model::ctrl_char::TAB,
+                        payload: vec![0; 12],
+                    });
+                }
+                // 그 외 C0 제어문자(0x00~0x1F)는 문서를 깨뜨릴 수 있어 드롭한다. markdown의
+                // 줄바꿈은 SoftBreak/HardBreak 이벤트로 따로 처리되므로 여기 Text에는
+                // 정상 텍스트만 남는다(코드블록의 개행도 push_code_text가 CharCtrl로 분리).
+                c if (c as u32) < 0x20 => {}
+                c => {
+                    self.wchar_pos += c.len_utf16() as u32;
+                    self.chars.push(HwpChar::Text(c));
+                }
+            }
         }
     }
 
@@ -577,6 +597,7 @@ fn inject_section_controls(para: &mut Paragraph) {
             data: Vec::new(),
             page: Some(page),
             extras: Vec::new(),
+            secpr_raw_children: Vec::new(),
         }),
     );
     para.controls.insert(
@@ -694,5 +715,20 @@ mod tests {
         let h = default_header();
         assert_eq!(h.char_shapes[0].base_size, 1000); // 본문 10pt
         assert_eq!(h.char_shapes[4].base_size, 1800); // H1 = 본문 × 1.8
+    }
+
+    /// push_text: 탭은 InlineCtrl(9)로, 그 외 C0 제어문자는 드롭, 일반 문자는 Text로.
+    #[test]
+    fn push_text_탭_인라인컨트롤_제어문자_드롭() {
+        let mut b = Builder::default();
+        b.push_text("A\tB\u{0001}C");
+        let kinds: Vec<_> = b.chars.iter().cloned().collect();
+        assert_eq!(kinds.len(), 4, "A, 탭, B, C (0x01 드롭): {kinds:?}");
+        assert!(matches!(kinds[0], HwpChar::Text('A')));
+        assert!(matches!(kinds[1], HwpChar::InlineCtrl { code: 9, .. }));
+        assert!(matches!(kinds[2], HwpChar::Text('B')));
+        assert!(matches!(kinds[3], HwpChar::Text('C')));
+        // wchar_pos = 1 + 8 + 1 + 1 (0x01은 소비 안 함).
+        assert_eq!(b.wchar_pos, 11);
     }
 }

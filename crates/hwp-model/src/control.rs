@@ -67,6 +67,13 @@ pub enum BinRef {
     ItemRef(String),
 }
 
+/// hwpx `<hp:secPr>`의 미해석 자식이 저장될 [`SectionDef::secpr_raw_children`]에서
+/// `<hp:pagePr>`(의미 파싱되어 페이지 정의로 재방출됨)가 자식 순서상 놓일 자리를
+/// 표시하는 센티넬. 실제 XML엔 나타날 수 없는 제어문자 조합이라 원문과 충돌하지 않는다.
+/// reader가 이 마커를 삽입하고, writer가 이 자리에서 페이지 정의로부터 생성한 pagePr을
+/// 방출한다(원본 자식 순서 보존).
+pub const SECPR_PAGEPR_SLOT: &str = "\u{0}pagePr\u{0}";
+
 /// 구역 정의 컨트롤.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SectionDef {
@@ -77,6 +84,12 @@ pub struct SectionDef {
     pub page: Option<PageDef>,
     /// FOOTNOTE_SHAPE, PAGE_BORDER_FILL 등 미해석 자식
     pub extras: Vec<OpaqueRecord>,
+    /// hwpx `<hp:secPr>`의 미해석 자식(grid/startNum/visibility/lineNumberShape/
+    /// footNotePr/endNotePr/pageBorderFill 등)의 원문 XML을 등장 순서대로 보존한다.
+    /// pagePr 자리는 [`SECPR_PAGEPR_SLOT`] 마커로 표시된다(페이지 정의에서 재생성).
+    /// 비어 있으면(hwp5 출신·구형 IR) writer가 기존 상수 템플릿을 방출한다.
+    #[serde(default)]
+    pub secpr_raw_children: Vec<String>,
 }
 
 /// PAGE_DEF (40바이트) — 용지 정의.

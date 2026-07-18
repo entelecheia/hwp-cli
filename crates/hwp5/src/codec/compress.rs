@@ -2,6 +2,8 @@
 //!
 //! FileHeader의 압축 플래그(bit 0)가 설정된 경우 DocInfo/BodyText 스트림은
 //! **zlib 헤더 없는 raw deflate**로 압축되어 있다 (pyhwp의 wbits=-15와 동일).
+//! Scripts 스트림(DefaultJScript 등)도 압축 대상이다 — 정품 표본 실측
+//! (문서 10 §1 쓰기 비대칭 참조).
 
 use std::io::Read;
 

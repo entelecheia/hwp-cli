@@ -78,7 +78,12 @@ pub fn write_document_with(
         Ok(())
     };
 
-    put(&mut zip, "version.xml", templates::VERSION_XML.as_bytes())?;
+    // version.xml — 슬롯이 있으면 원문 pass-through, 없으면 기본 상수(바이트 동일).
+    let version_xml = doc
+        .hwpx_version_xml
+        .as_deref()
+        .unwrap_or(templates::VERSION_XML);
+    put(&mut zip, "version.xml", version_xml.as_bytes())?;
     put(
         &mut zip,
         "META-INF/container.rdf",
@@ -111,7 +116,12 @@ pub fn write_document_with(
         put(&mut zip, href, bytes)?;
     }
     put(&mut zip, "Preview/PrvText.txt", preview.as_bytes())?;
-    put(&mut zip, "settings.xml", templates::SETTINGS_XML.as_bytes())?;
+    // settings.xml — 슬롯이 있으면 원문 pass-through, 없으면 기본 상수(바이트 동일).
+    let settings_xml = doc
+        .hwpx_settings_xml
+        .as_deref()
+        .unwrap_or(templates::SETTINGS_XML);
+    put(&mut zip, "settings.xml", settings_xml.as_bytes())?;
 
     zip.finish()?;
     Ok(warnings)

@@ -85,6 +85,16 @@ fn num_fmt(s: &str) -> hwp_model::NumFmt {
     }
 }
 
+/// OWPML tabItem type → hwp5 탭 종류 코드(§4.2.7): 왼0/오른1/가운데2/소수점3.
+fn tab_kind_code(s: &str) -> u8 {
+    match s {
+        "RIGHT" => 1,
+        "CENTER" => 2,
+        "DECIMAL" => 3,
+        _ => 0, // LEFT
+    }
+}
+
 /// hwp5 ParaShape::alignment()과 같은 인코딩으로 정렬 매핑.
 fn alignment_code(s: &str) -> u32 {
     match s {
@@ -113,6 +123,12 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
     // 인덱스로 정규화하므로 외부 id→내부 인덱스 맵을 별도로 유지한다.
     let mut numbering_ids: HashMap<u16, u16> = HashMap::new();
     let mut bullet_ids: HashMap<u16, u16> = HashMap::new();
+    let mut current_tab: Option<hwp_model::TabDef> = None;
+    // 정품 tabItem은 hp:switch로 감싸 case(HwpUnitChar, unit=HWPUNIT, pos=X)와
+    // default(unit 없음, pos=2X)를 함께 낸다. case만 취하고 default는 버리기 위해
+    // hp:default 안에 있는 동안 tabItem 수집을 막는다(중복 방지). switch 없는 naked
+    // tabItem(구형 출력·타 구현체)은 이 플래그가 꺼진 채라 그대로 읽힌다.
+    let mut in_tab_default = false;
     // paraHead 텍스트(형식 템플릿 "^1." 등)를 담을 현재 수준(1-기반).
     let mut current_para_head: Option<usize> = None;
     // hp:switch의 case/default 중복 — 첫 분기(신형 한글이 읽는 값)만 취한다
@@ -329,6 +345,38 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                                 ps.attr1 |= level << 25;
                                 ps.numbering_id = attr_u16(e, "idRef").unwrap_or(0);
                             }
+                        }
+                    }
+                    // 탭 정의(§4.2.7 / hh:tabPr): 자동탭 속성 + 자식 tabItem.
+                    b"tabPr" => {
+                        let mut td = hwp_model::TabDef::default();
+                        if attr(e, "autoTabLeft").as_deref() == Some("1") {
+                            td.attr |= 0x1;
+                        }
+                        if attr(e, "autoTabRight").as_deref() == Some("1") {
+                            td.attr |= 0x2;
+                        }
+                        if empty {
+                            header.tab_stops.push(td);
+                        } else {
+                            current_tab = Some(td);
+                        }
+                    }
+                    // hp:default 안의 tabItem은 case의 중복(pos=2X)이므로 무시.
+                    b"default" => {
+                        if current_tab.is_some() {
+                            in_tab_default = true;
+                        }
+                    }
+                    b"tabItem" => {
+                        if let Some(td) = &mut current_tab
+                            && !in_tab_default
+                        {
+                            let pos = attr_i32(e, "pos").unwrap_or(0);
+                            let kind = attr(e, "type").map_or(0, |t| tab_kind_code(&t));
+                            // leader(리더/채움 선): 테두리선 종류 코드로 보존.
+                            let fill = attr(e, "leader").map_or(0, |l| line_type_code(&l));
+                            td.items.push(hwp_model::TabItem { pos, kind, fill });
                         }
                     }
                     // 번호 정의 시작 + 수준별 형식.
@@ -573,6 +621,13 @@ pub fn parse_header(xml: &str) -> Result<(DocHeader, Vec<String>)> {
                     if let Some(ps) = current_para.take() {
                         header.para_shapes.push(ps);
                     }
+                }
+                b"default" => in_tab_default = false,
+                b"tabPr" => {
+                    if let Some(td) = current_tab.take() {
+                        header.tab_stops.push(td);
+                    }
+                    in_tab_default = false;
                 }
                 b"numbering" => {
                     if let Some(levels) = current_numbering.take() {

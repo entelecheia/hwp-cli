@@ -23,6 +23,7 @@ pub fn run(
     create_bookmarks: &[String],
     create_hyperlinks: &[String],
     insert_images: &[String],
+    seals: &[String],
     set_formats: &[String],
     set_aligns: &[String],
     insert_paras: &[String],
@@ -41,7 +42,8 @@ pub fn run(
         || !delete_paras.is_empty()
         || !add_rows.is_empty()
         || !delete_rows.is_empty()
-        || !insert_images.is_empty();
+        || !insert_images.is_empty()
+        || !seals.is_empty();
 
     for spec in replaces {
         let (from, to) = spec
@@ -120,6 +122,17 @@ pub fn run(
         hwp_convert::insert_image(&mut doc, anchor, Path::new(path), size)
             .map_err(|e| anyhow::anyhow!(e))?;
         eprintln!("이미지 삽입: {anchor:?} 뒤에 {path:?}");
+        edits += 1;
+    }
+
+    for spec in seals {
+        let (anchor, rhs) = spec.split_once("=>").with_context(|| {
+            format!("--seal 형식은 \"앵커=>경로\" 또는 \"앵커=>경로@크기mm\" 입니다: {spec:?}")
+        })?;
+        let (path, size_mm) = parse_seal_size(rhs);
+        hwp_convert::insert_seal(&mut doc, anchor, Path::new(path), size_mm)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("도장 날인: {anchor:?} 위에 {path:?}");
         edits += 1;
     }
 
@@ -227,7 +240,7 @@ pub fn run(
 
     if edits == 0 {
         eprintln!(
-            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--set-meta/--create-field/--create-bookmark/--create-hyperlink/--insert-image/--set-format/--set-align/--insert-para/--delete-para/--add-row/--delete-row 확인)"
+            "경고: 적용된 편집이 없습니다 (--replace/--set-cell/--set-field/--set-meta/--create-field/--create-bookmark/--create-hyperlink/--insert-image/--seal/--set-format/--set-align/--insert-para/--delete-para/--add-row/--delete-row 확인)"
         );
     }
 
@@ -332,6 +345,18 @@ fn parse_image_size(rhs: &str) -> anyhow::Result<(&str, ImageSize)> {
         return Ok((path, ImageSize::Mm(w, h)));
     }
     Ok((rhs, ImageSize::Natural))
+}
+
+/// "경로" 또는 "경로@크기mm"(또는 "경로@크기") → (경로, Option<f32> mm).
+/// `@` 뒤가 수치로 파싱될 때만 크기로 보고, 아니면 경로 일부(기본 20mm)로 둔다.
+fn parse_seal_size(rhs: &str) -> (&str, Option<f32>) {
+    if let Some((path, raw)) = rhs.rsplit_once('@') {
+        let num = raw.trim().strip_suffix("mm").unwrap_or(raw.trim());
+        if let Ok(mm) = num.trim().parse::<f32>() {
+            return (path, Some(mm));
+        }
+    }
+    (rhs, None)
 }
 
 /// 정렬 이름 → 코드(0=양쪽,1=왼쪽,2=오른쪽,3=가운데,4=배분,5=나눔).

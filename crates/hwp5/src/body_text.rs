@@ -344,6 +344,8 @@ fn parse_section_def(
         data,
         page: None,
         extras: Vec::new(),
+        // hwp5 출신 구역은 hwpx 원문 자식이 없다(writer가 기존 상수 템플릿 방출).
+        secpr_raw_children: Vec::new(),
     };
     for child in children {
         if child.tag == tag::PAGE_DEF {

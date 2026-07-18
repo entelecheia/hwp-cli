@@ -79,6 +79,50 @@ fn 합성_문서_한글_규격_충족() {
     );
 }
 
+/// 본문 탭이 md→hwp5 경로에서 8 WCHAR 인라인 컨트롤(코드 9)로 저장·복원돼야 한다.
+/// Text('\t')로 1 WCHAR만 나가면 한글이 코드 9를 인라인 컨트롤 선두로 오인해 뒤
+/// 7 WCHAR를 잘못 삼켜 파일이 깨진다(§3.2.3 표 6).
+#[test]
+fn 본문_탭_hwp5_인라인컨트롤_왕복() {
+    use hwp_model::HwpChar;
+    let doc = hwp_convert::from_markdown("앞\t뒤\n");
+    // IR 불변식: 탭은 InlineCtrl(9), Text('\t') 부재.
+    let chars = &doc.sections[0].paragraphs[0].chars;
+    assert!(
+        chars
+            .iter()
+            .any(|c| matches!(c, HwpChar::InlineCtrl { code: 9, .. })),
+        "탭이 InlineCtrl(9)로 적재돼야: {chars:?}"
+    );
+    assert!(
+        !chars.iter().any(|c| matches!(c, HwpChar::Text('\t'))),
+        "탭이 Text('\\t')로 남으면 안 됨"
+    );
+
+    let out = tmp("synth_tab.hwp");
+    hwp5::write_document(&doc, &out, &hwp5::WriteOptions::default()).unwrap();
+
+    // PARA_TEXT에 탭 인라인 컨트롤 16바이트(09 00 + 12*0 + 09 00)가 있어야 한다.
+    let mut c = hwp5::Hwp5Container::open(&out).unwrap();
+    let bt = c.read_record_stream("/BodyText/Section0").unwrap();
+    let pt = first_record(&bt, 0x43).expect("PARA_TEXT");
+    let tab16 = [9u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0];
+    assert!(
+        pt.windows(16).any(|w| w == tab16),
+        "PARA_TEXT에 탭 인라인 컨트롤 16B 없음"
+    );
+
+    // 왕복: 다시 읽어도 InlineCtrl(9) + 텍스트 순서 보존.
+    let reread = hwp5::read_document(&out).unwrap().document;
+    let rc = &reread.sections[0].paragraphs[0].chars;
+    assert!(
+        rc.iter()
+            .any(|c| matches!(c, HwpChar::InlineCtrl { code: 9, .. })),
+        "왕복 후 InlineCtrl(9) 소실: {rc:?}"
+    );
+    assert!(reread.plain_text().contains("앞\t뒤"), "탭 텍스트 복원");
+}
+
 /// 합성 문단의 본문 구조가 정품 한글 문단(가나다.hwp 5.1.1.0)과 동형이어야 한다.
 /// 정품 대조로 확정한 5대 본문 결함의 회귀 방지 — 이 결함들이 합쳐져
 /// "보안 낮춤에도 손상" 경고를 냈다.

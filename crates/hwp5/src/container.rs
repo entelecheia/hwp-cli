@@ -116,5 +116,6 @@ pub fn is_record_stream(path: &str) -> bool {
     path == "/DocInfo"
         || path.starts_with("/BodyText/")
         || path.starts_with("/ViewText/")
+        // Scripts 스트림도 압축 대상(정품 표본 실측 — 문서 10 §1 쓰기 비대칭 참조).
         || path.starts_with("/Scripts/")
 }

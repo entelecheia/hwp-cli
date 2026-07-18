@@ -751,13 +751,25 @@ fn synth_pictures_para(
                 };
                 // gso 개체 공통 속성(40B)을 배치에서 합성한다. 정품 한라대 .hwp
                 // 실측 attr: 인라인(글자처럼)=0x042a6001, 떠 있는(floating)=
-                // 0x040a6000. floating은 hwpx 오프셋으로 위치 지정. instance_id는
-                // 개체마다 유니크 부여. (고정 템플릿을 쓰면 떠 있는 로고가 인라인으로
-                // 배치돼 한글에서 안 보이거나 오배치된다.)
+                // 0x040a6000. instance_id는 개체마다 유니크 부여. (고정 템플릿을 쓰면
+                // 떠 있는 로고가 인라인으로 배치돼 한글에서 안 보이거나 오배치된다.)
+                //
+                // 부유는 문단 기준(vertRelTo/horzRelTo=PARA)으로 둔다: 0x040a6000은
+                // relTo=PAPER(용지 좌상단 기준)이라, insert_seal이 앵커 문단 안에서
+                // 계산한 오프셋을 쓰면 도장이 용지 좌상단으로 튄다(D2 미겹침 결함).
+                // PARA 비트(vertRelTo=2<<3, horzRelTo=3<<8)를 세워 hwpx(D1) PARA
+                // 배치와 오프셋 의미를 일치시킨다.
+                //
+                // 어울림(bits21-23)은 글 앞(IN_FRONT_OF_TEXT=5)으로: 표본 0x040a6000의
+                // wrap=0(SQUARE)은 본문을 밀어내 겹침이 불가(§4.3.9.1, D2 "(인) 우측
+                // 밀림" 실기 결함). 값 체계는 정품 annual attr 0x046a4000→wrap=3
+                // (TOP_AND_BOTTOM)으로 교차 확인. bit13(본문 영역 제한)도 해제 —
+                // 스펙상 제한 시 겹침 허용(bit14)이 무시된다. hwpx 부유 그림 방출
+                // (IN_FRONT_OF_TEXT 고정)과 대칭.
                 let attr: u32 = if p.treat_as_char {
                     0x042a_6001
                 } else {
-                    0x040a_6000
+                    (0x040a_6000 & !(1 << 13)) | (2 << 3) | (3 << 8) | (5 << 21) // = 0x04aa4310
                 };
                 // 오프셋은 글자처럼 취급(treat_as_char)이어도 보존한다. 정품 본문 로고는
                 // treatAsChar=1인데도 vertOffset=68401을 유지하므로, 0으로 만들면 좌상단으로
@@ -1689,6 +1701,16 @@ fn emit_para_text(chars: &[HwpChar]) -> Vec<u8> {
     let mut w = ByteWriter::new();
     for ch in chars {
         match ch {
+            // 방어선: 탭이 Text로 잘못 적재된 경우(과거 오염 IR)에도 8 WCHAR 인라인
+            // 컨트롤(코드 9)로 정규화한다. 코드 9를 1 WCHAR로 내보내면 한글이 인라인
+            // 컨트롤 선두로 오인해 뒤 7 WCHAR를 잘못 삼킨다(§3.2.3 표 6). 정상 경로는
+            // 탭을 InlineCtrl(9)로 이미 담으므로 여기 오지 않아 왕복 바이트동일 게이트에
+            // 영향이 없다(정품 hwp5는 탭을 Text로 저장하지 않는다).
+            HwpChar::Text('\t') => {
+                w.write_u16(9);
+                w.write_bytes(&[0u8; 12]);
+                w.write_u16(9);
+            }
             HwpChar::Text(c) => {
                 let mut buf = [0u16; 2];
                 for u in c.encode_utf16(&mut buf) {
@@ -1859,7 +1881,15 @@ fn emit_table(
         }
         // instance id: 고유한 비-0 값(z순서 기반). 개체 링크용이라 렌더 영향은 작다.
         w.write_u32(0x5000_0000 | (pl.z_order as u32 & 0xffff));
-        w.write_i32(i32::from(pl.hold_anchor)); // @36: 앵커/개체 고정
+        // @36 INT32 = 쪽나눔 방지 on(1)/off(0) (스펙 표 69). 정품 표본(color_fill.hwp
+        // 표) 실측 = 0. 과거 이 자리에 hwpx holdAnchorAndSO를 잘못 기록했다 — 두 필드는
+        // 의미가 다르다. holdAnchorAndSO는 hwp5 공통 속성에 대응 자리가 없어 hwp5 합성에서
+        // 버린다(손실 아님: hwpx→hwpx 왕복은 <hp:pos> anchor 속성으로 pl.hold_anchor를 보존).
+        w.write_i32(0); // 쪽나눔 방지 off
+        // 개체 설명문 길이 WORD(len=0) — 스펙 표 69의 마지막 필수 필드(≥5.0.0.5).
+        // 누락하면 45→44B가 되어 스펙 최소 46B(=" lbt" 4 + 42)에 미달, 한글이 레코드를
+        // 짧게 읽어 거부할 수 있다. 그림 경로(emit_picture 합성)와 동일하게 방출한다.
+        w.write_u16(0); // desc_len = 0
     } else {
         // md 출신: 셀 크기로 계산한 떠 있는 표본값(기존 동작 유지).
         let mut col_w = vec![0i64; table.cols.max(1) as usize];
@@ -1884,6 +1914,7 @@ fn emit_table(
         }
         w.write_u32(0); // instance id
         w.write_i32(0); // 쪽 나눔 방지
+        w.write_u16(0); // 개체 설명문 길이 WORD(len=0) — 스펙 표 69 필수, 46B 정합
     }
 
     let mut tw = ByteWriter::new();
@@ -2063,6 +2094,73 @@ mod tests {
         assert_eq!(
             i32::from_le_bytes(pic.data[86..90].try_into().unwrap()),
             61875
+        );
+    }
+
+    fn synth_table(placement: Option<hwp_model::GsoPlacement>) -> Table {
+        Table {
+            common_data: Vec::new(),
+            placement,
+            attr: 0,
+            rows: 1,
+            cols: 1,
+            cell_spacing: 0,
+            inner_margins: [0; 4],
+            row_cell_counts: vec![1],
+            border_fill: hwp_model::BorderFillId(1),
+            table_tail: Vec::new(),
+            cells: Vec::new(),
+            extras: Vec::new(),
+        }
+    }
+
+    /// 합성(hwpx·md 출신) 표의 개체 공통 속성은 스펙 표 69의 최소 46B
+    /// (" lbt" 4 + 40 필드 + desc_len 2)로 방출해야 한다. 그림 경로(46B)와 정합.
+    /// @40(=공통 4+@36) INT32 = 쪽나눔 방지 = 0(정품 표본 실측), @44 WORD = desc_len = 0.
+    #[test]
+    fn 합성_표_공통속성_46b_쪽나눔0() {
+        // 1) hwpx 출신(placement) 경로.
+        let pl = hwp_model::GsoPlacement {
+            hold_anchor: true, // hwp5 합성에서 버려야 함(쪽나눔 자리로 새면 안 됨)
+            width: 40000,
+            height: 20000,
+            z_order: 3,
+            ..Default::default()
+        };
+        let node = emit_table(&synth_table(Some(pl)), true, false, false);
+        assert_eq!(&node.data[0..4], b" lbt", "표 ctrl ID");
+        assert_eq!(
+            node.data.len(),
+            46,
+            "placement 경로: ctrl ID 4 + 공통 42 = 46B (스펙 표 69 최소)"
+        );
+        assert_eq!(
+            i32::from_le_bytes(node.data[40..44].try_into().unwrap()),
+            0,
+            "@40 쪽나눔 방지 = 0 (holdAnchorAndSO가 새면 안 됨)"
+        );
+        assert_eq!(
+            u16::from_le_bytes(node.data[44..46].try_into().unwrap()),
+            0,
+            "@44 desc_len = 0"
+        );
+
+        // 2) md 출신 경로(placement=None, common_data 비어 있음).
+        let node = emit_table(&synth_table(None), true, false, false);
+        assert_eq!(
+            node.data.len(),
+            46,
+            "md 경로: 46B (스펙 표 69 최소)"
+        );
+        assert_eq!(
+            i32::from_le_bytes(node.data[40..44].try_into().unwrap()),
+            0,
+            "md 경로 @40 쪽나눔 방지 = 0"
+        );
+        assert_eq!(
+            u16::from_le_bytes(node.data[44..46].try_into().unwrap()),
+            0,
+            "md 경로 @44 desc_len = 0"
         );
     }
 }

@@ -26,7 +26,7 @@ pub use field::{
 pub use format::{CharFormat, set_char_format, set_para_align};
 pub use from_markdown::{default_header, from_markdown};
 pub use html::{to_html, to_html_fragment};
-pub use image::{ImageSize, image_kind, insert_image};
+pub use image::{ImageSize, image_kind, insert_image, insert_seal};
 pub use markdown::{MarkdownOptions, to_markdown, to_markdown_with};
 pub use odt::to_odt;
 pub use structure::{add_table_row, delete_paragraph, delete_table_row, insert_paragraph};
