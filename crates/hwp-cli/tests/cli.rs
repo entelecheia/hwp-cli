@@ -665,3 +665,45 @@ fn 변환_완전_왕복_hwp_hwpx_hwp() {
     let _ = std::fs::remove_file(&mid);
     let _ = std::fs::remove_file(&dst);
 }
+
+/// markdown 변환 --media-dir: 이미지가 지정 디렉터리(figs/)에 추출되고 링크가 그 경로를 쓴다.
+#[test]
+fn convert_md_media_dir_figs() {
+    if skip_if_no_fixtures() {
+        return;
+    }
+    let src = fixture("hwp5/annual_report.hwp");
+    if !src.exists() {
+        eprintln!("스킵: annual_report.hwp 없음");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hwp_cli_figs_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("report.md");
+
+    let r = hwp()
+        .arg("convert")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .args(["--media-dir", "figs"])
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+
+    let md = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        md.contains("![image](figs/image"),
+        "figs 경로 링크: {}",
+        &md[..md.len().min(400)]
+    );
+    let figs = dir.join("figs");
+    assert!(figs.is_dir(), "figs 디렉터리가 출력 옆에 생성");
+    assert!(
+        std::fs::read_dir(&figs).unwrap().next().is_some(),
+        "추출된 이미지 파일 존재"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
