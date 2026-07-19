@@ -26,12 +26,12 @@ pub mod units;
 
 pub use control::{
     BinRef, Cell, ColumnDef, Control, Equation, GenericControl, GradientSpec, GsoPlacement,
-    PageDef, ParagraphList, Picture, SectionDef, ShapeGeom, ShapeKind, Table,
+    PageDef, ParagraphList, Picture, SECPR_PAGEPR_SLOT, SectionDef, ShapeGeom, ShapeKind, Table,
 };
 pub use document::{BinStream, DocMeta, Document, Metadata, Section};
 pub use header::{
     BinDataItem, BorderFill, BorderLine, CharShape, DocHeader, DocumentProperties, FaceName,
-    LANG_COUNT, NumFmt, NumLevel, ParaShape, RawEntry, Style,
+    LANG_COUNT, NumFmt, NumLevel, ParaShape, RawEntry, Style, TabDef, TabItem,
 };
 pub use ids::{BinDataId, BorderFillId, CharShapeId, FaceNameId, ParaShapeId, StyleId};
 pub use opaque::OpaqueRecord;

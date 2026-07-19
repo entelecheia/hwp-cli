@@ -76,6 +76,9 @@ pub fn read_document(path: &Path) -> Result<ReadResult> {
         header,
         sections,
         bin_streams,
+        // hwp5 출신 문서는 hwpx 부속 파트가 없다 → None(쓰기 시 기본 상수).
+        hwpx_settings_xml: None,
+        hwpx_version_xml: None,
     };
     Ok(ReadResult { document, warnings })
 }

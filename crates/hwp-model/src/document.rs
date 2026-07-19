@@ -19,6 +19,14 @@ pub struct Document {
     /// 첨부 바이너리 (이미지 등). 키는 원본 컨테이너 항목 이름
     /// (hwp5: "BIN0001.png", hwpx: "BinData/image1.png").
     pub bin_streams: Vec<BinStream>,
+    /// hwpx `settings.xml` 원문(앱 설정·캐럿 위치). IR 경유 되쓰기에서 원본을
+    /// 그대로 통과시키기 위한 슬롯. hwp5 출신 문서는 `None`(쓰기 시 기본 상수).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwpx_settings_xml: Option<String>,
+    /// hwpx `version.xml` 원문(버전 메타). IR 경유 되쓰기에서 원본을 그대로
+    /// 통과시키기 위한 슬롯. hwp5 출신 문서는 `None`(쓰기 시 기본 상수).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwpx_version_xml: Option<String>,
 }
 
 /// 문서 수준 메타데이터 (요약 정보 / OPF 메타).

@@ -455,3 +455,242 @@ fn 그러데이션_채움_백엔드() {
         right.blue()
     );
 }
+
+/// GC-8 내어쓰기(음수 first-line indent): 첫 줄이 나머지 줄보다 왼쪽에 놓여야 한다.
+/// 폴백(캐시 없는) 문단 경로를 탄다 — 합성 문서(line_segs 없음)라 layout이 그리디
+/// 줄바꿈한다. 픽셀 골든이 아니라 DisplayList의 글리프 x를 줄별로 비교한다.
+#[test]
+fn 내어쓰기_첫줄이_왼쪽() {
+    use hwp_render::display::Item;
+    // 여러 줄로 넘치도록 충분히 긴 한 문단.
+    let mut doc = hwp_convert::from_markdown(&"가".repeat(400));
+    // 이 문단의 문단모양에 좌여백(60pt) + 내어쓰기(-40pt) 설정. IR 여백류는 2×HWPUNIT.
+    let psid = doc.sections[0].paragraphs[0].para_shape.0 as usize;
+    doc.header.para_shapes[psid].margin_left = 12000; // /200 = 60pt
+    doc.header.para_shapes[psid].indent = -8000; // /200 = -40pt (내어쓰기)
+
+    let mut store = hwp_render::FontStore::new();
+    let mut warns = Vec::new();
+    let list = hwp_render::layout::layout_document(&doc, &mut store, &mut warns);
+
+    // (y=베이스라인, x) 글리프 목록.
+    let glyphs: Vec<(f32, f32)> = list.pages[0]
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Glyphs { x, y, .. } => Some((*y, *x)),
+            _ => None,
+        })
+        .collect();
+    assert!(glyphs.len() >= 2, "여러 줄로 줄바꿈돼야: {}", glyphs.len());
+
+    let min_y = glyphs.iter().map(|(y, _)| *y).fold(f32::INFINITY, f32::min);
+    // 첫 줄(min_y)의 최소 x.
+    let first_x = glyphs
+        .iter()
+        .filter(|(y, _)| (*y - min_y).abs() < 0.5)
+        .map(|(_, x)| *x)
+        .fold(f32::INFINITY, f32::min);
+    // 더 아래 줄(둘째 줄 이후)의 최소 x.
+    let rest_x = glyphs
+        .iter()
+        .filter(|(y, _)| *y > min_y + 0.5)
+        .map(|(_, x)| *x)
+        .fold(f32::INFINITY, f32::min);
+    assert!(rest_x.is_finite(), "둘째 줄이 있어야 한다(줄바꿈 발생)");
+    assert!(
+        first_x < rest_x - 1.0,
+        "내어쓰기: 첫 줄 x({first_x:.1})이 나머지 줄 x({rest_x:.1})보다 왼쪽이어야"
+    );
+}
+
+/// GC-9 페이지 걸친 문단 배경: 배경 border_fill을 가진 긴 문단이 페이지를 넘기면
+/// 각 페이지에 배경 조각(Rect)이 그려져야 한다(통째 생략 금지). 합성 line_segs로
+/// 멀티페이지를 만들고, 두 페이지 모두에 그 채움색 Rect가 있는지 DisplayList로 확인한다.
+#[test]
+fn 페이지_걸친_문단배경_조각() {
+    use hwp_model::BorderFill;
+    use hwp_render::display::{Item, PageList};
+
+    // 여러 페이지를 넘길 만큼 아주 긴 한 문단.
+    let mut doc = hwp_convert::from_markdown(&"가".repeat(4000));
+
+    // 가시 배경 border_fill 추가 → 첫 문단 문단모양이 참조(id는 1-based).
+    let fill_color = 0x00FF_EEDDu32;
+    doc.header.border_fills.push(BorderFill {
+        bg_color: Some(fill_color),
+        fill_type: 1,
+        ..BorderFill::default()
+    });
+    let bf_id = doc.header.border_fills.len() as u16;
+    let psid = doc.sections[0].paragraphs[0].para_shape.0 as usize;
+    doc.header.para_shapes[psid].border_fill_id = bf_id;
+
+    let mut store = hwp_render::FontStore::new();
+    let mut warns = Vec::new();
+    hwp_render::lineseg::synthesize_linesegs(&mut doc, &mut store, &mut warns);
+    let list = hwp_render::layout::layout_document(&doc, &mut store, &mut warns);
+
+    assert!(
+        list.pages.len() >= 2,
+        "문단이 페이지를 걸쳐야 한다: {}쪽",
+        list.pages.len()
+    );
+    let has_bg = |p: &PageList| {
+        p.items
+            .iter()
+            .any(|it| matches!(it, Item::Rect { fill, .. } if *fill == fill_color))
+    };
+    assert!(has_bg(&list.pages[0]), "1쪽에 배경 조각(Rect)이 있어야 한다");
+    assert!(
+        has_bg(&list.pages[1]),
+        "2쪽에도 배경 조각(Rect)이 있어야 한다 — 페이지 걸친 배경 통째 생략 금지"
+    );
+}
+
+/// 쪽 테두리(PAGE_BORDER_FILL BOTH) 렌더: 정답지 BF#7(4변 실선 0.4mm 검정)을 종이
+/// 기준 gap 1417(≈5mm)로 주입하면 용지 가장자리에서 gap만큼 안쪽에 4변 Line이 그려지고
+/// (색·굵기·위치 반영), 텍스트 뒤(맨 앞 삽입)에 놓여야 한다. id=1(무테두리)·PAGE_BORDER
+/// 미존재는 무출력(기본 문서 불변).
+#[test]
+fn 쪽_테두리_렌더() {
+    use hwp_model::{BorderFill, BorderLine, Control, Document};
+    use hwp_render::display::{Item, PageList};
+
+    // PAGE_BORDER_FILL 14바이트 합성: attr u32 + gap u16×4(왼/오/위/아래) + 테두리ID u16.
+    fn raw(attr: u32, gap: [u16; 4], id: u16) -> Vec<u8> {
+        let mut v = Vec::with_capacity(14);
+        v.extend_from_slice(&attr.to_le_bytes());
+        for g in gap {
+            v.extend_from_slice(&g.to_le_bytes());
+        }
+        v.extend_from_slice(&id.to_le_bytes());
+        v
+    }
+
+    // 첫 SectionDef의 page_border_fills_raw에 BOTH 레코드를 주입한다(순서=BOTH/EVEN/ODD).
+    fn inject(doc: &mut Document, data: Vec<u8>) {
+        for para in &mut doc.sections[0].paragraphs {
+            for c in &mut para.controls {
+                if let Control::SectionDef(sd) = c {
+                    sd.page_border_fills_raw.push(data);
+                    return;
+                }
+            }
+        }
+        panic!("SectionDef 없음 — from_markdown 구조 변경?");
+    }
+
+    fn lines(page: &PageList) -> Vec<(f32, f32, f32, f32, u32, f32)> {
+        page.items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Line {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    color,
+                    width,
+                } => Some((*x1, *y1, *x2, *y2, *color, *width)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn layout(doc: &Document) -> hwp_render::display::DisplayList {
+        let mut store = hwp_render::FontStore::new();
+        let mut warns = Vec::new();
+        hwp_render::layout::layout_document(doc, &mut store, &mut warns)
+    }
+
+    // A4 종이(from_markdown 기본): 595.28 × 841.86 pt.
+    const PAPER_W: f32 = 595.28;
+    const PAPER_H: f32 = 841.86;
+    const GAP_PT: f32 = 14.17; // 1417 HWPUNIT ≈ 5mm
+    // 0.4mm(굵기 인덱스 6) → pt.
+    let expect_w = 0.4 * 72.0 / 25.4;
+
+    // border_fills: id 7(index 6) = 4변 실선 0.4mm 검정. index 0(id 1)=무테두리(기본).
+    let real_border = BorderFill {
+        sides: [BorderLine {
+            line_type: 1,
+            width: 6,
+            color: 0,
+        }; 4],
+        ..BorderFill::default()
+    };
+
+    // (A) BOTH=id7 실테두리 → 4변 Line, 종이 가장자리에서 gap만큼 안쪽.
+    {
+        let mut doc = hwp_convert::from_markdown("본문 한 줄.\n");
+        while doc.header.border_fills.len() < 6 {
+            doc.header.border_fills.push(BorderFill::default());
+        }
+        doc.header.border_fills.push(real_border.clone());
+        inject(&mut doc, raw(1, [1417; 4], 7)); // attr bit0=1(종이 기준)
+
+        let list = layout(&doc);
+        let page = &list.pages[0];
+        let ls = lines(page);
+        assert_eq!(ls.len(), 4, "4변(전 변 실선)이 그려져야: {}", ls.len());
+
+        // 맨 앞 4개가 테두리(텍스트 뒤에 그림).
+        for i in 0..4 {
+            assert!(
+                matches!(page.items[i], Item::Line { .. }),
+                "쪽 테두리는 페이지 맨 앞(뒤에 그림)에 삽입돼야 한다"
+            );
+        }
+
+        // 색·굵기.
+        for &(_, _, _, _, color, width) in &ls {
+            assert_eq!(color, 0, "테두리 색은 검정(0)");
+            assert!((width - expect_w).abs() < 0.01, "굵기 {width} ≠ {expect_w}");
+        }
+
+        // 위치: 사각형 경계가 종이 가장자리에서 gap만큼 안쪽(gap 반영).
+        let minx = ls.iter().map(|l| l.0.min(l.2)).fold(f32::MAX, f32::min);
+        let maxx = ls.iter().map(|l| l.0.max(l.2)).fold(f32::MIN, f32::max);
+        let miny = ls.iter().map(|l| l.1.min(l.3)).fold(f32::MAX, f32::min);
+        let maxy = ls.iter().map(|l| l.1.max(l.3)).fold(f32::MIN, f32::max);
+        assert!((minx - GAP_PT).abs() < 0.1, "좌변 안쪽 gap: {minx}");
+        assert!((miny - GAP_PT).abs() < 0.1, "상변 안쪽 gap: {miny}");
+        assert!(
+            (PAPER_W - maxx - GAP_PT).abs() < 0.1,
+            "우변 안쪽 gap: {}",
+            PAPER_W - maxx
+        );
+        assert!(
+            (PAPER_H - maxy - GAP_PT).abs() < 0.1,
+            "하변 안쪽 gap: {}",
+            PAPER_H - maxy
+        );
+        // 4변 각각 축 정렬(수직/수평).
+        for &(x1, y1, x2, y2, ..) in &ls {
+            let axis = (x1 - x2).abs() < 0.01 || (y1 - y2).abs() < 0.01;
+            assert!(axis, "변은 축 정렬이어야: ({x1},{y1})-({x2},{y2})");
+        }
+    }
+
+    // (B) id=1(전 변 무테두리) 주입 → 무출력.
+    {
+        let mut doc = hwp_convert::from_markdown("본문.\n");
+        inject(&mut doc, raw(1, [1417; 4], 1));
+        let list = layout(&doc);
+        assert!(
+            lines(&list.pages[0]).is_empty(),
+            "id=1(무테두리)은 쪽 테두리를 그리지 않아야 한다"
+        );
+    }
+
+    // (C) PAGE_BORDER_FILL 미존재(기본 문서) → 무출력(기존 렌더 불변).
+    {
+        let doc = hwp_convert::from_markdown("본문.\n");
+        let list = layout(&doc);
+        assert!(
+            lines(&list.pages[0]).is_empty(),
+            "PAGE_BORDER_FILL 없는 기본 문서는 쪽 테두리 무출력"
+        );
+    }
+}

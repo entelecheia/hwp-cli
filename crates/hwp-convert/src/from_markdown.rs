@@ -1,19 +1,37 @@
 //! Markdown → IR.
 //!
-//! 매핑: 헤딩 → "개요 N" 스타일 + 절 번호 접두(리터럴), 굵게/기울임 → 문자 모양 변형,
-//! GFM 표 → Table 컨트롤, 목록 → 표준 불릿/번호 접두 문단(❍/`- `/❶/`n) `, 들여쓰기는
-//! 전용 문단 모양), 줄바꿈 → CharCtrl(10).
+//! 매핑: 헤딩 → "개요 N" 스타일, 굵게/기울임/취소선 → 문자 모양 변형,
+//! GFM 표 → Table 컨트롤, 순서·글머리 목록 → 머리(NUMBER/BULLET) 문단,
+//! 각주/미주(`[^N]`/`[^eN]`) → fn/en 컨트롤, 줄바꿈 → CharCtrl(10).
 //!
-//! 스타일 사다리(GI-2 해소): RISE 보고서 표본(fixtures/samples/report-tables.hwpx)의
-//! 리터럴 마커 + 행잉 인덴트 방식을 따른다 — 네이티브 BULLET/NUMBERING 정의는 만들지
-//! 않는다(hwp5 writer는 RawEntry 없는 정의를 합성하지 못해 dangling ref가 되므로).
+//! 내보내기(markdown.rs)와의 대칭이 왕복 폐쇄의 기준이다:
+//! - 취소선: 내보내기가 `CharShape.strike`를 읽으므로 strike=true 전용 문자모양을 만든다.
+//! - 각주/미주: 내보내기가 `FOOTNOTE_ENDNOTE` ExtCtrl + `fn `/`en ` GenericControl의
+//!   `paragraph_lists`를 읽으므로 그 구조를 그대로 합성한다.
+//! - 목록: 내보내기가 `ParaShape.head_type()/head_level()/numbering_id`와
+//!   `numbering_levels`/`bullet_chars`로 마커를 그리므로 그 정의를 만든다.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use hwp_model::{
-    BorderFill, BorderFillId, BorderLine, Cell, CharShape, CharShapeId, Control, DocMeta, Document,
-    FaceName, HwpChar, HwpUnit, LANG_COUNT, ParaShape, ParaShapeId, Paragraph, Section, Style,
-    StyleId, Table,
+    BinRef, BinStream, BorderFill, BorderFillId, BorderLine, Cell, CharShape, CharShapeId, Control,
+    DocMeta, Document, FaceName, GenericControl, HwpChar, HwpUnit, LANG_COUNT, NumLevel, ParaShape,
+    ParaShapeId, Paragraph, ParagraphList, Picture, Section, Style, StyleId, Table, ctrl_char,
 };
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+
+/// default_header가 만드는 기본 문단 모양 개수(인덱스 0~4). 목록용 문단 모양은
+/// 이 뒤(5~)에 붙는다.
+const BASE_PARA_SHAPES: u16 = 5;
+
+/// markdown 들여오기 옵션.
+#[derive(Default)]
+pub struct MarkdownImportOptions<'a> {
+    /// 상대 경로 이미지(`![](fig.png)`)를 해석할 기준 디렉터리(md 파일의 위치).
+    /// `None`이면 상대 경로 이미지는 경고 후 alt 텍스트만 보존한다(절대 경로는 그대로 시도).
+    pub base_dir: Option<&'a Path>,
+}
 
 /// 문자 모양 ID 배치 (default_header와 일치해야 함).
 mod shapes {
@@ -25,29 +43,17 @@ mod shapes {
     pub const HEADING_BASE: u16 = 4;
     /// 하이퍼링크 표시 텍스트(파랑 + 밑줄)
     pub const HYPERLINK: u16 = 10;
+    /// 취소선 조합(본문/굵게/기울임/굵게+기울임 + strike) → 11~14
+    pub const STRIKE: u16 = 11;
+    pub const BOLD_STRIKE: u16 = 12;
+    pub const ITALIC_STRIKE: u16 = 13;
+    pub const BOLD_ITALIC_STRIKE: u16 = 14;
+    /// 인라인 코드(함초롬돋움 + 연회색 음영) → 15
+    pub const CODE: u16 = 15;
 }
 
-/// 문단 모양 ID 배치 (default_header의 para_shapes와 일치해야 함).
-mod para {
-    /// 기본·표 셀(양쪽, 간격 없음)
-    pub const CELL: u16 = 0;
-    /// 제목(왼쪽 + 위/아래 간격) — H1, H4~H6
-    pub const HEADING: u16 = 1;
-    /// 본문(양쪽 + 아래 간격)
-    pub const BODY: u16 = 2;
-    /// 인용문(왼쪽 들여 + 좌측 막대)
-    pub const QUOTE: u16 = 3;
-    /// 코드블록(좌우 들여 + 회색 배경)
-    pub const CODE: u16 = 4;
-    /// 절 번호 제목 — H2/H3 (왼쪽 들여 2000)
-    pub const SECTION: u16 = 5;
-    /// 불릿 수준 1 — `❍ ` (왼쪽 8000 / 내어쓰기 −2400, 추정치)
-    pub const BULLET1: u16 = 6;
-    /// 불릿/번호 수준 2+ — `- `, `n) ` (왼쪽 6000 / 내어쓰기 −8548, 표본 paraPr43/44×2)
-    pub const BULLET2: u16 = 7;
-    /// 원형 번호 수준 1 — `❶ ` (왼쪽 9200 / 내어쓰기 −6076, 표본 paraPr46×2)
-    pub const NUMBERED: u16 = 8;
-}
+/// default_header 글꼴 테이블의 함초롬돋움 인덱스(인라인 코드용). 함초롬바탕=0.
+const FONT_DOTUM: u16 = 1;
 
 /// 테두리/배경 ID 배치: 1·2 = 무테두리(기본/참조용), 3 = 실선 0.12mm.
 const TABLE_BORDER_FILL: u16 = 3;
@@ -62,15 +68,27 @@ pub fn default_header() -> hwp_model::DocHeader {
     let h = |factor: i32| (body * factor) / 100;
     let mut header = hwp_model::DocHeader::default();
     for slot in 0..LANG_COUNT {
-        header.fonts[slot] = vec![FaceName {
-            name: "함초롬바탕".to_string(),
-            // 한글 무결성 검사는 글꼴 대체를 위해 기본 글꼴 이름(attr bit5, 0x20)을 기대한다.
-            // 정상 표본 hello_world.hwp 의 '함초롬바탕'은 default_name="HCR Batang", attr=0x21.
-            // attr 하위 0x01 = 글꼴 유형 TTF(표 20). emit_face_name 이 0x20 비트를 자동 OR 한다.
-            attr: 0x01,
-            default_name: Some("HCR Batang".to_string()),
-            ..FaceName::default()
-        }];
+        header.fonts[slot] = vec![
+            FaceName {
+                name: "함초롬바탕".to_string(),
+                // 한글 무결성 검사는 글꼴 대체를 위해 기본 글꼴 이름(attr bit5, 0x20)을 기대한다.
+                // 정상 표본 hello_world.hwp 의 '함초롬바탕'은 default_name="HCR Batang", attr=0x21.
+                // attr 하위 0x01 = 글꼴 유형 TTF(표 20). emit_face_name 이 0x20 비트를 자동 OR 한다.
+                attr: 0x01,
+                default_name: Some("HCR Batang".to_string()),
+                ..FaceName::default()
+            },
+            // 인덱스 1 = 함초롬돋움(고딕/산세리프) — 인라인 코드용. 번들 fonts/의 HCRDotum으로
+            // 렌더러도 실제 글리프를 그린다. 두 writer(hwp5 emit_face_name 루프·hwpx
+            // write_fontfaces)가 슬롯별 fonts 전체를 방출하고 ID_MAPPINGS 카운트도 len으로 유도돼
+            // 정합한다.
+            FaceName {
+                name: "함초롬돋움".to_string(),
+                attr: 0x01,
+                default_name: Some("HCR Dotum".to_string()),
+                ..FaceName::default()
+            },
+        ];
     }
 
     let base = CharShape {
@@ -114,6 +132,27 @@ pub fn default_header() -> hwp_model::DocHeader {
             ..base.clone()
         },
     ];
+    // 11~14 취소선 조합. 내보내기(markdown.rs)는 CharShape.strike(명시 플래그)로
+    // 취소선을 감지하므로, `~~`가 왕복하려면 strike=true 전용 문자모양이 필요하다.
+    // hwp5는 strike를 바이트로 쓰지 않아(무영향), hwpx는 <hh:strikeout SOLID>로 방출.
+    let cs_strike = |bold: bool, italic: bool| CharShape {
+        base_size: body,
+        attr: u32::from(bold) << 1 | u32::from(italic),
+        strike: true,
+        ..base.clone()
+    };
+    header.char_shapes.push(cs_strike(false, false)); // 11 취소선
+    header.char_shapes.push(cs_strike(true, false)); // 12 굵게+취소선
+    header.char_shapes.push(cs_strike(false, true)); // 13 기울임+취소선
+    header.char_shapes.push(cs_strike(true, true)); // 14 굵게+기울임+취소선
+    // 15 인라인 코드: 함초롬돋움(face_id=1) + 연회색 음영(0xF0F0F0). 한글은 shade_color를
+    // 글자 배경 하이라이트로 그려 코드 스팬에 회색 배경을 준다(0xFFFFFFFF='없음'과 대비).
+    header.char_shapes.push(CharShape {
+        base_size: body,
+        face_ids: [FONT_DOTUM; LANG_COUNT],
+        shade_color: 0x00F0_F0F0,
+        ..base.clone()
+    });
 
     // 탭 정의 — 한글 기본 좌/중/우 자동 탭 3개. 정상 표본(hello_world 등
     // 5.1.0.1)은 전부 이 3개를 가지며, 모든 PARA_SHAPE가 tab_def_id=0 을
@@ -182,33 +221,6 @@ pub fn default_header() -> hwp_model::DocHeader {
             border_fill_id: 5,
             spacing_top: 300,
             spacing_bottom: 300,
-            ..base_para.clone()
-        },
-        // ── 스타일 사다리(RISE 보고서 표본, fixtures/samples/report-tables.hwpx) ──
-        // 전부 리터럴 마커 + 행잉 인덴트 — head_type 비트(attr1 bit23~27)는 건드리지
-        // 않는다(네이티브 BULLET/NUMBERING 정의를 만들지 않으므로 dangling ref 방지).
-        // 5 절 번호 제목(H2/H3): 왼쪽 들여 1000(HWPUNIT)×2. 표본 ps40 계열.
-        ParaShape {
-            margin_left: 2000,
-            ..base_para.clone()
-        },
-        // 6 불릿 수준 1 (`❍ `): 표본 ps34(left 4000×2). intent는 표본 부재 추정치.
-        // ponytail: intent −2400은 −1200×2 추정 — 실기에서 행잉 깊이 확인 필요.
-        ParaShape {
-            margin_left: 8000,
-            indent: -2400,
-            ..base_para.clone()
-        },
-        // 7 불릿/번호 수준 2+ (`- `, `n) `): 표본 ps43/44(left 3000, intent −4274)×2.
-        ParaShape {
-            margin_left: 6000,
-            indent: -8548,
-            ..base_para.clone()
-        },
-        // 8 원형 번호 수준 1 (`❶ `): 표본 ps46(left 4600, intent −3038)×2.
-        ParaShape {
-            margin_left: 9200,
-            indent: -6076,
             ..base_para
         },
     ];
@@ -283,17 +295,40 @@ pub fn default_header() -> hwp_model::DocHeader {
     header
 }
 
-/// markdown 텍스트를 문서로 변환한다.
+/// markdown 텍스트를 문서로 변환한다(기존 시그니처 — 상대 경로 이미지는 경고 후 alt 보존).
 pub fn from_markdown(md: &str) -> Document {
+    from_markdown_with(md, &MarkdownImportOptions::default())
+}
+
+/// 옵션을 받는 변형. `base_dir` 지정 시 상대 경로 이미지(`![](fig.png)`)를 임베드한다.
+/// 원격 URL·없는 파일·미지원 포맷은 경고(stderr) 후 alt 텍스트만 본문에 보존한다.
+pub fn from_markdown_with(md: &str, opts: &MarkdownImportOptions) -> Document {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
-    let parser = Parser::new_ext(md, options);
+    // 취소선(`~~`)·각주(`[^N]`)를 파싱한다. 작업목록(TASKLISTS)은 대응 IR 의미가 없어 제외.
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    // 각주 참조 시점에 정의 본문이 필요하므로 이벤트를 한 번에 모아 두 번 훑는다.
+    let events: Vec<Event> = Parser::new_ext(md, options).collect();
 
-    let mut b = Builder::default();
-    for event in parser {
-        b.event(event);
+    // 1) 각주/미주 정의 본문을 미리 렌더한다(참조에서 재사용).
+    let note_bodies = collect_note_bodies(&events);
+
+    // 2) 본문 처리.
+    let mut b = Builder {
+        note_bodies,
+        base_dir: opts.base_dir.map(Path::to_path_buf),
+        ..Builder::default()
+    };
+    for event in &events {
+        b.event(event.clone());
     }
     b.flush_paragraph();
+
+    // 이미지 실패 등 경고는 stderr로 남긴다(문서 생성 자체는 성공한다).
+    for w in &b.warnings {
+        eprintln!("경고: {w}");
+    }
 
     if b.paragraphs.is_empty() {
         // 빈 문서도 문단 하나로 닫는다. 문단끝 문자는 writer가 보장한다.
@@ -301,18 +336,91 @@ pub fn from_markdown(md: &str) -> Document {
     }
     // 첫 문단에 구역/단 정의 주입 — hwp5/한글 호환의 전제 조건
     inject_section_controls(&mut b.paragraphs[0]);
+
+    // 목록에서 만든 문단 모양·번호/글머리 정의를 헤더에 합친다.
+    let mut header = default_header();
+    header.para_shapes.extend(b.extra_para_shapes);
+    header.numbering_levels = b.numbering_levels;
+    header.bullet_chars = b.bullet_chars;
+
     Document {
         meta: DocMeta {
             source_format: "markdown".to_string(),
             source_version: String::new(),
         },
         metadata: Default::default(),
-        header: default_header(),
+        header,
         sections: vec![Section {
             paragraphs: b.paragraphs,
             extras: Vec::new(),
         }],
-        bin_streams: Vec::new(),
+        bin_streams: b.bin_streams,
+        hwpx_settings_xml: None,
+        hwpx_version_xml: None,
+    }
+}
+
+/// 각주/미주 라벨이 미주(`eN`)인지 — 내보내기가 미주를 `[^eN]`으로 쓰는 규약과 대칭.
+fn is_endnote_label(label: &str) -> bool {
+    label
+        .strip_prefix('e')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// 각주/미주 정의(`[^N]: 본문`) 블록을 라벨→본문 문단으로 미리 렌더한다.
+/// 참조(`[^N]`)가 정의보다 먼저 등장할 수 있어 선수집이 필요하다.
+fn collect_note_bodies(events: &[Event]) -> HashMap<String, Vec<Paragraph>> {
+    let mut map = HashMap::new();
+    let mut i = 0;
+    while i < events.len() {
+        let Event::Start(Tag::FootnoteDefinition(label)) = &events[i] else {
+            i += 1;
+            continue;
+        };
+        // 대응하는 End까지의 내부 이벤트를 추린다(정의는 중첩되지 않지만 깊이로 방어).
+        let mut depth = 1usize;
+        let start = i + 1;
+        let mut j = start;
+        while j < events.len() {
+            match &events[j] {
+                Event::Start(Tag::FootnoteDefinition(_)) => depth += 1,
+                Event::End(TagEnd::FootnoteDefinition) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let mut sub = Builder::default();
+        for ev in &events[start..j] {
+            sub.event(ev.clone());
+        }
+        sub.flush_paragraph();
+        let mut body = sub.paragraphs;
+        if body.is_empty() {
+            body.push(note_body_para());
+        }
+        // 각주 본문은 목록 문단모양(합쳐지지 않는 서브빌더 산출)을 참조할 수 없으므로
+        // 기본 본문 모양으로 되돌린다(각주 안 목록은 v1 미지원 — 텍스트만 보존).
+        for p in &mut body {
+            if p.para_shape.0 >= BASE_PARA_SHAPES {
+                p.para_shape = ParaShapeId(2);
+            }
+        }
+        map.insert(label.to_string(), body);
+        i = j + 1;
+    }
+    map
+}
+
+/// 빈 각주/미주 본문 문단(문자 모양 run 1개 필수 불변식 충족).
+fn note_body_para() -> Paragraph {
+    Paragraph {
+        char_shape_runs: vec![(0, CharShapeId(0))],
+        ..Paragraph::default()
     }
 }
 
@@ -327,19 +435,42 @@ struct Builder {
     style: u16,
     bold: bool,
     italic: bool,
+    strike: bool,              // 취소선 구간(`~~`)
+    in_code: bool,             // 인라인 코드 구간(`code` — 함초롬돋움+음영)
     in_link: bool,             // 하이퍼링크 표시 텍스트 구간(파랑+밑줄)
     link_end: Option<HwpChar>, // 링크 종료 시 방출할 FIELD_END 문자
     in_blockquote: u32,        // 인용문 중첩 깊이(>0이면 인용 문단)
     in_codeblock: bool,        // 코드블록 구간(회색 배경 문단)
     heading: Option<u16>,      // 1..=6
-    /// H1~H3 절 번호 접두(헤딩 시작 시 계산, 텍스트가 숫자로 시작하면 폐기).
-    pending_heading_num: Option<String>,
-    /// 절 번호 카운터 [H1, H2, H3].
+    // H1~H3 절 번호 사다리(1. / 1-1. / 1-1-1.) — 보고서 표준. 제목이 숫자로
+    // 시작하면 접두를 생략한다(이중 번호 방지).
     h_counters: [u32; 3],
+    pending_heading_num: Option<String>,
+    section_para_shape: Option<u16>, // H2/H3 들여쓰기(left 2000) 문단모양 인덱스
     // 표 수집 상태
     table: Option<TableBuilder>,
-    /// 목록 스택: None=불릿, Some(다음 항목 번호)=번호 목록. 깊이 = len - 1.
-    list_stack: Vec<Option<u64>>,
+    // 목록 상태 — 수준별 프레임 스택(중첩), 항목 문단에 머리 문단모양을 부여.
+    list_stack: Vec<ListFrame>,
+    // 목록에서 만든 문단 모양(헤더 인덱스 BASE_PARA_SHAPES~)·번호/글머리 정의(0~).
+    extra_para_shapes: Vec<ParaShape>,
+    numbering_levels: Vec<Vec<NumLevel>>,
+    bullet_chars: Vec<char>,
+    // 각주/미주: 선수집한 정의 본문(라벨→문단) + 정의 블록 건너뛰기 깊이.
+    note_bodies: HashMap<String, Vec<Paragraph>>,
+    skip_note_def: u32,
+    // 이미지: 상대 경로 기준 디렉터리 + 임베드한 바이너리 + 경고 + alt 억제 상태.
+    base_dir: Option<PathBuf>,
+    bin_streams: Vec<BinStream>,
+    warnings: Vec<String>,
+    in_image_suppress: bool, // 이미지 임베드 성공 시 alt 텍스트를 억제
+}
+
+/// 목록 한 수준(프레임). `Start(List)`마다 하나 생기고 항목이 이 머리 문단모양을 쓴다.
+struct ListFrame {
+    /// 이 목록 항목 문단이 참조할 문단 모양 인덱스.
+    para_shape_id: u16,
+    /// 지금 이 수준의 항목이 열려 있는지(문단 flush 시 머리 부여 여부).
+    item_open: bool,
 }
 
 #[derive(Default)]
@@ -351,17 +482,25 @@ struct TableBuilder {
 
 impl Builder {
     fn current_shape(&self) -> u16 {
+        // 인라인 코드는 함초롬돋움+음영으로 다른 서식을 지배한다(가장 우선).
+        if self.in_code {
+            return shapes::CODE;
+        }
         if self.in_link {
             return shapes::HYPERLINK;
         }
         if let Some(level) = self.heading {
             return shapes::HEADING_BASE + level - 1;
         }
-        match (self.bold, self.italic) {
-            (false, false) => shapes::NORMAL,
-            (true, false) => shapes::BOLD,
-            (false, true) => shapes::ITALIC,
-            (true, true) => shapes::BOLD_ITALIC,
+        match (self.bold, self.italic, self.strike) {
+            (false, false, false) => shapes::NORMAL,
+            (true, false, false) => shapes::BOLD,
+            (false, true, false) => shapes::ITALIC,
+            (true, true, false) => shapes::BOLD_ITALIC,
+            (false, false, true) => shapes::STRIKE,
+            (true, false, true) => shapes::BOLD_STRIKE,
+            (false, true, true) => shapes::ITALIC_STRIKE,
+            (true, true, true) => shapes::BOLD_ITALIC_STRIKE,
         }
     }
 
@@ -371,8 +510,26 @@ impl Builder {
             self.runs.push((self.wchar_pos, shape));
         }
         for c in text.chars() {
-            self.wchar_pos += c.len_utf16() as u32;
-            self.chars.push(HwpChar::Text(c));
+            match c {
+                // 탭: HWP는 코드 9를 8 WCHAR 인라인 컨트롤로 저장한다(§3.2.3 표 6).
+                // Text('\t')(1 WCHAR)로 적재하면 hwp5 PARA_TEXT/hwpx <hp:t>가 모두
+                // 깨지므로 IR 불변식대로 InlineCtrl로 분리 적재한다.
+                '\t' => {
+                    self.wchar_pos += 8;
+                    self.chars.push(HwpChar::InlineCtrl {
+                        code: hwp_model::ctrl_char::TAB,
+                        payload: vec![0; 12],
+                    });
+                }
+                // 그 외 C0 제어문자(0x00~0x1F)는 문서를 깨뜨릴 수 있어 드롭한다. markdown의
+                // 줄바꿈은 SoftBreak/HardBreak 이벤트로 따로 처리되므로 여기 Text에는
+                // 정상 텍스트만 남는다(코드블록의 개행도 push_code_text가 CharCtrl로 분리).
+                c if (c as u32) < 0x20 => {}
+                c => {
+                    self.wchar_pos += c.len_utf16() as u32;
+                    self.chars.push(HwpChar::Text(c));
+                }
+            }
         }
     }
 
@@ -416,30 +573,26 @@ impl Builder {
         if runs.is_empty() {
             runs.push((0, CharShapeId(self.current_shape())));
         }
-        // 코드블록→4(회색 배경), 인용→3(들여쓰기+막대), 제목→1(H2/H3은 5), 표 셀→0,
-        // 목록 항목→6/7/8(종류·깊이별), 본문→2.
-        let para_shape = if self.in_codeblock {
-            para::CODE
+        // 목록 항목이 열려 있으면 머리(NUMBER/BULLET) 문단모양을 우선한다.
+        // 그 외: 코드블록→4(회색 배경), 인용→3(들여쓰기+막대), 제목→1,
+        // 표 셀→0(간격 없음), 본문→2.
+        let para_shape = if let Some(id) = self.active_list_para_shape() {
+            id
+        } else if self.in_codeblock {
+            4
         } else if self.in_blockquote > 0 {
-            para::QUOTE
-        } else if let Some(hn) = self.heading {
-            if (2..=3).contains(&hn) {
-                para::SECTION
+            3
+        } else if let Some(h) = self.heading {
+            // H2/H3는 들여쓰기(SECTION) 문단모양, 그 외 제목은 기본 제목 모양.
+            if (2..=3).contains(&h) {
+                self.section_para_shape.unwrap_or(1)
             } else {
-                para::HEADING
+                1
             }
         } else if self.table.is_some() {
-            para::CELL
-        } else if let Some(kind) = self.list_stack.last() {
-            let depth = self.list_stack.len() - 1;
-            match (kind, depth) {
-                (None, 0) => para::BULLET1,
-                (None, _) => para::BULLET2,
-                (Some(_), 0) => para::NUMBERED,
-                (Some(_), _) => para::BULLET2,
-            }
+            0
         } else {
-            para::BODY
+            2
         };
         let mut para = Paragraph {
             para_shape: ParaShapeId(para_shape),
@@ -458,35 +611,241 @@ impl Builder {
         }
     }
 
+    /// 지금 열려 있는 목록 항목의 머리 문단모양(없으면 None).
+    fn active_list_para_shape(&self) -> Option<u16> {
+        self.list_stack
+            .last()
+            .filter(|f| f.item_open)
+            .map(|f| f.para_shape_id)
+    }
+
+    /// 목록 진입 — 상위 항목 문단을 닫고 이 수준의 머리 문단모양·정의를 만든다.
+    fn start_list(&mut self, start: Option<u64>) {
+        // 상위 항목의 문단(예: 중첩 앞 "second")을 먼저 닫는다.
+        self.flush_paragraph();
+        let level = (self.list_stack.len() as u16 + 1).min(7);
+        let para_shape_id = match start {
+            // 순서 목록: 번호 정의(내보내기가 numbering_levels로 마커 그림) + NUMBER 머리.
+            Some(s) => {
+                let def_id = self.numbering_levels.len() as u16;
+                let mut levels = vec![NumLevel::default(); 7];
+                // 이 목록 수준의 시작 번호를 보존한다(내보내기가 start를 반영).
+                levels[(level as usize - 1).min(6)].start = s.max(1) as u32;
+                self.numbering_levels.push(levels);
+                self.push_list_para_shape(2, level, def_id)
+            }
+            // 글머리표 목록: 불릿 문자 + BULLET 머리.
+            None => {
+                let def_id = self.bullet_chars.len() as u16;
+                self.bullet_chars.push('•');
+                self.push_list_para_shape(3, level, def_id)
+            }
+        };
+        self.list_stack.push(ListFrame {
+            para_shape_id,
+            item_open: false,
+        });
+    }
+
+    fn end_list(&mut self) {
+        self.flush_paragraph();
+        self.list_stack.pop();
+    }
+
+    /// 목록 항목용 문단 모양을 만들어 인덱스를 돌려준다.
+    /// head_type: 2=번호, 3=글머리표. level 1~7 → 머리 수준(내보내기가 중첩 감지에 사용).
+    fn push_list_para_shape(&mut self, head_type: u32, level: u16, def_id: u16) -> u16 {
+        let idx = BASE_PARA_SHAPES + self.extra_para_shapes.len() as u16;
+        // 수준당 들여쓰기(HWPUNIT) — 한글에서 중첩이 눈에 띄게. 내보내기의 중첩 감지는
+        // head_level 기준이라 왕복 폐쇄에는 무영향(여백은 실기 표시용).
+        let step = 2000i32;
+        self.extra_para_shapes.push(ParaShape {
+            // 정상 본문 문단모양(0x180: 한글 줄나눔+줄격자) + 왼쪽 정렬 + 머리 종류/수준.
+            attr1: 0x180 | (1 << 2) | (head_type << 23) | (u32::from(level) << 25),
+            margin_left: i32::from(level) * step,
+            indent: -step, // 내어쓰기: 마커와 본문 정렬
+            line_spacing_old: 160,
+            line_spacing: 160,
+            border_fill_id: 2,
+            numbering_id: def_id,
+            ..ParaShape::default()
+        });
+        idx
+    }
+
+    /// 각주/미주 참조를 현재 문단에 심는다 — FOOTNOTE_ENDNOTE ExtCtrl(앵커) +
+    /// fn/en GenericControl(본문 문단 리스트). 내보내기가 이 구조를 읽어 `[^N]`을 낸다.
+    fn push_footnote(&mut self, label: &str) {
+        let ctrl_id = if is_endnote_label(label) {
+            *b"en  "
+        } else {
+            *b"fn  "
+        };
+        let body = self
+            .note_bodies
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| vec![note_body_para()]);
+        // 앵커: ExtCtrl(code 17). payload 12B 앞 4B = 역순 ctrl_id(다른 앵커와 동일 규약).
+        let mut payload = vec![0u8; 12];
+        let mut rev = ctrl_id;
+        rev.reverse();
+        payload[..4].copy_from_slice(&rev);
+        let idx = self.controls.len() as u32;
+        self.chars.push(HwpChar::ExtCtrl {
+            code: ctrl_char::FOOTNOTE_ENDNOTE,
+            ctrl_id,
+            payload,
+            ctrl_index: Some(idx), // flush의 relink_ctrl_index가 최종 재배치
+        });
+        self.wchar_pos += 8;
+        self.controls.push(Control::Generic(GenericControl {
+            ctrl_id,
+            data: Vec::new(),
+            paragraph_lists: vec![ParagraphList {
+                header_data: Vec::new(),
+                paragraphs: body,
+            }],
+            extras: Vec::new(),
+            raw_children: Vec::new(),
+            gso_shapes: Vec::new(),
+            equation: None,
+            column_def: None,
+        }));
+    }
+
+    /// 이미지 참조를 현재 문단에 임베드한다 — 로컬 파일이면 BinStream + 인라인 Picture(글자처럼,
+    /// 자연 크기)로 삽입하고 alt를 억제, 실패면(원격/없음/미지원) 경고 후 alt 텍스트를 남긴다.
+    fn start_image(&mut self, dest_url: &str) {
+        match self.load_image(dest_url) {
+            Ok((data, name, w, h)) => {
+                let idx = self.controls.len() as u32;
+                self.controls.push(Control::Picture(Picture {
+                    common_data: Vec::new(),
+                    width: HwpUnit(w.max(1)),
+                    height: HwpUnit(h.max(1)),
+                    treat_as_char: true, // 인라인(글자처럼) 배치 — writer가 도형 레코드 합성
+                    z_order: 0,
+                    vert_offset: 0,
+                    horz_offset: 0,
+                    bin_ref: BinRef::ItemRef(name.clone()),
+                    extras: Vec::new(),
+                }));
+                // gso 앵커 문자(code 11) — insert_image와 동일 규약. relink가 ctrl_index 재배치.
+                self.chars.push(HwpChar::ExtCtrl {
+                    code: 11,
+                    ctrl_id: *b"gso ",
+                    payload: crate::field::rev_payload(b"gso "),
+                    ctrl_index: Some(idx),
+                });
+                self.wchar_pos += 8;
+                self.bin_streams.push(BinStream { name, data });
+                self.in_image_suppress = true;
+            }
+            Err(warn) => {
+                self.warnings.push(warn);
+                self.in_image_suppress = false; // alt 텍스트를 폴백으로 보존
+            }
+        }
+    }
+
+    /// 이미지 경로를 해석·판독한다. 성공 시 (바이트, bin 이름, 표시폭, 표시높이).
+    /// 로컬 경로(절대 + base_dir 기준 상대)만 허용 — 원격 URL은 네트워크 의존 금지.
+    fn load_image(&self, dest_url: &str) -> Result<(Vec<u8>, String, i32, i32), String> {
+        let lower = dest_url.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return Err(format!("원격 이미지 URL은 지원하지 않습니다(alt 보존): {dest_url}"));
+        }
+        // file: 스킴 접두는 벗겨서 로컬 경로로 다룬다.
+        let raw = dest_url.strip_prefix("file://").unwrap_or(dest_url);
+        let path = Path::new(raw);
+        let resolved: PathBuf = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match &self.base_dir {
+                Some(dir) => dir.join(path),
+                None => {
+                    return Err(format!(
+                        "상대 경로 이미지의 기준 디렉터리를 알 수 없습니다(alt 보존): {dest_url}"
+                    ));
+                }
+            }
+        };
+        let data = std::fs::read(&resolved)
+            .map_err(|e| format!("이미지 읽기 실패 {}: {e} (alt 보존)", resolved.display()))?;
+        if data.is_empty() {
+            return Err(format!("빈 이미지 파일(alt 보존): {}", resolved.display()));
+        }
+        // 매직 바이트로 포맷 판별 — 미지(.bin)면 미지원으로 처리(alt 보존).
+        let (ext, _) = crate::image::image_kind(&data);
+        if ext == "bin" {
+            return Err(format!(
+                "지원하지 않는 이미지 형식(alt 보존): {}",
+                resolved.display()
+            ));
+        }
+        let (w, h) = crate::image::display_size(&data, &crate::image::ImageSize::Natural, BODY_WIDTH);
+        let name = format!("md_image{}.{ext}", self.bin_streams.len() + 1);
+        Ok((data, name, w, h))
+    }
+
     fn event(&mut self, event: Event<'_>) {
+        // 각주/미주 정의 블록은 collect_note_bodies가 선수집했으므로 본문에서 건너뛴다
+        // (깊이만 추적). skip 중에는 다른 이벤트를 무시한다.
+        if let Event::Start(Tag::FootnoteDefinition(_)) = &event {
+            self.skip_note_def += 1;
+            return;
+        }
+        if let Event::End(TagEnd::FootnoteDefinition) = &event {
+            self.skip_note_def = self.skip_note_def.saturating_sub(1);
+            return;
+        }
+        if self.skip_note_def > 0 {
+            return;
+        }
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
                 self.flush_paragraph();
                 let n = heading_level(level);
                 self.heading = Some(n);
                 self.style = n; // 개요 N 스타일
-                // H1~H3 절 번호 접두 (H4~H6은 번호 없음 — 사다리 외).
-                if (1..=3).contains(&n) {
+                // H1~H3 절 번호 계산: 해당 수준 +1, 하위 0 리셋, 0인 상위는 1로 승격.
+                self.pending_heading_num = if n <= 3 {
                     let i = (n - 1) as usize;
                     self.h_counters[i] += 1;
                     for c in &mut self.h_counters[i + 1..] {
                         *c = 0;
                     }
-                    self.pending_heading_num = Some(match n {
-                        1 => format!("{}. ", self.h_counters[0]),
-                        2 => format!("{}-{}. ", self.h_counters[0], self.h_counters[1]),
-                        _ => format!(
-                            "{}-{}-{}. ",
-                            self.h_counters[0], self.h_counters[1], self.h_counters[2]
-                        ),
+                    for c in &mut self.h_counters[..i] {
+                        if *c == 0 {
+                            *c = 1;
+                        }
+                    }
+                    let nums: Vec<String> =
+                        self.h_counters[..=i].iter().map(u32::to_string).collect();
+                    Some(format!("{}. ", nums.join("-")))
+                } else {
+                    None
+                };
+                // H2/H3 들여쓰기 문단모양(1회 할당).
+                if (2..=3).contains(&n) && self.section_para_shape.is_none() {
+                    let idx = BASE_PARA_SHAPES + self.extra_para_shapes.len() as u16;
+                    self.extra_para_shapes.push(ParaShape {
+                        attr1: 0x180 | (1 << 2),
+                        margin_left: 2000,
+                        line_spacing_old: 160,
+                        line_spacing: 160,
+                        border_fill_id: 2,
+                        ..ParaShape::default()
                     });
+                    self.section_para_shape = Some(idx);
                 }
             }
             Event::End(TagEnd::Heading(_)) => {
                 self.flush_paragraph();
                 self.heading = None;
-                self.pending_heading_num = None;
                 self.style = 0;
+                self.pending_heading_num = None;
             }
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => self.flush_paragraph(),
@@ -494,21 +853,35 @@ impl Builder {
             Event::End(TagEnd::Strong) => self.bold = false,
             Event::Start(Tag::Emphasis) => self.italic = true,
             Event::End(TagEnd::Emphasis) => self.italic = false,
+            Event::Start(Tag::Strikethrough) => self.strike = true,
+            Event::End(TagEnd::Strikethrough) => self.strike = false,
             Event::Text(t) => {
-                // 절 번호 접두는 첫 텍스트에서 확정한다 — 텍스트가 이미 숫자로
-                // 시작하면(예: "1. 기존 번호") 이중 번호가 되므로 붙이지 않는다.
-                if let Some(prefix) = self.pending_heading_num.take()
+                // 절 번호 접두: 제목 첫 텍스트 앞에 삽입(숫자 시작 제목은 생략).
+                if self.heading.is_some()
+                    && let Some(num) = self.pending_heading_num.take()
                     && !t.starts_with(|c: char| c.is_ascii_digit())
                 {
-                    self.push_text(&prefix);
+                    self.push_text(&num);
                 }
-                if self.in_codeblock {
+                if self.in_image_suppress {
+                    // 이미지 임베드 성공 → alt 텍스트 억제(그림이 대체한다).
+                } else if self.in_codeblock {
                     self.push_code_text(&t); // 코드블록 텍스트의 \n → 줄바꿈
                 } else {
                     self.push_text(&t);
                 }
             }
-            Event::Code(t) => self.push_text(&t),
+            // ── 인라인 코드(`code`) → 함초롬돋움+음영 글자모양 run ──
+            Event::Code(t) => {
+                self.in_code = true;
+                self.push_text(&t);
+                self.in_code = false;
+            }
+            // ── 이미지(`![alt](경로)`) → 인라인 Picture + BinStream (로컬 경로만) ──
+            Event::Start(Tag::Image { dest_url, .. }) => self.start_image(&dest_url),
+            Event::End(TagEnd::Image) => self.in_image_suppress = false,
+            // ── 각주/미주 참조(`[^N]`/`[^eN]`) → FOOTNOTE_ENDNOTE ExtCtrl + fn/en 컨트롤 ──
+            Event::FootnoteReference(label) => self.push_footnote(&label),
             // ── 하이퍼링크: [텍스트](url) → %hlk 필드(FIELD_START + 파랑밑줄 텍스트 + FIELD_END) ──
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let (start, _end, control) = crate::field::hyperlink_field_parts(&dest_url);
@@ -548,38 +921,20 @@ impl Builder {
                 self.flush_paragraph();
                 self.in_codeblock = false;
             }
-            // ── 목록: 종류별 리터럴 마커 + 수준별 전용 문단 모양 (GI-2) ──
-            // Start(List)에서 flush — 중첩 타이트 리스트가 한 문단으로 뭉치는 것을 막는다.
-            Event::Start(Tag::List(start)) => {
-                self.flush_paragraph();
-                self.list_stack.push(start);
-            }
-            Event::End(TagEnd::List(_)) => {
-                self.flush_paragraph();
-                self.list_stack.pop();
-            }
+            // ── 순서/글머리 목록 → 머리(NUMBER/BULLET) 문단, 중첩은 수준으로 ──
+            Event::Start(Tag::List(start)) => self.start_list(start),
+            Event::End(TagEnd::List(_)) => self.end_list(),
             Event::Start(Tag::Item) => {
-                self.flush_paragraph();
-                // 마커는 항목 시작에서 즉시 방출한다(문단 시작 이벤트 유무와 무관).
-                let depth = self.list_stack.len().saturating_sub(1);
-                let marker = match self.list_stack.last_mut() {
-                    Some(Some(n)) => {
-                        let m = if depth == 0 {
-                            circled_marker(*n)
-                        } else {
-                            format!("{n}) ")
-                        };
-                        *n += 1;
-                        m
-                    }
-                    Some(None) => (if depth == 0 { "❍ " } else { "- " }).to_string(),
-                    None => String::new(),
-                };
-                if !marker.is_empty() {
-                    self.push_text(&marker);
+                if let Some(f) = self.list_stack.last_mut() {
+                    f.item_open = true;
                 }
             }
-            Event::End(TagEnd::Item) => self.flush_paragraph(),
+            Event::End(TagEnd::Item) => {
+                self.flush_paragraph();
+                if let Some(f) = self.list_stack.last_mut() {
+                    f.item_open = false;
+                }
+            }
             // ── GFM 표 ──
             Event::Start(Tag::Table(_)) => {
                 self.flush_paragraph();
@@ -631,16 +986,6 @@ fn heading_level(level: HeadingLevel) -> u16 {
         HeadingLevel::H4 => 4,
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
-    }
-}
-
-/// 번호 목록 수준 1 마커: 1~9는 원형 숫자(❶~❾), 10 이상은 "N. ".
-fn circled_marker(n: u64) -> String {
-    if (1..=9).contains(&n) {
-        // ❶ = U+2776 (DINGBAT NEGATIVE CIRCLED DIGIT ONE, 세리프 계열 — 표본과 동일).
-        char::from_u32(0x2775 + n as u32).map_or_else(|| format!("{n}. "), |c| format!("{c} "))
-    } else {
-        format!("{n}. ")
     }
 }
 
@@ -698,7 +1043,10 @@ fn inject_section_controls(para: &mut Paragraph) {
             data: Vec::new(),
             page: Some(page),
             extras: Vec::new(),
-            hwpx_raw: None,
+            secpr_raw_children: Vec::new(),
+            footnote_shape_raw: None,
+            endnote_shape_raw: None,
+            page_border_fills_raw: Vec::new(),
         }),
     );
     para.controls.insert(
@@ -811,101 +1159,256 @@ fn table_paragraph(tb: TableBuilder) -> Paragraph {
 mod tests {
     use super::*;
 
-    fn para_text(p: &Paragraph) -> String {
-        p.chars
-            .iter()
-            .filter_map(|c| match c {
-                HwpChar::Text(ch) => Some(*ch),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn texts(doc: &Document) -> Vec<String> {
-        doc.sections[0].paragraphs.iter().map(para_text).collect()
-    }
-
     #[test]
     fn default_header_크기() {
         let h = default_header();
         assert_eq!(h.char_shapes[0].base_size, 1000); // 본문 10pt
         assert_eq!(h.char_shapes[4].base_size, 1800); // H1 = 본문 × 1.8
-        assert_eq!(h.para_shapes.len(), 9, "사다리 문단 모양 5~8 추가분");
-        // 네이티브 정의는 만들지 않는다(hwp5 dangling ref 방지).
-        assert!(h.bullets.is_empty() && h.bullet_chars.is_empty());
-        assert!(h.numberings.is_empty() && h.numbering_levels.is_empty());
-        // head_type 비트는 전부 0 (리터럴 마커 방식).
-        assert!(h.para_shapes.iter().all(|ps| ps.head_type() == 0));
     }
 
+    /// GI-1/GI-2 왕복 (a): md → IR → md 에서 각주·취소선·순서목록(start)·중첩이 보존.
     #[test]
-    fn 목록_중첩_ul_ol_마커와_문단모양() {
-        let doc = from_markdown("- 상위\n  - 하위\n1. 첫\n2. 둘\n");
-        let t = texts(&doc);
-        // 첫 문단에는 secd/cold가 주입된다(텍스트는 첫 항목).
-        assert_eq!(t[0], "❍ 상위");
-        assert_eq!(t[1], "- 하위");
-        assert_eq!(t[2], "❶ 첫");
-        assert_eq!(t[3], "❷ 둘");
-        let ps = |i: usize| doc.sections[0].paragraphs[i].para_shape.0;
-        assert_eq!(ps(0), para::BULLET1, "UL 깊이 0");
-        assert_eq!(ps(1), para::BULLET2, "UL 깊이 1");
-        assert_eq!(ps(2), para::NUMBERED, "OL 깊이 0");
+    fn 왕복_각주_취소선_순서목록_중첩() {
+        let md = "\
+문단에 각주[^1]가 있다.
+
+~~지운 글~~ 과 보통 글.
+
+1. 첫째
+2. 둘째
+   - 안쪽 가
+   - 안쪽 나
+3. 셋째
+
+[^1]: 각주 본문이다.
+";
+        let doc = from_markdown(md);
+        let out = crate::markdown::to_markdown(&doc);
+
+        // 각주: 본문 마커 + 문서 끝 정의.
+        assert!(out.contains("[^1]"), "각주 마커: {out}");
+        assert!(out.contains("[^1]: 각주 본문이다."), "각주 정의: {out}");
+        // 취소선.
+        assert!(out.contains("~~지운 글~~"), "취소선: {out}");
+        // 순서 목록(1./2./3.).
+        assert!(out.contains("1. 첫째"), "순서1: {out}");
+        assert!(out.contains("2. 둘째"), "순서2: {out}");
+        assert!(out.contains("3. 셋째"), "순서3: {out}");
+        // 중첩 글머리 목록(들여쓰기된 `-`).
+        assert!(out.contains("- 안쪽 가"), "중첩 불릿: {out}");
+        let idx = out.find("안쪽 가").unwrap();
+        let line_start = out[..idx].rfind('\n').map_or(0, |p| p + 1);
+        assert!(
+            out[line_start..idx].starts_with(' '),
+            "중첩은 들여쓰기: {out}"
+        );
     }
 
+    /// 순서 목록 start 보존: `3.`으로 시작하면 왕복 후에도 `3.`.
     #[test]
-    fn 목록_ol_시작번호와_하위수준() {
-        let doc = from_markdown("3. 세\n4. 네\n   1) 하위\n");
-        let t = texts(&doc);
-        assert_eq!(t[0], "❸ 세");
-        assert_eq!(t[1], "❹ 네");
-        assert!(t[2].starts_with("1) "), "OL 깊이 1은 n) 마커: {:?}", t[2]);
+    fn 왕복_순서목록_start_보존() {
+        let doc = from_markdown("3. 셋\n4. 넷\n");
+        let out = crate::markdown::to_markdown(&doc);
+        assert!(out.contains("3. 셋"), "start=3 보존: {out}");
+        assert!(out.contains("4. 넷"), "다음 번호: {out}");
     }
 
+    /// 미주(`[^eN]`)도 대칭 왕복.
+    #[test]
+    fn 왕복_미주() {
+        let doc = from_markdown("본문[^e1] 끝.\n\n[^e1]: 미주 본문.\n");
+        let out = crate::markdown::to_markdown(&doc);
+        assert!(out.contains("[^e1]"), "미주 마커: {out}");
+        assert!(out.contains("[^e1]: 미주 본문."), "미주 정의: {out}");
+    }
+
+    /// 각주 컨트롤이 fn GenericControl + FOOTNOTE_ENDNOTE 앵커로 합성되는지(구조 단언).
+    #[test]
+    fn 각주_컨트롤_구조() {
+        let doc = from_markdown("가[^1]나\n\n[^1]: 각주.\n");
+        let para = &doc.sections[0].paragraphs[0];
+        let has_anchor = para.chars.iter().any(|c| {
+            matches!(c, HwpChar::ExtCtrl { code, ctrl_id, .. }
+                if *code == hwp_model::ctrl_char::FOOTNOTE_ENDNOTE && ctrl_id == b"fn  ")
+        });
+        assert!(has_anchor, "각주 앵커 존재");
+        let has_ctrl = para.controls.iter().any(|c| matches!(c,
+            Control::Generic(g) if g.ctrl_id == *b"fn  " && !g.paragraph_lists.is_empty()));
+        assert!(has_ctrl, "각주 컨트롤+본문 존재");
+    }
+
+    /// 테스트용 최소 PNG(치수 헤더만) 파일을 쓰고 경로를 돌려준다.
+    fn write_png(dir: &std::path::Path, name: &str, w: u32, h: u32) -> std::path::PathBuf {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend([0, 0, 0, 13]);
+        png.extend(b"IHDR");
+        png.extend(w.to_be_bytes());
+        png.extend(h.to_be_bytes());
+        png.extend([0u8; 8]);
+        let p = dir.join(name);
+        std::fs::write(&p, &png).unwrap();
+        p
+    }
+
+    /// GI-3: 로컬 이미지 `![alt](fig.png)` → 인라인 Picture + BinStream(자연 크기).
+    #[test]
+    fn 이미지_로컬_임베드() {
+        let dir = std::env::temp_dir().join("hwp-md-img-embed");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_png(&dir, "fig.png", 96, 48);
+        let doc = from_markdown_with(
+            "본문\n\n![대체텍스트](fig.png)\n",
+            &MarkdownImportOptions {
+                base_dir: Some(&dir),
+            },
+        );
+        assert_eq!(doc.bin_streams.len(), 1, "BinStream 1개 임베드");
+        let pic = doc.sections[0]
+            .paragraphs
+            .iter()
+            .flat_map(|p| &p.controls)
+            .find_map(|c| match c {
+                Control::Picture(p) => Some(p),
+                _ => None,
+            })
+            .expect("Picture 존재");
+        assert!(pic.treat_as_char, "인라인(글자처럼) 배치");
+        assert!(pic.extras.is_empty(), "writer 합성용 빈 extras");
+        assert!(doc.resolve_bin(&pic.bin_ref).is_some(), "bin_ref 해석");
+        assert_eq!(pic.width.0, 96 * 7200 / 96, "자연 크기(96px→7200)");
+        // 성공한 이미지의 alt 텍스트는 억제된다.
+        assert!(!doc.plain_text().contains("대체텍스트"), "alt 억제");
+    }
+
+    /// GI-3: 없는 파일·원격 URL·상대경로(기준 없음)는 경고 후 alt 텍스트를 보존한다.
+    #[test]
+    fn 이미지_실패는_alt_보존() {
+        let dir = std::env::temp_dir().join("hwp-md-img-fail");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 없는 파일.
+        let d1 = from_markdown_with(
+            "![없음alt](nope.png)\n",
+            &MarkdownImportOptions {
+                base_dir: Some(&dir),
+            },
+        );
+        assert!(d1.bin_streams.is_empty(), "임베드 없음");
+        assert!(d1.plain_text().contains("없음alt"), "alt 보존");
+        // 원격 URL(네트워크 금지).
+        let d2 = from_markdown("![원격alt](https://example.com/a.png)\n");
+        assert!(d2.bin_streams.is_empty());
+        assert!(d2.plain_text().contains("원격alt"), "원격은 alt 보존");
+        // 상대경로 + 기준 디렉터리 없음.
+        let d3 = from_markdown("![상대alt](fig.png)\n");
+        assert!(d3.bin_streams.is_empty());
+        assert!(d3.plain_text().contains("상대alt"), "기준없음은 alt 보존");
+    }
+
+    /// GI-3 왕복: md(이미지)→IR→#8 exporter(media_dir) 재수출 시 이미지 데이터 보존.
+    #[test]
+    fn 이미지_왕복_exporter_데이터보존() {
+        let dir = std::env::temp_dir().join("hwp-md-img-rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_path = write_png(&dir, "rt.png", 32, 32);
+        let orig = std::fs::read(&png_path).unwrap();
+        let doc = from_markdown_with(
+            "![x](rt.png)\n",
+            &MarkdownImportOptions {
+                base_dir: Some(&dir),
+            },
+        );
+        let media = dir.join("out_media");
+        let _ = std::fs::remove_dir_all(&media);
+        let md = crate::markdown::to_markdown_with(
+            &doc,
+            &crate::markdown::MarkdownOptions {
+                media_dir: Some(&media),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(md.contains("!["), "이미지 참조 재수출: {md}");
+        let extracted = std::fs::read(media.join("image1.png")).expect("추출 이미지");
+        assert_eq!(extracted, orig, "추출 이미지 바이트 == 원본(무손실)");
+        let _ = std::fs::remove_dir_all(&media);
+    }
+
+    /// GI-4: 인라인 코드 `code` → 함초롬돋움(face_id=1) + 연회색 음영 글자모양 run.
+    #[test]
+    fn 인라인_코드_글자모양() {
+        let doc = from_markdown("이건 `let x = 1;` 코드다.\n");
+        let code_id = shapes::CODE;
+        let cs = &doc.header.char_shapes[code_id as usize];
+        assert_eq!(cs.face_ids[0], FONT_DOTUM, "함초롬돋움 face_id");
+        assert_eq!(cs.shade_color, 0x00F0_F0F0, "연회색 음영");
+        // 코드 텍스트가 CODE 글자모양 run으로 적재됐는지.
+        let para = &doc.sections[0].paragraphs[0];
+        let has_code_run = para.char_shape_runs.iter().any(|(_, id)| id.0 == code_id);
+        assert!(has_code_run, "CODE run 존재: {:?}", para.char_shape_runs);
+        // 함초롬돋움 글꼴이 테이블에 있다.
+        assert_eq!(doc.header.fonts[0][FONT_DOTUM as usize].name, "함초롬돋움");
+    }
+
+    /// push_text: 탭은 InlineCtrl(9)로, 그 외 C0 제어문자는 드롭, 일반 문자는 Text로.
+    #[test]
+    fn push_text_탭_인라인컨트롤_제어문자_드롭() {
+        let mut b = Builder::default();
+        b.push_text("A\tB\u{0001}C");
+        let kinds: Vec<_> = b.chars.iter().cloned().collect();
+        assert_eq!(kinds.len(), 4, "A, 탭, B, C (0x01 드롭): {kinds:?}");
+        assert!(matches!(kinds[0], HwpChar::Text('A')));
+        assert!(matches!(kinds[1], HwpChar::InlineCtrl { code: 9, .. }));
+        assert!(matches!(kinds[2], HwpChar::Text('B')));
+        assert!(matches!(kinds[3], HwpChar::Text('C')));
+        // wchar_pos = 1 + 8 + 1 + 1 (0x01은 소비 안 함).
+        assert_eq!(b.wchar_pos, 11);
+    }
+
+    /// H1~H3 절 번호 사다리: 카운터 증가·하위 리셋·상위 0 승격 + H2/H3 들여쓰기 모양.
     #[test]
     fn 헤딩_절번호_카운터() {
-        let doc = from_markdown("# 일\n# 이\n## 이일\n## 이이\n# 삼\n### 삼일일\n");
-        let t = texts(&doc);
-        assert_eq!(t[0], "1. 일");
-        assert_eq!(t[1], "2. 이");
-        assert_eq!(t[2], "2-1. 이일");
-        assert_eq!(t[3], "2-2. 이이");
-        assert_eq!(t[4], "3. 삼");
-        assert_eq!(t[5], "3-0-1. 삼일일");
-        // H2/H3는 절 번호 문단 모양.
-        let ps = |i: usize| doc.sections[0].paragraphs[i].para_shape.0;
-        assert_eq!(ps(0), para::HEADING);
-        assert_eq!(ps(2), para::SECTION);
-        assert_eq!(ps(5), para::SECTION);
+        let doc = from_markdown("# 서론\n## 배경\n## 목적\n# 본론\n### 세부\n");
+        let text = doc.plain_text();
+        for want in ["1. 서론", "1-1. 배경", "1-2. 목적", "2. 본론", "2-1-1. 세부"] {
+            assert!(text.contains(want), "{want} 없음: {text}");
+        }
+        // H2/H3 문단은 SECTION 문단모양(margin_left 2000)을 쓴다.
+        let ps_of = |needle: &str| {
+            let p = doc.sections[0]
+                .paragraphs
+                .iter()
+                .find(|p| {
+                    p.chars.iter().any(|c| matches!(c, HwpChar::Text(_)))
+                        && plain_of(p).contains(needle)
+                })
+                .unwrap();
+            p.para_shape.0
+        };
+        fn plain_of(p: &Paragraph) -> String {
+            p.chars
+                .iter()
+                .filter_map(|c| match c {
+                    HwpChar::Text(ch) => Some(*ch),
+                    _ => None,
+                })
+                .collect()
+        }
+        let section_ps = ps_of("1-1. 배경");
+        assert!(section_ps >= BASE_PARA_SHAPES, "SECTION은 확장 모양");
+        assert_eq!(ps_of("2-1-1. 세부"), section_ps, "H2/H3 동일 모양");
+        assert_eq!(
+            doc.header.para_shapes[section_ps as usize].margin_left,
+            2000
+        );
+        assert_eq!(ps_of("1. 서론"), 1, "H1은 기본 제목 모양");
     }
 
+    /// 숫자로 시작하는 제목은 절 번호 접두를 생략한다(이중 번호 방지).
     #[test]
     fn 헤딩_이중번호_방지() {
-        // 이미 숫자로 시작하는 제목에는 절 번호를 붙이지 않는다.
-        let doc = from_markdown("# 3-2-1. 기존 번호 제목\n");
-        let t = texts(&doc);
-        assert_eq!(t[0], "3-2-1. 기존 번호 제목");
-    }
-
-    #[test]
-    fn 목록_타이트_중첩_문단분리() {
-        // 중첩 타이트 리스트가 한 문단으로 뭉치지 않고 항목별 문단이 된다.
-        let doc = from_markdown("- a\n  - b\n  - c\n- d\n");
-        let t = texts(&doc);
-        assert_eq!(t.len(), 4);
-        assert_eq!(t[0], "❍ a");
-        assert_eq!(t[1], "- b");
-        assert_eq!(t[2], "- c");
-        assert_eq!(t[3], "❍ d");
-    }
-
-    #[test]
-    fn 목록_숫자10이상_평문마커() {
-        let items: String = (1..=11).map(|i| format!("{i}. 항{i}\n")).collect();
-        let doc = from_markdown(&items);
-        let t = texts(&doc);
-        assert_eq!(t[8], "❾ 항9");
-        assert_eq!(t[9], "10. 항10");
-        assert_eq!(t[10], "11. 항11");
+        let doc = from_markdown("# 1. 서론\n");
+        let text = doc.plain_text();
+        assert!(text.contains("1. 서론"), "{text}");
+        assert!(!text.contains("1. 1. 서론"), "이중 번호 금지: {text}");
     }
 }

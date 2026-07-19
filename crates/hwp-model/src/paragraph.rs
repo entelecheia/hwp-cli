@@ -11,7 +11,7 @@ use crate::control::Control;
 use crate::ids::{CharShapeId, ParaShapeId, StyleId};
 use crate::opaque::{OpaqueRecord, hex_bytes};
 
-/// 컨트롤 문자 분류 (한글문서파일형식 5.0 §4.2.4 표).
+/// 컨트롤 문자 분류 (한글문서파일형식 5.0 §3.2.3 표 6 「제어 문자」).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharKind {
     /// 1 WCHAR — 그 자체로 의미를 갖는 문자형 컨트롤 (0, 10, 13, 24~31)
@@ -62,6 +62,13 @@ pub enum HwpChar {
     /// 1 WCHAR 문자형 컨트롤
     CharCtrl(u16),
     /// 8 WCHAR 인라인 컨트롤 — payload는 정보 6 WCHAR(12바이트)
+    ///
+    /// **불변식(탭)**: 탭 문자는 항상 `InlineCtrl { code: 9, .. }`로 모델링한다
+    /// (§3.2.3 표 6: 코드 9 = 8 WCHAR 인라인 컨트롤). `Text('\t')`(1 WCHAR)로
+    /// 적재하면 hwp5 PARA_TEXT는 코드 9를 인라인 컨트롤 선두로 오인해 뒤 7 WCHAR를
+    /// 잘못 삼키고, hwpx `<hp:t>`는 raw 0x09를 그대로 방출해 둘 다 한글이 파일을
+    /// 거부한다. 유입 경로(from_markdown, hwpx read)에서 InlineCtrl로 정규화하고,
+    /// 방출부(hwp5 emit_para_text·hwpx flush_text/esc)는 방어선으로 재정규화한다.
     InlineCtrl {
         code: u16,
         #[serde(with = "hex_bytes")]

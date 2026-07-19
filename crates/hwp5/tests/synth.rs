@@ -79,6 +79,250 @@ fn 합성_문서_한글_규격_충족() {
     );
 }
 
+/// GI-1/GI-2 왕복 (c): md(각주·순서목록·중첩) → hwp5 저장 → 재읽기.
+/// 합성 각주·번호/글머리 문단이 synth 규격(레코드 크기·dangling 방지) 위반 없이
+/// 저장·복원되는지 검증한다. (취소선 플래그는 hwp5가 바이너리로 쓰지 않아 왕복에서
+/// 소실된다 — DIFFSPEC 회피를 위한 설계상 결정. hwpx 왕복은 보존.)
+#[test]
+fn 왕복_각주_목록_hwp5_규격() {
+    let md = "\
+문단에 각주[^1]가 있다. ~~지운 글~~ 도 있다.
+
+1. 첫째
+2. 둘째
+   - 안쪽 가
+3. 셋째
+
+[^1]: 각주 본문이다.
+";
+    let doc = hwp_convert::from_markdown(md);
+    let out = tmp("synth_notes_list.hwp");
+    let warnings = hwp5::write_document(&doc, &out, &hwp5::WriteOptions::default()).unwrap();
+    // 각주·목록이 DROP 없이 저장돼야 한다.
+    assert!(
+        !warnings.iter().any(|w| w.contains("DROP")),
+        "DROP 경고: {warnings:?}"
+    );
+
+    let reread = hwp5::read_document(&out).unwrap().document;
+    let d = &reread;
+
+    // 1) 각주 컨트롤(fn) + 본문 문단 리스트가 재읽기에서 살아 있다.
+    let has_fn = d.sections[0].paragraphs.iter().any(|p| {
+        p.controls.iter().any(|c| matches!(c,
+            hwp_model::Control::Generic(g) if g.ctrl_id == *b"fn  " && !g.paragraph_lists.is_empty()))
+    });
+    assert!(has_fn, "각주 컨트롤 왕복");
+
+    // 2) 번호/글머리 머리 문단모양이 살아 있고 참조 테이블이 dangling 아님(defect A10).
+    let has_number = d.header.para_shapes.iter().any(|ps| ps.head_type() == 2);
+    let has_bullet = d.header.para_shapes.iter().any(|ps| ps.head_type() == 3);
+    assert!(has_number, "번호 머리 문단모양 보존");
+    assert!(has_bullet, "글머리 머리 문단모양 보존");
+    for ps in &d.header.para_shapes {
+        match ps.head_type() {
+            2 => assert!(
+                (ps.numbering_id as usize) < d.header.numberings.len(),
+                "번호 정의 dangling: id={} < {}",
+                ps.numbering_id,
+                d.header.numberings.len()
+            ),
+            3 => assert!(
+                (ps.numbering_id as usize) < d.header.bullets.len(),
+                "글머리 정의 dangling: id={} < {}",
+                ps.numbering_id,
+                d.header.bullets.len()
+            ),
+            _ => {}
+        }
+    }
+
+    // 3) synth 규격: 레코드 크기(새 취소선 문자모양·목록 문단모양·각주 본문 포함).
+    let mut c = hwp5::Hwp5Container::open(&out).unwrap();
+    let di = c.read_record_stream("/DocInfo").unwrap();
+    let bt = c.read_record_stream("/BodyText/Section0").unwrap();
+    assert!(
+        record_sizes(&di, 0x19).iter().all(|&s| s == 58),
+        "PARA_SHAPE 58B"
+    );
+    assert!(
+        record_sizes(&di, 0x15).iter().all(|&s| s == 74),
+        "CHAR_SHAPE 74B"
+    );
+    assert!(
+        record_sizes(&bt, 0x42).iter().all(|&s| s == 24),
+        "PARA_HEADER 24B (각주 본문 문단 포함)"
+    );
+
+    // 4) BULLET 레코드가 정품 필드 패턴과 일치(사업계획서 전수 대조): 25B, [8..12]=글자모양
+    //    id 없음(0xFFFFFFFF), [12..14]=글머리표 문자(우리 '•'=0x2022). 오프셋이 어긋나면
+    //    한글이 마커를 미표시한다(1차 H2 실기 결함).
+    let bullets = all_records(&di, 0x18);
+    assert!(!bullets.is_empty(), "BULLET 레코드 존재");
+    for b in &bullets {
+        assert_eq!(b.len(), 25, "BULLET 레코드 25B(정품 실측)");
+        assert_eq!(&b[8..12], &[0xFF, 0xFF, 0xFF, 0xFF], "번호 글자모양 id 없음");
+        assert_eq!(
+            u16::from_le_bytes([b[12], b[13]]),
+            0x2022,
+            "글머리표 문자 '•'가 오프셋 12에 있어야"
+        );
+    }
+
+    // 5) 취소선: strike CharShape의 on-disk 속성 bit18(취소선 여부=1)이 세워졌는지(바이트).
+    //    CHAR_SHAPE 속성은 오프셋 26(면 ID 14×2=14B + ratios/spacings/rel/offsets 각 7B ×4 =
+    //    28B... → base_size 앞). 여기선 레코드에서 (attr>>18)&1 을 가진 것이 하나라도 있으면
+    //    OK. 속성 오프셋: face_ids(14)+ratios(7)+spacings(7)+rel_sizes(7)+offsets(7)+base_size(4)=46.
+    let strike_present = all_records(&di, 0x15).iter().any(|d| {
+        d.len() >= 50 && (u32::from_le_bytes([d[46], d[47], d[48], d[49]]) >> 18) & 1 == 1
+    });
+    assert!(
+        strike_present,
+        "취소선 CHAR_SHAPE 속성 bit18(취소선 여부)이 기록돼야"
+    );
+}
+
+/// 번호/글머리 numbering_id의 포맷 경계 ±1 변환이 정확한 역이어야 한다.
+/// IR 규약은 0-기반이고 hwp5 on-disk는 1-기반이므로, md(0-기반)→hwp5(write +1)→
+/// 재읽기(read -1)에서 numbering_id가 0으로 보존돼야 한다(왕복 무손실).
+#[test]
+fn hwp5_numbering_id_0기반_경계왕복() {
+    let doc = hwp_convert::from_markdown("1. 하나\n2. 둘\n\n- 가\n- 나\n");
+    // md 출신 IR은 번호/글머리 참조가 0-기반이어야 한다.
+    for ps in &doc.header.para_shapes {
+        if matches!(ps.head_type(), 2 | 3) {
+            assert_eq!(ps.numbering_id, 0, "md 출신 IR numbering_id는 0-기반");
+        }
+    }
+    let out = tmp("numbering_base.hwp");
+    hwp5::write_document(&doc, &out, &hwp5::WriteOptions::default()).unwrap();
+
+    // on-disk PARA_SHAPE의 numbering_id는 1-기반이어야 한다(head 2/3 문단=1). 오프셋 30:
+    // attr1(4) + i32×6(24) + tab_def_id(2) = 30. write가 +1 복원했는지 바이트로 확인.
+    let mut c = hwp5::Hwp5Container::open(&out).unwrap();
+    let di = c.read_record_stream("/DocInfo").unwrap();
+    let raw_ids: Vec<u16> = all_records(&di, 0x19)
+        .iter()
+        .filter(|d| d.len() >= 32 && ((u32::from_le_bytes([d[0], d[1], d[2], d[3]]) >> 23) & 3) != 0)
+        .map(|d| u16::from_le_bytes([d[30], d[31]]))
+        .collect();
+    assert!(
+        raw_ids.iter().any(|&id| id == 1),
+        "머리 문단모양 on-disk numbering_id가 1-기반(=1)이어야: {raw_ids:?}"
+    );
+
+    // 재읽기에서 다시 0-기반으로 정규화되는지(read -1 == write +1의 역).
+    let reread = hwp5::read_document(&out).unwrap().document;
+    for ps in &reread.header.para_shapes {
+        if matches!(ps.head_type(), 2 | 3) {
+            assert_eq!(ps.numbering_id, 0, "재읽기 numbering_id 0-기반 정규화");
+        }
+    }
+}
+
+/// GI-3/GI-4 왕복: md(이미지+인라인 코드) → hwp5 저장 → 재읽기에서 Picture·bin·코드 글자모양 생존.
+#[test]
+fn md_이미지_코드_hwp5_왕복() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("hwp5-md-imgcode");
+    std::fs::create_dir_all(&dir).unwrap();
+    // 최소 PNG(16×16 치수 헤더).
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend([0, 0, 0, 13]);
+    png.extend(b"IHDR");
+    png.extend(16u32.to_be_bytes());
+    png.extend(16u32.to_be_bytes());
+    png.extend([0u8; 8]);
+    let fig = dir.join("f.png");
+    std::fs::File::create(&fig).unwrap().write_all(&png).unwrap();
+
+    let doc = hwp_convert::from_markdown_with(
+        "본문 `let x = 1;` 코드와 이미지.\n\n![alt](f.png)\n",
+        &hwp_convert::MarkdownImportOptions {
+            base_dir: Some(&dir),
+        },
+    );
+    let out = tmp("md_imgcode.hwp");
+    let warnings = hwp5::write_document(&doc, &out, &hwp5::WriteOptions::default()).unwrap();
+    assert!(
+        !warnings.iter().any(|w| w.contains("DROP")),
+        "DROP 경고: {warnings:?}"
+    );
+    let reread = hwp5::read_document(&out).unwrap().document;
+
+    // 이미지 Picture + bin 데이터 생존.
+    let has_pic = reread.sections[0]
+        .paragraphs
+        .iter()
+        .any(|p| {
+            p.controls
+                .iter()
+                .any(|c| matches!(c, hwp_model::Control::Picture(_)))
+        });
+    assert!(has_pic, "이미지 Picture 왕복");
+    assert!(!reread.bin_streams.is_empty(), "bin_streams 왕복");
+
+    // 인라인 코드: 함초롬돋움(face_id=1) 글자모양 + 그걸 참조하는 run.
+    let code_ids: std::collections::HashSet<u16> = reread
+        .header
+        .char_shapes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.face_ids[0] == 1)
+        .map(|(i, _)| i as u16)
+        .collect();
+    assert!(!code_ids.is_empty(), "코드 글자모양(함초롬돋움) 왕복");
+    let has_run = reread.sections[0]
+        .paragraphs
+        .iter()
+        .any(|p| p.char_shape_runs.iter().any(|(_, id)| code_ids.contains(&id.0)));
+    assert!(has_run, "코드 run 왕복");
+}
+
+/// 본문 탭이 md→hwp5 경로에서 8 WCHAR 인라인 컨트롤(코드 9)로 저장·복원돼야 한다.
+/// Text('\t')로 1 WCHAR만 나가면 한글이 코드 9를 인라인 컨트롤 선두로 오인해 뒤
+/// 7 WCHAR를 잘못 삼켜 파일이 깨진다(§3.2.3 표 6).
+#[test]
+fn 본문_탭_hwp5_인라인컨트롤_왕복() {
+    use hwp_model::HwpChar;
+    let doc = hwp_convert::from_markdown("앞\t뒤\n");
+    // IR 불변식: 탭은 InlineCtrl(9), Text('\t') 부재.
+    let chars = &doc.sections[0].paragraphs[0].chars;
+    assert!(
+        chars
+            .iter()
+            .any(|c| matches!(c, HwpChar::InlineCtrl { code: 9, .. })),
+        "탭이 InlineCtrl(9)로 적재돼야: {chars:?}"
+    );
+    assert!(
+        !chars.iter().any(|c| matches!(c, HwpChar::Text('\t'))),
+        "탭이 Text('\\t')로 남으면 안 됨"
+    );
+
+    let out = tmp("synth_tab.hwp");
+    hwp5::write_document(&doc, &out, &hwp5::WriteOptions::default()).unwrap();
+
+    // PARA_TEXT에 탭 인라인 컨트롤 16바이트(09 00 + 12*0 + 09 00)가 있어야 한다.
+    let mut c = hwp5::Hwp5Container::open(&out).unwrap();
+    let bt = c.read_record_stream("/BodyText/Section0").unwrap();
+    let pt = first_record(&bt, 0x43).expect("PARA_TEXT");
+    let tab16 = [9u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 0];
+    assert!(
+        pt.windows(16).any(|w| w == tab16),
+        "PARA_TEXT에 탭 인라인 컨트롤 16B 없음"
+    );
+
+    // 왕복: 다시 읽어도 InlineCtrl(9) + 텍스트 순서 보존.
+    let reread = hwp5::read_document(&out).unwrap().document;
+    let rc = &reread.sections[0].paragraphs[0].chars;
+    assert!(
+        rc.iter()
+            .any(|c| matches!(c, HwpChar::InlineCtrl { code: 9, .. })),
+        "왕복 후 InlineCtrl(9) 소실: {rc:?}"
+    );
+    assert!(reread.plain_text().contains("앞\t뒤"), "탭 텍스트 복원");
+}
+
 /// 합성 문단의 본문 구조가 정품 한글 문단(가나다.hwp 5.1.1.0)과 동형이어야 한다.
 /// 정품 대조로 확정한 5대 본문 결함의 회귀 방지 — 이 결함들이 합쳐져
 /// "보안 낮춤에도 손상" 경고를 냈다.
@@ -503,26 +747,28 @@ fn 글상자_hwpx출신_안전저하_텍스트보존() {
     assert!(!reread.plain_text().is_empty(), "유효 문서(빈 본문 아님)");
 }
 
-/// 스타일 사다리(from_markdown 목록/절번호)는 리터럴 마커 방식이라 BULLET 정의
-/// 레코드를 만들지 않아야 한다 — RawEntry 없는 정의 참조는 dangling ref(A10 손상
-/// 클래스)가 되므로, hwp5 출력의 BULLET 레코드 0건을 단언한다.
+/// 스타일 사다리(from_markdown): 목록은 네이티브 BULLET/NUMBERING 정의(B7 25B 정답지,
+/// 실기 확정)로, H1~H3 절 번호는 리터럴 접두로 방출된다 — hwp5 출력에서 BULLET
+/// 레코드 수가 IR 글머리 정의 수와 일치하고 절 번호 텍스트가 왕복되는지 단언한다.
 #[test]
-fn 스타일_사다리_네이티브_정의_없음() {
+fn 스타일_사다리_hwp5_정의_왕복() {
     let doc = hwp_convert::from_markdown("# 제목\n\n- 항목\n  - 하위\n\n1. 첫\n2. 둘\n");
+    assert!(!doc.header.bullet_chars.is_empty(), "글머리 정의 생성");
     let out = tmp("synth_ladder.hwp");
     hwp5::write_document(&doc, &out, &hwp5::WriteOptions::default()).unwrap();
     let mut c = hwp5::Hwp5Container::open(&out).unwrap();
     let di = c.read_record_stream("/DocInfo").unwrap();
-    let scan = hwp5::record::scan_stream(&di, hwp5::record::ScanMode::Tolerant).unwrap();
-    let bullets = scan
-        .roots
-        .iter()
-        .filter(|r| r.tag == hwp5::record::tag::BULLET)
-        .count();
-    assert_eq!(bullets, 0, "BULLET 레코드 0건(리터럴 마커 방식)");
+    let bullets = all_records(&di, 0x18);
+    assert_eq!(
+        bullets.len(),
+        doc.header.bullet_chars.len(),
+        "BULLET 레코드 수 == IR 글머리 정의 수"
+    );
 
-    // 리터럴 마커 텍스트는 그대로 왕복된다.
+    // 절 번호는 리터럴 접두로, 목록 텍스트는 마커 없는 본문으로 왕복된다.
     let reread = hwp5::read_document(&out).unwrap().document;
-    assert!(reread.plain_text().contains("❍ 항목"));
-    assert!(reread.plain_text().contains("1. 제목"));
+    let text = reread.plain_text();
+    assert!(text.contains("1. 제목"), "{text}");
+    assert!(text.contains("항목"), "{text}");
+    assert!(!text.contains("❍"), "리터럴 마커는 더 쓰지 않는다: {text}");
 }

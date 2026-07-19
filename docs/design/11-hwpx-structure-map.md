@@ -57,8 +57,8 @@ HWPX는 OPC(Open Packaging Conventions) ZIP 아카이브다. 아래는 한글이
 | 파트 | 역할 | read 경로 (파일:줄) | write 경로 (파일:줄 / 소스) | 왕복 상태 |
 |------|------|--------------------|----------------------------|-----------|
 | `mimetype` | 컨테이너 매직(첫 엔트리·STORED) | `package.rs:34` 검증만 | `write/mod.rs:72` `MIMETYPE` 상수 | 상수 |
-| `version.xml` | 포맷 버전 | `read/mod.rs:57` ← `package.rs:71` `version_info` → `DocMeta.source_version` | `write/mod.rs:81` `VERSION_XML` 상수 | 포맷 상수 고정, `application`만 hwp-cli |
-| `settings.xml` | 앱 설정(캐럿) | **없음(미해석)** | `write/mod.rs:114` `SETTINGS_XML` 상수 | 왕복 시 캐럿 0으로 재설정 |
+| `version.xml` | 포맷 버전 | `version_info` 의미 파싱 + **원문 pass-through**(`Document.hwpx_version_xml`) | 원문 재방출(없으면 `VERSION_XML` 상수) | ✅ 원문 보존(2026-07-15, GE-β5) |
+| `settings.xml` | 앱 설정(캐럿) | **원문 pass-through**(`Document.hwpx_settings_xml`) | 원문 재방출(없으면 `SETTINGS_XML` 상수) | ✅ 원문 보존(2026-07-15, GE-β5) |
 | `META-INF/container.xml` | OCF rootfiles(진입점) | **없음** | `write/mod.rs:87` `CONTAINER_XML` 상수 | 상수 |
 | `META-INF/container.rdf` | RDF 패키지 관계 | **없음** | `write/mod.rs:83` `CONTAINER_RDF` 상수 | 상수(header+section0만 기술) |
 | `META-INF/manifest.xml` | ODF manifest(빈 셸) | **없음** | `write/mod.rs:92` `MANIFEST_XML` 상수 | 상수 |
@@ -333,7 +333,7 @@ grep 실측). 개별 나열 대신 계열로 묶는다. read가 만들지 못하
 | 테두리채움 | `hh:borderFills`, `hh:borderFill`, `hh:slash`, `hh:backSlash`, `hh:leftBorder`/`rightBorder`/`topBorder`/`bottomBorder`, `hh:diagonal`, `hc:fillBrush`, `hc:winBrush` | `write_border_fills` :130 |
 | 문자모양 | `hh:charProperties`, `hh:charPr`, `hh:fontRef`, `hh:ratio`, `hh:spacing`, `hh:relSz`, `hh:offset`, `hh:italic`, `hh:bold`, `hh:underline`, `hh:strikeout`, `hh:outline`, `hh:shadow`, `hh:emboss`, `hh:engrave`, `hh:supscript`, `hh:subscript` (2026-07-15부터 전부 IR 기반) | `write_char_properties` :184 |
 | 탭 | `hh:tabProperties`, `hh:tabPr` | `write_tab_properties` :263 |
-| 번호(상수) | `hh:numberings`, `hh:numbering`, `hh:paraHead` | `write_numberings` :275 |
+| 번호·글머리 | `hh:numberings`, `hh:numbering`, `hh:paraHead`, `hh:bullets`, `hh:bullet`(PR #8 신설 — 이전엔 글머리 정의가 쓰기에서 소실) | `write_numberings`, `write_bullets` |
 | 문단모양 | `hh:paraProperties`, `hh:paraPr`, `hh:align`, `hh:heading`, `hh:breakSetting`, `hh:autoSpacing`, `hh:margin`, `hc:intent`/`left`/`right`/`prev`/`next`, `hh:lineSpacing`, `hh:border` | `write_para_properties` :291 |
 | 스타일 | `hh:styles`, `hh:style` | `write_styles` :346 |
 
@@ -362,7 +362,7 @@ read가 버리므로(§3의 skip) IR엔 없다. write가 sz/좌표 등에서 재
 | `hp:imgRect`, `hp:imgClip`, `hp:imgDim` | bbox 상수 | skip(parse_picture) | 이미지 크롭·치수 재합성 | :1079 |
 | `hp:drawText`>`hp:textMargin` | 여백 283 상수 | 텍스트(subList)만 수집 | 글상자 여백 상수화 | :622 |
 | lineShape `headfill`/`tailfill`/`headSz`/`tailSz`/`endCap`/`outlineStyle`/`alpha` | 상수 | color/width/style/head/tail만 | 화살표 크기·꼬리 상수 | :748 |
-| `hp:pageBorderFill`, `hp:footNotePr`, `hp:endNotePr`, `hp:grid`, `hp:startNum`, `hp:visibility`, `hp:lineNumberShape` | 구역 상수 | skip(secPr 자식) | ✅ **해소(2026-07-19)** — `SectionDef.hwpx_raw`로 원본 secPr 전문 보존·verbatim 방출(없으면 기존 상수 템플릿 폴림) | `read/xml.rs::echo_elements` ↔ `write/section.rs SectionDef arm` |
+| `hp:pageBorderFill`, `hp:footNotePr`, `hp:endNotePr`, `hp:grid`, `hp:startNum`, `hp:visibility`, `hp:lineNumberShape` | 원문 있으면 원문 재방출, 없으면 구역 상수 | **원문 XML pass-through**(`secpr_raw_children`) | ✅ **해소(2026-07-15, GC-5)** — hwpx 왕복에서 원문·순서 보존(의미 파싱은 아님) | `parse_sec_pr` ↔ `write_default_sec_pr` |
 | `hh:beginNum`, `hh:compatibleDocument`, `hh:docOption`, `hh:autoSpacing` | 상수 | skip(header) | 호환·문서옵션 상수 | `write/header.rs:51,71` |
 
 ### (b) read만 해석·write는 상수/근사/미방출 — 읽었으나 hwpx로 되돌리지 못함
@@ -378,11 +378,10 @@ IR엔 값이 있으나(hwp5로는 나감) hwpx write가 상수/근사로 눌러 
 | `hh:underline shape` | type/**shape**/color 해석(IR `underline_shape` 신설) | ✅ `underline_shape` 기반(0=SOLID) | **해소(2026-07-15)** | `:204` ↔ 동상 |
 | colPr `colSz`/`colLine`(단별폭·구분선) | 미수집(등폭 가정) | 값 방출하나 단별폭 없음 | 불균등 단·구분선 손실 | `parse_col_pr :377` ↔ `write_col_ctrl :473` |
 | `hc:gradation angle`·중심·step | angle만(라디안 근사) | angle round + centerX/Y/step 상수 | 그러데이션 중심·단계 근사 | `parse_gradation :1217` ↔ `:764` |
-| `hp:pagePr landscape` | attr bit0 | default_sec_pr에서 재방출 | 보존(단 secPr 다른 상수와 함께 — raw 우선) | `:340` ↔ `:453` |
-| `hp:footNote`/`hp:endNote` | fn/en + subList 수집 | ✅ **해소(2026-07-19)** — `write_footnote`로 subList 스캐폴드 방출(기존 DROP). 한글 저장본 실측 정합(2026-07-19): number/suffixChar/instId 속성 + 본문 autoNum(num/numType/autoNumFormat) | `:589` ↔ `write/section.rs::write_footnote` |
+| `hp:pagePr landscape` | attr bit0 | default_sec_pr에서 재방출 | 보존(단 secPr 다른 상수와 함께) | `:340` ↔ `:453` |
 | numbering `paraHead` 형식 | template/start/numFormat 수집 | ✅ `numbering_levels` 기반(없으면 기존 상수) | **해소(2026-07-15)** — 다중 번호정의 itemCnt 뭉개짐도 함께 수정 | `:333` ↔ `write_numberings` |
-| tab `tabPr`(위치·채움) | tabPrIDRef만 | ✅ **해소(2026-07-19)** — `DocHeader.hwpx_tab_defs_raw`로 `<hh:tabPr>` 전문 보존·verbatim 방출(없으면 기존 상수 폴림, tab-count 클램프 반영) | `read/header.rs`(에코) ↔ `write_tab_properties` |
-| paraPr `heading`(문단↔번호 연결) | attr1 bits23‑27 + numbering_id | ✅ OUTLINE/NUMBER/BULLET 역방출 | **해소(2026-07-15 2차)** — [12](12-feature-gaps.md) GE-α8 | `:309` ↔ `write_para_properties` |
+| tab `tabPr`(위치·채움) | `tabPr/tabItem` 의미 파싱 → IR `TabDef` | ✅ `tab_stops` 기반 방출(없으면 기존 상수) | **해소(2026-07-15, GC-4)** | `read/header.rs` ↔ `write_tab_properties` |
+| paraPr `heading`(문단↔번호 연결) | attr1 bits23‑27 + numbering_id | ✅ OUTLINE/NUMBER/BULLET 역방출 | **해소(2026-07-15 2차)** — [12](12-feature-gaps.md) GE-α8. PR #8(07-18)이 OUTLINE idRef +1 밀림 실기 버그 추가 수정(정품 idRef=0) + 정의 id 비연속 관용화 | `:309` ↔ `write_para_properties` |
 
 ### (c) 양쪽 없음(미구현) — read·write 모두 의미 처리 없음
 

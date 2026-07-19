@@ -751,13 +751,25 @@ fn synth_pictures_para(
                 };
                 // gso 개체 공통 속성(40B)을 배치에서 합성한다. 정품 한라대 .hwp
                 // 실측 attr: 인라인(글자처럼)=0x042a6001, 떠 있는(floating)=
-                // 0x040a6000. floating은 hwpx 오프셋으로 위치 지정. instance_id는
-                // 개체마다 유니크 부여. (고정 템플릿을 쓰면 떠 있는 로고가 인라인으로
-                // 배치돼 한글에서 안 보이거나 오배치된다.)
+                // 0x040a6000. instance_id는 개체마다 유니크 부여. (고정 템플릿을 쓰면
+                // 떠 있는 로고가 인라인으로 배치돼 한글에서 안 보이거나 오배치된다.)
+                //
+                // 부유는 문단 기준(vertRelTo/horzRelTo=PARA)으로 둔다: 0x040a6000은
+                // relTo=PAPER(용지 좌상단 기준)이라, insert_seal이 앵커 문단 안에서
+                // 계산한 오프셋을 쓰면 도장이 용지 좌상단으로 튄다(D2 미겹침 결함).
+                // PARA 비트(vertRelTo=2<<3, horzRelTo=3<<8)를 세워 hwpx(D1) PARA
+                // 배치와 오프셋 의미를 일치시킨다.
+                //
+                // 어울림(bits21-23)은 글 앞(IN_FRONT_OF_TEXT=5)으로: 표본 0x040a6000의
+                // wrap=0(SQUARE)은 본문을 밀어내 겹침이 불가(§4.3.9.1, D2 "(인) 우측
+                // 밀림" 실기 결함). 값 체계는 정품 annual attr 0x046a4000→wrap=3
+                // (TOP_AND_BOTTOM)으로 교차 확인. bit13(본문 영역 제한)도 해제 —
+                // 스펙상 제한 시 겹침 허용(bit14)이 무시된다. hwpx 부유 그림 방출
+                // (IN_FRONT_OF_TEXT 고정)과 대칭.
                 let attr: u32 = if p.treat_as_char {
                     0x042a_6001
                 } else {
-                    0x040a_6000
+                    (0x040a_6000 & !(1 << 13)) | (2 << 3) | (3 << 8) | (5 << 21) // = 0x04aa4310
                 };
                 // 오프셋은 글자처럼 취급(treat_as_char)이어도 보존한다. 정품 본문 로고는
                 // treatAsChar=1인데도 vertOffset=68401을 유지하므로, 0으로 만들면 좌상단으로
@@ -825,6 +837,19 @@ fn synth_pictures_para(
                         }
                     }
                 }
+                // 합성 각주/미주(md 출신): LIST_HEADER 헤더가 없으면 검증된 텍스트 리스트
+                // 헤더 템플릿(paraCount 패치)으로 채운다. 비면 emit_control이 빈 LIST_HEADER를
+                // 써 문단 리스트를 잃는다. (각주 전용 리스트 헤더 필드는 실기 확인 대상 — 보고.)
+                if (g.ctrl_id == *b"fn  " || g.ctrl_id == *b"en  ") && g.raw_children.is_empty() {
+                    for list in &mut g.paragraph_lists {
+                        if list.header_data.is_empty() {
+                            let mut lh = hex_to_bytes(HEADER_LIST_HEADER_TEMPLATE);
+                            let npara = list.paragraphs.len().max(1) as u16;
+                            lh[0..2].copy_from_slice(&npara.to_le_bytes());
+                            list.header_data = lh;
+                        }
+                    }
+                }
                 for list in &mut g.paragraph_lists {
                     for lp in &mut list.paragraphs {
                         synth_pictures_para(
@@ -854,8 +879,14 @@ fn strip_unwritable_pictures(para: &mut Paragraph, warnings: &mut Vec<String>) {
             }
             // hwp5 페이로드를 합성할 수 없는 컨트롤(hwpx/md 출신 머리말/자동번호
             // 등)만 생략. raw_children가 있으면 hwp5 원본이므로 보존.
+            // 예외: 각주/미주(fn/en)는 CTRL_HEADER가 ctrl_id뿐(빈 data가 정상)이고
+            // paragraph_lists(본문)로부터 LIST_HEADER+문단을 합성할 수 있으므로 보존한다.
             Control::Generic(g)
-                if g.data.is_empty() && g.ctrl_id != *b"cold" && g.raw_children.is_empty() =>
+                if g.data.is_empty()
+                    && g.ctrl_id != *b"cold"
+                    && g.raw_children.is_empty()
+                    && !((g.ctrl_id == *b"fn  " || g.ctrl_id == *b"en  ")
+                        && !g.paragraph_lists.is_empty()) =>
             {
                 warnings.push(format!(
                     "DROP: hwp5 페이로드가 없는 {:?} 컨트롤을 생략 (hwpx 출신)",
@@ -969,6 +1000,24 @@ const DEFAULT_NUMBERING_DATA: [u8; 226] = [
     0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
     0x00, 0x00,
 ];
+
+/// HWPTAG_BULLET 레코드 데이터 — **정품 실측 25B**(제주한라대 사업계획서 BULLET 전수 대조).
+/// 레이아웃: 문단 머리 정보(8B, attr 0x08=자동 내어쓰기·본문거리 50%) + **번호 글자모양
+/// id 4B=0xFFFFFFFF(없음)** + 글머리표 문자 WCHAR(오프셋 12) + 후행 11B(0).
+///
+/// 스펙 md 표42의 "20B / 글머리 문자 오프셋 8"은 오답이다 — 정품엔 머리 정보와 문자 사이에
+/// 글자모양 id 4B가 있어 문자가 오프셋 12에 온다(NUMBERING의 `ff ff ff ff` 필드와 동형).
+/// 이 4B를 빠뜨리면 한글이 오프셋 12를 문자로 읽어 0을 만나 **글머리 마커가 미표시**된다
+/// (1차 H2 실기 결함). doc_info.rs BULLET 파서도 오프셋 12로 함께 교정.
+fn make_bullet_data(ch: char) -> Vec<u8> {
+    let mut v = Vec::with_capacity(25);
+    v.extend_from_slice(&[0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00]); // 문단 머리 정보 8B
+    v.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // 번호 글자모양 id = 없음
+    let code = u16::try_from(u32::from(ch)).unwrap_or(0x2022); // 글머리표 문자(오프셋 12)
+    v.extend_from_slice(&code.to_le_bytes());
+    v.extend_from_slice(&[0u8; 11]); // 이미지 여부/정보·체크 문자·후행 (정품 전수 0)
+    v
+}
 
 /// `\x05HwpSummaryInformation` (OLE 속성 집합) 작성. 메타데이터(제목/주제/지은이/키워드/
 /// 설명/마지막 저장자/작성·수정 일시)를 채우되, 없으면 기존과 동일한 기본값(빈 문자열/
@@ -1157,12 +1206,30 @@ fn emit_doc_info(doc: &Document, _warnings: &mut Vec<String>) -> Vec<RecordNode>
         h.tab_defs.clone()
     };
     let numberings_owned: Vec<RawEntry> = if h.numberings.is_empty() {
-        vec![RawEntry {
-            data: DEFAULT_NUMBERING_DATA.to_vec(),
-            children: Vec::new(),
-        }]
+        // 합성 문서(md 출신): 참조되는 번호 정의 수(numbering_levels)만큼 기본 번호를
+        // 만든다. 최소 1개 — 모든 PARA_SHAPE가 numbering_id=0을 참조하므로 dangling 방지.
+        let count = h.numbering_levels.len().max(1);
+        (0..count)
+            .map(|_| RawEntry {
+                data: DEFAULT_NUMBERING_DATA.to_vec(),
+                children: Vec::new(),
+            })
+            .collect()
     } else {
         h.numberings.clone()
+    };
+    // 글머리표: 합성 문서는 bullet_chars만큼 BULLET 레코드를 만든다(head_type=3 참조처).
+    // 비면 글머리 목록 문단의 numbering_id가 dangling → 한글 '손상' 판정.
+    let bullets_owned: Vec<RawEntry> = if h.bullets.is_empty() {
+        h.bullet_chars
+            .iter()
+            .map(|&ch| RawEntry {
+                data: make_bullet_data(ch),
+                children: Vec::new(),
+            })
+            .collect()
+    } else {
+        h.bullets.clone()
     };
 
     // DOCUMENT_PROPERTIES — 구역 수는 실제 섹션 수에서 유도
@@ -1192,7 +1259,7 @@ fn emit_doc_info(doc: &Document, _warnings: &mut Vec<String>) -> Vec<RecordNode>
     counts.push(h.char_shapes.len() as u32);
     counts.push(tab_defs_owned.len() as u32);
     counts.push(numberings_owned.len() as u32);
-    counts.push(h.bullets.len() as u32);
+    counts.push(bullets_owned.len() as u32);
     counts.push(h.para_shapes.len() as u32);
     counts.push(h.styles.len() as u32);
     if h.id_mappings_counts.len() > counts.len() {
@@ -1256,7 +1323,7 @@ fn emit_doc_info(doc: &Document, _warnings: &mut Vec<String>) -> Vec<RecordNode>
             children: n.children.iter().map(opaque_to_node).collect(),
         });
     }
-    for b in &h.bullets {
+    for b in &bullets_owned {
         children.push(RecordNode {
             tag: tag::BULLET,
             data: b.data.clone(),
@@ -1416,7 +1483,17 @@ fn emit_char_shape(cs: &CharShape) -> RecordNode {
         w.write_u8(v as u8);
     }
     w.write_i32(cs.base_size);
-    w.write_u32(cs.attr);
+    // 취소선: IR의 `strike` 플래그가 켜지면 CHAR_SHAPE 속성 bit18(취소선 여부=1)을 세운다.
+    // 스펙 §4.2.7 표35의 취소선 여부(bit18~20) + 정품 코퍼스 실측(취소선 쓰는 문단이 값 1).
+    // **쓰기에만** 적용한다(우리가 취소선임을 아는 md 출신). 읽기는 bit18을 신뢰하지 않는다
+    // (변경추적 삭제표시 등에서 bit18이 세워진 정품이 있어 평문에 가짜 취소선을 그림 — DIFFSPEC,
+    // doc_info.rs가 strike=false 고정). ⚠ bit 조합의 한글 수용은 H2 실기로 최종 확정 대상.
+    let attr = if cs.strike {
+        cs.attr | (1 << 18)
+    } else {
+        cs.attr
+    };
+    w.write_u32(attr);
     w.write_u8(cs.shadow_gap.0 as u8);
     w.write_u8(cs.shadow_gap.1 as u8);
     w.write_u32(cs.text_color);
@@ -1448,7 +1525,14 @@ fn emit_para_shape(ps: &ParaShape) -> RecordNode {
     w.write_i32(ps.spacing_bottom);
     w.write_i32(ps.line_spacing_old);
     w.write_u16(ps.tab_def_id);
-    w.write_u16(ps.numbering_id);
+    // IR의 번호/글머리 참조는 0-기반이다. on-disk는 1-기반이므로 head_type 2/3에 한해
+    // +1 복원한다(parse_para_shape의 -1 정규화의 역 — 왕복 바이트 동일). 개요·머리없음은 그대로.
+    let numbering_id_raw = if matches!(ps.head_type(), 2 | 3) {
+        ps.numbering_id.saturating_add(1)
+    } else {
+        ps.numbering_id
+    };
+    w.write_u16(numbering_id_raw);
     w.write_u16(ps.border_fill_id);
     for v in ps.border_offsets {
         w.write_u16(v as u16);
@@ -1689,6 +1773,16 @@ fn emit_para_text(chars: &[HwpChar]) -> Vec<u8> {
     let mut w = ByteWriter::new();
     for ch in chars {
         match ch {
+            // 방어선: 탭이 Text로 잘못 적재된 경우(과거 오염 IR)에도 8 WCHAR 인라인
+            // 컨트롤(코드 9)로 정규화한다. 코드 9를 1 WCHAR로 내보내면 한글이 인라인
+            // 컨트롤 선두로 오인해 뒤 7 WCHAR를 잘못 삼킨다(§3.2.3 표 6). 정상 경로는
+            // 탭을 InlineCtrl(9)로 이미 담으므로 여기 오지 않아 왕복 바이트동일 게이트에
+            // 영향이 없다(정품 hwp5는 탭을 Text로 저장하지 않는다).
+            HwpChar::Text('\t') => {
+                w.write_u16(9);
+                w.write_bytes(&[0u8; 12]);
+                w.write_u16(9);
+            }
             HwpChar::Text(c) => {
                 let mut buf = [0u16; 2];
                 for u in c.encode_utf16(&mut buf) {
@@ -1859,7 +1953,15 @@ fn emit_table(
         }
         // instance id: 고유한 비-0 값(z순서 기반). 개체 링크용이라 렌더 영향은 작다.
         w.write_u32(0x5000_0000 | (pl.z_order as u32 & 0xffff));
-        w.write_i32(i32::from(pl.hold_anchor)); // @36: 앵커/개체 고정
+        // @36 INT32 = 쪽나눔 방지 on(1)/off(0) (스펙 표 69). 정품 표본(color_fill.hwp
+        // 표) 실측 = 0. 과거 이 자리에 hwpx holdAnchorAndSO를 잘못 기록했다 — 두 필드는
+        // 의미가 다르다. holdAnchorAndSO는 hwp5 공통 속성에 대응 자리가 없어 hwp5 합성에서
+        // 버린다(손실 아님: hwpx→hwpx 왕복은 <hp:pos> anchor 속성으로 pl.hold_anchor를 보존).
+        w.write_i32(0); // 쪽나눔 방지 off
+        // 개체 설명문 길이 WORD(len=0) — 스펙 표 69의 마지막 필수 필드(≥5.0.0.5).
+        // 누락하면 45→44B가 되어 스펙 최소 46B(=" lbt" 4 + 42)에 미달, 한글이 레코드를
+        // 짧게 읽어 거부할 수 있다. 그림 경로(emit_picture 합성)와 동일하게 방출한다.
+        w.write_u16(0); // desc_len = 0
     } else {
         // md 출신: 셀 크기로 계산한 떠 있는 표본값(기존 동작 유지).
         let mut col_w = vec![0i64; table.cols.max(1) as usize];
@@ -1884,6 +1986,7 @@ fn emit_table(
         }
         w.write_u32(0); // instance id
         w.write_i32(0); // 쪽 나눔 방지
+        w.write_u16(0); // 개체 설명문 길이 WORD(len=0) — 스펙 표 69 필수, 46B 정합
     }
 
     let mut tw = ByteWriter::new();
@@ -2063,6 +2166,73 @@ mod tests {
         assert_eq!(
             i32::from_le_bytes(pic.data[86..90].try_into().unwrap()),
             61875
+        );
+    }
+
+    fn synth_table(placement: Option<hwp_model::GsoPlacement>) -> Table {
+        Table {
+            common_data: Vec::new(),
+            placement,
+            attr: 0,
+            rows: 1,
+            cols: 1,
+            cell_spacing: 0,
+            inner_margins: [0; 4],
+            row_cell_counts: vec![1],
+            border_fill: hwp_model::BorderFillId(1),
+            table_tail: Vec::new(),
+            cells: Vec::new(),
+            extras: Vec::new(),
+        }
+    }
+
+    /// 합성(hwpx·md 출신) 표의 개체 공통 속성은 스펙 표 69의 최소 46B
+    /// (" lbt" 4 + 40 필드 + desc_len 2)로 방출해야 한다. 그림 경로(46B)와 정합.
+    /// @40(=공통 4+@36) INT32 = 쪽나눔 방지 = 0(정품 표본 실측), @44 WORD = desc_len = 0.
+    #[test]
+    fn 합성_표_공통속성_46b_쪽나눔0() {
+        // 1) hwpx 출신(placement) 경로.
+        let pl = hwp_model::GsoPlacement {
+            hold_anchor: true, // hwp5 합성에서 버려야 함(쪽나눔 자리로 새면 안 됨)
+            width: 40000,
+            height: 20000,
+            z_order: 3,
+            ..Default::default()
+        };
+        let node = emit_table(&synth_table(Some(pl)), true, false, false);
+        assert_eq!(&node.data[0..4], b" lbt", "표 ctrl ID");
+        assert_eq!(
+            node.data.len(),
+            46,
+            "placement 경로: ctrl ID 4 + 공통 42 = 46B (스펙 표 69 최소)"
+        );
+        assert_eq!(
+            i32::from_le_bytes(node.data[40..44].try_into().unwrap()),
+            0,
+            "@40 쪽나눔 방지 = 0 (holdAnchorAndSO가 새면 안 됨)"
+        );
+        assert_eq!(
+            u16::from_le_bytes(node.data[44..46].try_into().unwrap()),
+            0,
+            "@44 desc_len = 0"
+        );
+
+        // 2) md 출신 경로(placement=None, common_data 비어 있음).
+        let node = emit_table(&synth_table(None), true, false, false);
+        assert_eq!(
+            node.data.len(),
+            46,
+            "md 경로: 46B (스펙 표 69 최소)"
+        );
+        assert_eq!(
+            i32::from_le_bytes(node.data[40..44].try_into().unwrap()),
+            0,
+            "md 경로 @40 쪽나눔 방지 = 0"
+        );
+        assert_eq!(
+            u16::from_le_bytes(node.data[44..46].try_into().unwrap()),
+            0,
+            "md 경로 @44 desc_len = 0"
         );
     }
 }

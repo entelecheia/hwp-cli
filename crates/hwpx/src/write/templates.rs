@@ -115,6 +115,10 @@ pub fn esc(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            // XML 1.0에서 금지된 C0 제어문자(탭·개행·복귀 제외)는 제거한다 — 이스케이프
+            // 해도 무효이고, raw로 방출하면 한글이 파일을 거부한다. 탭/개행은 상위
+            // (flush_text)에서 이미 <hp:tab …/>·<hp:lineBreak/> 요소로 변환돼 여기 오지 않는다.
+            c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {}
             _ => out.push(c),
         }
     }

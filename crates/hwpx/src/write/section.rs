@@ -9,10 +9,10 @@ use std::fmt::Write as _;
 
 use hwp_model::{
     BinRef, Cell, Control, Document, GenericControl, HwpChar, PageDef, Paragraph, Picture, Section,
-    ShapeKind, Table,
+    SectionDef, ShapeKind, Table,
 };
 
-use crate::write::templates::esc;
+use crate::write::templates::{color_attr, esc};
 
 /// 동봉할 바이너리(이미지) 수집기.
 #[derive(Default)]
@@ -150,12 +150,19 @@ fn write_paragraph(
     // (annual 6쪽 링 미렌더 실기 확정: 도형 35개/run → 22번째 이후 타원 전부 누락). 한계
     // 전에 run을 강제 분할해 모든 도형이 렌더되게 한다.
     let mut run_shapes = 0usize;
+    // 문단 내 인라인 탭의 대기 XML 큐 + 탭 순번. 탭은 반드시 <hp:t> **안**의 중첩
+    // <hp:tab .../>(정품 mixed content)로 방출해야 한다 — t 밖 형제 bare 탭은 한글이
+    // 폭 0으로 무시한다(D3 밀착 결함). InlineCtrl(9) 시점에 문단 탭 정의로 XML을 만들어
+    // 큐에 넣고 '\t' 센티넬을 텍스트 버퍼에 넣으면, flush_text가 열린 <hp:t> 안에서
+    // 센티넬을 큐의 XML로 치환한다(위치 보존).
+    let mut pending_tabs: Vec<String> = Vec::new();
+    let mut tab_ordinal = 0usize;
 
     macro_rules! open_run {
         ($shape:expr) => {
             if !run_open || cur_shape != $shape {
                 if run_open {
-                    flush_text(out, &mut text_buf);
+                    flush_text(out, &mut text_buf, &mut pending_tabs);
                     out.push_str("</hp:run>");
                 }
                 let _ = write!(out, r##"<hp:run charPrIDRef="{}">"##, $shape);
@@ -207,15 +214,18 @@ fn write_paragraph(
             },
             HwpChar::InlineCtrl { code, .. } => match *code {
                 9 => {
+                    // 탭 XML을 지금 만들어(문단 탭 정의의 N번째 항목) 큐에 넣고 '\t'
+                    // 센티넬만 버퍼에 넣는다. 실제 방출은 flush_text가 <hp:t> 안에서 한다.
                     open_run!(cur_shape);
-                    flush_text(out, &mut text_buf);
-                    out.push_str("<hp:tab/>");
+                    pending_tabs.push(tab_xml(doc, para, tab_ordinal));
+                    tab_ordinal += 1;
+                    text_buf.push('\t');
                 }
                 4 => {
                     // FIELD_END — 앞의 fieldBegin과 beginIDRef로 연결.
                     if let Some(fid) = current_field_id.take() {
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         let _ = write!(
                             out,
                             r##"<hp:ctrl><hp:fieldEnd beginIDRef="{fid}" fieldid="{fid}"/></hp:ctrl>"##,
@@ -232,50 +242,27 @@ fn write_paragraph(
                 match control {
                     Control::SectionDef(def) => {
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
-                        match &def.hwpx_raw {
-                            // 원문 secPr verbatim 방출 (비-기본 secPr 왕복 보존).
-                            // 단 IR PageDef가 raw와 어긋나면(JSON에서 페이지 수정)
-                            // 수정값이 조용히 무시되지 않게 의미 경로로 폴백한다.
-                            Some(raw) if raw_matches_page(raw, def.page.as_ref()) => {
-                                out.push_str(raw);
-                            }
-                            Some(_) => {
-                                warnings.push(
-                                    "secPr 원문 보존 해제: PageDef가 수정되어 의미값으로 재생성"
-                                        .into(),
-                                );
-                                write_default_sec_pr(out, def.page.as_ref());
-                            }
-                            None => write_default_sec_pr(out, def.page.as_ref()),
-                        }
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
+                        write_default_sec_pr(out, Some(def));
                     }
                     Control::Generic(g) if g.ctrl_id == *b"cold" => {
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         write_col_ctrl(out, g.column_def.as_ref());
                     }
                     Control::Generic(g) if g.ctrl_id == *b"head" || g.ctrl_id == *b"foot" => {
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         write_header_footer(out, doc, g, ids, bins, preserve_linesegs, warnings);
-                    }
-                    Control::Generic(g) if g.ctrl_id == *b"fn  " || g.ctrl_id == *b"en  " => {
-                        // 각주/미주 — write_header_footer의 subList 스캐폴드 미러.
-                        // (정답지 없음 주의: 한컴 저장 footNote 실물 미확보 — OWPML 스펙 형태
-                        // 로 방출하고 한글 실기 게이트로 확정한다.)
-                        open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
-                        write_footnote(out, doc, g, ids, bins, preserve_linesegs, warnings);
                     }
                     Control::Table(table) => {
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         write_table(out, doc, table, ids, bins, preserve_linesegs, warnings);
                     }
                     Control::Picture(pic) => {
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         shape_break!();
                         let before = out.len();
                         write_picture(out, doc, pic, ids, bins, warnings);
@@ -285,7 +272,7 @@ fn write_paragraph(
                         // 필드(누름틀·계산식·하이퍼링크 등) — fieldBegin 방출. 값 텍스트는
                         // 뒤따르는 Text가 <hp:t>로, FIELD_END(InlineCtrl 4)가 fieldEnd로 닫는다.
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         let (name, command) = hwp_convert::field::field_meta(control);
                         let fid = ids.next();
                         current_field_id = Some(fid);
@@ -308,7 +295,7 @@ fn write_paragraph(
                     Control::Generic(g) if g.ctrl_id == *b"bokm" => {
                         // 책갈피(지점 표식) — <hp:bookmark name="…"/>. 필드와 달리 END 없음.
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         let name =
                             hwp_convert::bookmark::bookmark_name(control).unwrap_or_default();
                         let _ = write!(
@@ -321,7 +308,7 @@ fn write_paragraph(
                         // 쪽번호 위치 — reader build_pgnp의 역(12B: props[format|pos<<8] +
                         // 6B 0 + side_char u16). 정답지: 한글 export <hp:pageNum>.
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         let props =
                             u32::from_le_bytes([g.data[0], g.data[1], g.data[2], g.data[3]]);
                         let side = u16::from_le_bytes([g.data[10], g.data[11]]);
@@ -339,7 +326,7 @@ fn write_paragraph(
                     Control::Generic(g) if g.ctrl_id == *b"pghd" && g.data.len() >= 4 => {
                         // 쪽 감추기 — reader build_pghd의 역(4B 비트맵).
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         let mask = u32::from_le_bytes([g.data[0], g.data[1], g.data[2], g.data[3]]);
                         let b = |bit: u32| u8::from(mask & (1 << bit) != 0);
                         let _ = write!(
@@ -356,7 +343,7 @@ fn write_paragraph(
                     Control::Generic(g) if g.ctrl_id == *b"nwno" && g.data.len() >= 6 => {
                         // 새 번호 지정 — reader build_nwno의 역(종류 u32 + num u16).
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         let num = u16::from_le_bytes([g.data[4], g.data[5]]);
                         let _ = write!(
                             out,
@@ -367,13 +354,13 @@ fn write_paragraph(
                         // 자동 번호(쪽) — 코퍼스 export에 인라인 정답지가 없어 표준형으로
                         // 방출(v1). 페이로드는 reader build_atno가 실측 표준 12B로 복원.
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         out.push_str(r##"<hp:ctrl><hp:autoNum numType="PAGE"/></hp:ctrl>"##);
                     }
                     Control::Generic(g) if !g.gso_shapes.is_empty() => {
                         // hwpx-출신 구조화 도형(rect/ellipse/line/…) — ShapeGeom 재직렬화.
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         shape_break!();
                         let before = out.len();
                         write_ir_shapes(out, doc, g, ids, bins, preserve_linesegs, warnings);
@@ -383,11 +370,18 @@ fn write_paragraph(
                         // hwp5-출신 gso: 글상자(rect+drawText — 텍스트/필드/책갈피 보존)와
                         // 장식 도형(SHAPE_COMPONENT → 도형 요소) 모두 방출.
                         open_run!(cur_shape);
-                        flush_text(out, &mut text_buf);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
                         shape_break!();
                         let before = out.len();
                         write_gso(out, doc, g, ids, bins, preserve_linesegs, warnings);
                         run_shapes += count_shape_tags(&out[before..]);
+                    }
+                    Control::Generic(g) if g.ctrl_id == *b"fn  " || g.ctrl_id == *b"en  " => {
+                        // 각주/미주 — <hp:footNote>/<hp:endNote> + 본문 subList. reader는
+                        // 속성을 무시하고 subList 문단만 수집하므로 표준 속성으로 방출한다.
+                        open_run!(cur_shape);
+                        flush_text(out, &mut text_buf, &mut pending_tabs);
+                        write_foot_end_note(out, doc, g, ids, bins, preserve_linesegs, warnings);
                     }
                     Control::Generic(g) => {
                         warnings.push(format!(
@@ -402,7 +396,7 @@ fn write_paragraph(
     }
 
     if run_open {
-        flush_text(out, &mut text_buf);
+        flush_text(out, &mut text_buf, &mut pending_tabs);
         out.push_str("</hp:run>");
     }
     // 줄 배치 정보 보존 (무수정 왕복 전용 — 기본은 제거, 한글이 재계산)
@@ -435,19 +429,120 @@ fn write_paragraph(
     out.push_str("</hp:p>");
 }
 
-fn flush_text(out: &mut String, buf: &mut String) {
-    if !buf.is_empty() {
-        out.push_str(r##"<hp:t xml:space="preserve">"##);
-        // '\n' 센티넬(강제 줄바꿈)은 <hp:t> 안의 <hp:lineBreak/>로, 나머지는 XML 이스케이프.
-        for (i, part) in buf.split('\n').enumerate() {
-            if i > 0 {
+/// 인라인 `<hp:tab>`의 `type` 속성 = hwp5 탭 종류 코드 + 1.
+///
+/// 정품 실측(정답지 대조 확정): 왼쪽 탭(kind 0)→`type="1"`, 오른쪽 탭(kind 1)→`type="2"`.
+/// OWPML 인라인 탭은 헤더 `tabItem`의 문자열 종류(LEFT/RIGHT/…)와 달리 1-기반 정수
+/// 열거를 쓴다. 가운데(2)→3·소수점(3)→4는 같은 +1 규칙의 외삽이다.
+fn tab_type_attr(kind: u8) -> u8 {
+    kind.saturating_add(1)
+}
+
+/// 인라인 `<hp:tab>`의 `leader` 속성 = 채움(리더) 코드 → OWPML 인라인 리더 열거.
+///
+/// 정품 실측 확정: 없음(fill 0)→`leader="0"`, DASH(fill 2)→`leader="3"`. 인라인 리더
+/// 열거는 표25 테두리선 종류와 순서가 달라(DASH가 3) 그대로 쓸 수 없다. SOLID(1)→1·
+/// DOT(3)→2는 두 실측점과 모순 없는 자기일관 근사(미확인)이며, 그 밖의 코드는 관찰값
+/// DASH(3)로 강등한다(write/header `tab_leader_name`과 동일 철학 — 한글이 tab leader로
+/// 허용하는지 미확인인 값을 방출하지 않는다).
+fn tab_leader_attr(fill: u8) -> u8 {
+    match fill {
+        0 => 0, // 없음(실측)
+        1 => 1, // 실선(근사)
+        3 => 2, // 점(근사)
+        _ => 3, // DASH(실측) + 미확인 코드 강등
+    }
+}
+
+/// 인라인 탭의 기본 폭(HWPUNIT). 정품 기본 탭 폭 실측값 4000. 한글은 파일을 열 때
+/// 탭 폭을 텍스트 렌더 결과로 **재계산**하므로(정품 목차 탭 폭이 제목 길이에 반비례:
+/// 짧은 "개요" 33718 → 긴 "현황 및 문제점" 24718) 이 값은 근사 자리표시자다.
+const DEFAULT_TAB_WIDTH: i32 = 4000;
+
+/// 문단의 `ordinal`번째(0-기반) 탭에 대응하는 `<hp:tab .../>` XML.
+///
+/// 종류/채움은 문단 글자모양이 참조하는 탭 정의(`tab_def_id` → `tab_stops`)의 같은 순번
+/// 항목에서 가져온다(정품: 목차 문단 → tabPr id=3 → RIGHT/DASH → `type="2" leader="3"`).
+/// 정의가 없거나 항목이 모자라면 정품 기본 탭(왼쪽·채움 없음 → `type="1" leader="0"`).
+/// 속성 순서(width→leader→type)도 정품 방출과 맞춘다.
+fn tab_xml(doc: &Document, para: &Paragraph, ordinal: usize) -> String {
+    let item = doc
+        .header
+        .para_shapes
+        .get(para.para_shape.0 as usize)
+        .map(|ps| ps.tab_def_id)
+        .and_then(|id| doc.header.tab_stops.get(id as usize))
+        .and_then(|td| td.items.get(ordinal));
+    let (kind, fill) = item.map_or((0, 0), |it| (it.kind, it.fill));
+    format!(
+        r##"<hp:tab width="{}" leader="{}" type="{}"/>"##,
+        DEFAULT_TAB_WIDTH,
+        tab_leader_attr(fill),
+        tab_type_attr(kind),
+    )
+}
+
+/// 기본 인라인 탭 XML(대기 큐에 짝이 없는 방어선용 — 과거 오염 IR의 raw 0x09).
+const DEFAULT_TAB_XML: &str = r##"<hp:tab width="4000" leader="0" type="1"/>"##;
+
+fn flush_text(out: &mut String, buf: &mut String, pending_tabs: &mut Vec<String>) {
+    if buf.is_empty() {
+        return;
+    }
+    // 정상 경로의 buf 내용은 텍스트 + '\n'(강제 줄바꿈 센티넬) + '\t'(탭 센티넬)이다.
+    // '\t'는 <hp:t> **안**에서 대기 큐의 <hp:tab .../>로 치환하고(정품 mixed content),
+    // 그 밖의 C0 제어문자는 제거한다 — raw 0x09를 <hp:t> 안에 그대로 내보내면 한글이
+    // 파일을 열지 못하고(D3 먹통), t 밖 형제 탭은 폭 0으로 무시된다(D3 밀착).
+    let mut t_open = false;
+    let mut seg = String::new();
+    // 이번 flush에서 소비한 대기 탭 수(끝에서 큐 앞부분을 그만큼 제거).
+    let mut tabs_used = 0usize;
+    macro_rules! ensure_t {
+        () => {
+            if !t_open {
+                out.push_str(r##"<hp:t xml:space="preserve">"##);
+                t_open = true;
+            }
+        };
+    }
+    for c in buf.chars() {
+        match c {
+            // 강제 줄바꿈 센티넬 — <hp:t> 안의 <hp:lineBreak/>.
+            '\n' => {
+                ensure_t!();
+                out.push_str(&esc(&seg));
+                seg.clear();
                 out.push_str("<hp:lineBreak/>");
             }
-            out.push_str(&esc(part));
+            // 탭 센티넬 — 앞 텍스트를 흘린 뒤 같은 <hp:t> 안에 중첩 <hp:tab .../>를 낸다.
+            // 대기 큐에서 이 탭의 XML을 순서대로 꺼낸다. 큐에 짝이 없으면(방어선: 과거
+            // 오염 IR의 raw 탭) 기본 탭을 같은 형식으로 낸다.
+            '\t' => {
+                ensure_t!();
+                out.push_str(&esc(&seg));
+                seg.clear();
+                match pending_tabs.get(tabs_used) {
+                    Some(x) => {
+                        out.push_str(x);
+                        tabs_used += 1;
+                    }
+                    None => out.push_str(DEFAULT_TAB_XML),
+                }
+            }
+            // 그 외 C0 제어문자는 문서를 깨뜨리므로 제거.
+            c if (c as u32) < 0x20 => {}
+            c => seg.push(c),
         }
-        out.push_str("</hp:t>");
-        buf.clear();
     }
+    if !seg.is_empty() {
+        ensure_t!();
+        out.push_str(&esc(&seg));
+    }
+    if t_open {
+        out.push_str("</hp:t>");
+    }
+    pending_tabs.drain(0..tabs_used);
+    buf.clear();
 }
 
 fn shape_id_at(para: &Paragraph, pos: u32) -> u16 {
@@ -475,41 +570,11 @@ fn default_page() -> PageDef {
     }
 }
 
-/// raw secPr 안의 pagePr/margin 값이 IR PageDef와 일치하는가.
-/// JSON에서 PageDef만 고치고 hwpx_raw를 남겨둔 경우를 감지한다(불일치 → 의미 경로 폴백).
-fn raw_matches_page(raw: &str, page: Option<&PageDef>) -> bool {
-    let Some(p) = page else { return true };
-    fn attr_val(scope: &str, name: &str) -> Option<i64> {
-        let pat = format!("{name}=\"");
-        let i = scope.find(&pat)? + pat.len();
-        scope[i..].split('"').next()?.parse().ok()
-    }
-    fn tag_scope<'a>(raw: &'a str, tag: &str) -> Option<&'a str> {
-        let i = raw.find(tag)?;
-        let j = raw[i..].find('>')? + i;
-        Some(&raw[i..j])
-    }
-    let Some(pg) = tag_scope(raw, "<hp:pagePr") else {
-        return true; // pagePr 없는 raw는 비교 불가 — 보존 우선
-    };
-    let mg = tag_scope(raw, "<hp:margin").unwrap_or("");
-    [
-        (pg, "width", i64::from(p.width.0)),
-        (pg, "height", i64::from(p.height.0)),
-        (mg, "left", i64::from(p.margin_left.0)),
-        (mg, "right", i64::from(p.margin_right.0)),
-        (mg, "top", i64::from(p.margin_top.0)),
-        (mg, "bottom", i64::from(p.margin_bottom.0)),
-        (mg, "header", i64::from(p.margin_header.0)),
-        (mg, "footer", i64::from(p.margin_footer.0)),
-    ]
-    .iter()
-    .all(|(scope, name, want)| attr_val(scope, name).is_none_or(|got| got == *want))
-}
+/// `<hp:secPr>` 여는 태그(상수 속성). 원문 pass-through·상수 템플릿 두 경로가 공유한다.
+const SEC_PR_OPEN: &str = r##"<hp:secPr id="" textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" tabStopVal="4000" tabStopUnit="HWPUNIT" outlineShapeIDRef="1" memoShapeIDRef="0" textVerticalWidthHead="0" masterPageCnt="0">"##;
 
-fn write_default_sec_pr(out: &mut String, page: Option<&PageDef>) {
-    let fallback = default_page();
-    let p = page.unwrap_or(&fallback);
+/// `<hp:pagePr>`+`<hp:margin>`을 페이지 정의로부터 방출한다(상수 템플릿과 바이트 동일 형식).
+fn write_page_pr(out: &mut String, p: &PageDef) {
     let landscape = if p.attr & 1 != 0 {
         "NARROWLY"
     } else {
@@ -517,7 +582,7 @@ fn write_default_sec_pr(out: &mut String, page: Option<&PageDef>) {
     };
     let _ = write!(
         out,
-        r##"<hp:secPr id="" textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" tabStopVal="4000" tabStopUnit="HWPUNIT" outlineShapeIDRef="1" memoShapeIDRef="0" textVerticalWidthHead="0" masterPageCnt="0"><hp:grid lineGrid="0" charGrid="0" wonggojiFormat="0"/><hp:startNum pageStartsOn="BOTH" page="0" pic="0" tbl="0" equation="0"/><hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="0" hideFirstEmptyLine="0" showLineNumber="0"/><hp:lineNumberShape restartType="0" countBy="0" distance="0" startNumber="0"/><hp:pagePr landscape="{landscape}" width="{}" height="{}" gutterType="LEFT_ONLY"><hp:margin header="{}" footer="{}" gutter="{}" left="{}" right="{}" top="{}" bottom="{}"/></hp:pagePr><hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="283" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="EACH_COLUMN" beneathText="0"/></hp:footNotePr><hp:endNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="14692344" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="END_OF_DOCUMENT" beneathText="0"/></hp:endNotePr><hp:pageBorderFill type="BOTH" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill><hp:pageBorderFill type="EVEN" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill><hp:pageBorderFill type="ODD" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill></hp:secPr>"##,
+        r##"<hp:pagePr landscape="{landscape}" width="{}" height="{}" gutterType="LEFT_ONLY"><hp:margin header="{}" footer="{}" gutter="{}" left="{}" right="{}" top="{}" bottom="{}"/></hp:pagePr>"##,
         p.width.0,
         p.height.0,
         p.margin_header.0,
@@ -528,6 +593,244 @@ fn write_default_sec_pr(out: &mut String, page: Option<&PageDef>) {
         p.margin_top.0,
         p.margin_bottom.0,
     );
+}
+
+/// `<hp:secPr>`의 머리(grid/startNum/visibility/lineNumberShape/pagePr)를 방출한다.
+/// 상수 템플릿 경로와 hwp5 raw 해석 경로가 공유한다(출력 바이트 동일 형식).
+fn write_sec_pr_head(out: &mut String, p: &PageDef) {
+    let landscape = if p.attr & 1 != 0 {
+        "NARROWLY"
+    } else {
+        "WIDELY"
+    };
+    out.push_str(SEC_PR_OPEN);
+    let _ = write!(
+        out,
+        r##"<hp:grid lineGrid="0" charGrid="0" wonggojiFormat="0"/><hp:startNum pageStartsOn="BOTH" page="0" pic="0" tbl="0" equation="0"/><hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="0" hideFirstEmptyLine="0" showLineNumber="0"/><hp:lineNumberShape restartType="0" countBy="0" distance="0" startNumber="0"/><hp:pagePr landscape="{landscape}" width="{}" height="{}" gutterType="LEFT_ONLY"><hp:margin header="{}" footer="{}" gutter="{}" left="{}" right="{}" top="{}" bottom="{}"/></hp:pagePr>"##,
+        p.width.0,
+        p.height.0,
+        p.margin_header.0,
+        p.margin_footer.0,
+        p.gutter.0,
+        p.margin_left.0,
+        p.margin_right.0,
+        p.margin_top.0,
+        p.margin_bottom.0,
+    );
+}
+
+/// 상수 각주 모양(hello_world 표본 실측) — hwp5 raw가 없을 때의 안전값.
+const CONST_FOOT_NOTE_PR: &str = r##"<hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="283" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="EACH_COLUMN" beneathText="0"/></hp:footNotePr>"##;
+
+/// 상수 미주 모양(hello_world 표본 실측) — hwp5 raw가 없을 때의 안전값.
+const CONST_END_NOTE_PR: &str = r##"<hp:endNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="14692344" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="END_OF_DOCUMENT" beneathText="0"/></hp:endNotePr>"##;
+
+/// 상수 쪽 테두리/배경 3종(BOTH/EVEN/ODD) — hwp5 raw가 없을 때의 안전값.
+const CONST_PAGE_BORDER_FILL: [&str; 3] = [
+    r##"<hp:pageBorderFill type="BOTH" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill>"##,
+    r##"<hp:pageBorderFill type="EVEN" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill>"##,
+    r##"<hp:pageBorderFill type="ODD" borderFillIDRef="1" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill>"##,
+];
+
+/// `<hp:secPr>`를 방출한다.
+///
+/// 출처별 단일 방출(이중 방출 금지):
+/// 1. `secpr_raw_children`가 있으면(hwpx 출신) 원문 자식을 등장 순서대로 pass-through하고
+///    [`SECPR_PAGEPR_SLOT`] 자리에서만 페이지 정의로 pagePr을 재생성한다(GC-5).
+/// 2. hwp5 raw 필드(FOOTNOTE_SHAPE·PAGE_BORDER_FILL)가 있으면(hwp5 출신) 상수 대신
+///    실측 footNotePr/endNotePr/pageBorderFill을 재구성해 방출한다 — 교차 변환 손실 차단.
+/// 3. 둘 다 없으면(합성·구형 IR·secPr 주입) 기존 상수 템플릿을 방출한다 — 출력 바이트 불변.
+fn write_default_sec_pr(out: &mut String, def: Option<&SectionDef>) {
+    let fallback = default_page();
+    let p = def.and_then(|d| d.page.as_ref()).unwrap_or(&fallback);
+
+    // 1) hwpx 출신 원문 pass-through.
+    if let Some(d) = def
+        && !d.secpr_raw_children.is_empty()
+    {
+        out.push_str(SEC_PR_OPEN);
+        for child in &d.secpr_raw_children {
+            if child == hwp_model::SECPR_PAGEPR_SLOT {
+                write_page_pr(out, p);
+            } else {
+                out.push_str(child);
+            }
+        }
+        out.push_str("</hp:secPr>");
+        return;
+    }
+
+    // 2) hwp5 출신 raw 해석.
+    if let Some(d) = def
+        && (d.footnote_shape_raw.is_some()
+            || d.endnote_shape_raw.is_some()
+            || !d.page_border_fills_raw.is_empty())
+    {
+        write_sec_pr_head(out, p);
+        write_note_pr(out, "hp:footNotePr", d.footnote_shape_raw.as_deref(), false);
+        write_note_pr(out, "hp:endNotePr", d.endnote_shape_raw.as_deref(), true);
+        write_page_border_fills(out, &d.page_border_fills_raw);
+        out.push_str("</hp:secPr>");
+        return;
+    }
+
+    // 3) 상수 템플릿 — 기존 출력과 바이트 동일.
+    write_sec_pr_head(out, p);
+    out.push_str(CONST_FOOT_NOTE_PR);
+    out.push_str(CONST_END_NOTE_PR);
+    for s in CONST_PAGE_BORDER_FILL {
+        out.push_str(s);
+    }
+    out.push_str("</hp:secPr>");
+}
+
+/// FOOTNOTE_SHAPE(28B) raw를 `<hp:footNotePr>`/`<hp:endNotePr>`로 재구성한다.
+/// 레이아웃(gc23 조사 보고서 확정, 정품 전수 실측): 속성 u32, WCHAR×3(사용자기호/앞/뒤장식),
+/// 시작번호 u16, 구분선 길이 HWPUNIT(i32), 여백 u16×3(위/아래/주석사이), 구분선 종류 u8,
+/// 굵기 u8, 색 COLORREF. raw가 없거나 손상되면 상수 기본값으로 대체(secPr 유효성 보장).
+fn write_note_pr(out: &mut String, tag: &str, raw: Option<&[u8]>, is_end: bool) {
+    let Some(r) = raw.filter(|b| b.len() >= 28) else {
+        out.push_str(if is_end {
+            CONST_END_NOTE_PR
+        } else {
+            CONST_FOOT_NOTE_PR
+        });
+        return;
+    };
+    let attr = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+    let user_char = u16::from_le_bytes([r[4], r[5]]);
+    let prefix_char = u16::from_le_bytes([r[6], r[7]]);
+    let suffix_char = u16::from_le_bytes([r[8], r[9]]);
+    let start_num = u16::from_le_bytes([r[10], r[11]]);
+    let line_len = i32::from_le_bytes([r[12], r[13], r[14], r[15]]);
+    let above = u16::from_le_bytes([r[16], r[17]]);
+    let below = u16::from_le_bytes([r[18], r[19]]);
+    let between = u16::from_le_bytes([r[20], r[21]]);
+    let line_type = r[22];
+    let line_width = r[23];
+    let color = u32::from_le_bytes([r[24], r[25], r[26], r[27]]);
+
+    let num_fmt = note_num_format(attr & 0xFF);
+    let supscript = (attr >> 12) & 1;
+    let numbering = match (attr >> 10) & 0x3 {
+        1 => "ON_SECTION",
+        2 => "ON_PAGE",
+        _ => "CONTINUOUS",
+    };
+    // 미주는 배치가 다단(bits8-9)이 아니라 문서 끝 관례 — 정품 실측 END_OF_DOCUMENT.
+    let place = if is_end {
+        "END_OF_DOCUMENT"
+    } else {
+        match (attr >> 8) & 0x3 {
+            1 => "MERGED_COLUMN",
+            2 => "RIGHT_MARGIN",
+            _ => "EACH_COLUMN",
+        }
+    };
+    let _ = write!(
+        out,
+        r##"<{tag}><hp:autoNumFormat type="{num_fmt}" userChar="{}" prefixChar="{}" suffixChar="{}" supscript="{supscript}"/><hp:noteLine length="{line_len}" type="{}" width="{}" color="{}"/><hp:noteSpacing betweenNotes="{between}" belowLine="{below}" aboveLine="{above}"/><hp:numbering type="{numbering}" newNum="{start_num}"/><hp:placement place="{place}" beneathText="0"/></{tag}>"##,
+        wchar_attr(user_char),
+        wchar_attr(prefix_char),
+        wchar_attr(suffix_char),
+        note_line_type(line_type),
+        note_line_width_mm(line_width),
+        note_line_color(color),
+    );
+}
+
+/// PAGE_BORDER_FILL(14B) raw 목록을 `<hp:pageBorderFill>` 3종(BOTH/EVEN/ODD)으로 방출한다.
+/// 레이아웃(gc23 확정): 속성 u32(bit0 위치기준=종이·bit1 머리말·bit2 꼬리말·bits3-4 채울영역)
+/// 다음에 gap u16×4(left/right/top/bottom), 끝에 테두리ID u16(1-기반). 순서가 곧 BOTH/EVEN/ODD.
+/// 테두리ID는 hwpx borderFillIDRef와 1:1 대응(표 셀 테두리 승계 규약과 동일 — GE-7 전례).
+/// raw가 없거나 3개 미만이면 부족분은 상수로 채워 3종을 항상 방출한다.
+fn write_page_border_fills(out: &mut String, raws: &[Vec<u8>]) {
+    const TYPES: [&str; 3] = ["BOTH", "EVEN", "ODD"];
+    for (i, ty) in TYPES.iter().enumerate() {
+        let Some(r) = raws.get(i).filter(|b| b.len() >= 14) else {
+            out.push_str(CONST_PAGE_BORDER_FILL[i]);
+            continue;
+        };
+        let attr = u32::from_le_bytes([r[0], r[1], r[2], r[3]]);
+        let left = u16::from_le_bytes([r[4], r[5]]);
+        let right = u16::from_le_bytes([r[6], r[7]]);
+        let top = u16::from_le_bytes([r[8], r[9]]);
+        let bottom = u16::from_le_bytes([r[10], r[11]]);
+        let bf_id = u16::from_le_bytes([r[12], r[13]]).max(1);
+        let text_border = if attr & 1 != 0 { "PAPER" } else { "PAGE" };
+        let header_inside = (attr >> 1) & 1;
+        let footer_inside = (attr >> 2) & 1;
+        let fill_area = match (attr >> 3) & 0x3 {
+            1 => "PAGE",
+            2 => "BORDER",
+            _ => "PAPER",
+        };
+        let _ = write!(
+            out,
+            r##"<hp:pageBorderFill type="{ty}" borderFillIDRef="{bf_id}" textBorder="{text_border}" headerInside="{header_inside}" footerInside="{footer_inside}" fillArea="{fill_area}"><hp:offset left="{left}" right="{right}" top="{top}" bottom="{bottom}"/></hp:pageBorderFill>"##,
+        );
+    }
+}
+
+/// hwp5 번호 모양 코드 → hwpx autoNumFormat@type. 확신 가능한 흔한 값만 매핑하고
+/// 그 밖은 DIGIT으로 강등(한글 유효성 우선).
+fn note_num_format(fmt: u32) -> &'static str {
+    match fmt {
+        0 => "DIGIT",
+        1 => "CIRCLE_DIGIT",
+        2 => "ROMAN_CAPITAL",
+        3 => "ROMAN_SMALL",
+        4 => "LATIN_CAPITAL",
+        5 => "LATIN_SMALL",
+        _ => "DIGIT",
+    }
+}
+
+/// 구분선 종류 코드 → hwpx noteLine@type. 미상/0은 SOLID로 강등(구분선은 항상 그려짐).
+fn note_line_type(code: u8) -> &'static str {
+    match code {
+        2 => "DASH",
+        3 => "DOT",
+        4 => "DASH_DOT",
+        5 => "DASH_DOT_DOT",
+        6 => "LONG_DASH",
+        _ => "SOLID",
+    }
+}
+
+/// 구분선 굵기 인덱스 → "N mm" (한글 굵기 표 재사용). 정수는 "0.4 mm", 소수는 "0.12 mm".
+fn note_line_width_mm(code: u8) -> String {
+    let line = hwp_model::BorderLine {
+        line_type: 1,
+        width: code,
+        color: 0,
+    };
+    let mm = line.width_mm();
+    if (mm - mm.round()).abs() < f32::EPSILON {
+        format!("{} mm", mm.round() as i32)
+    } else {
+        format!("{mm} mm")
+    }
+}
+
+/// 구분선 색 COLORREF → "#rrggbb". 없음(0xFFFFFFFF)은 검정으로 대체(구분선은 색이 필요).
+fn note_line_color(c: u32) -> String {
+    if c == 0xFFFF_FFFF {
+        "#000000".to_string()
+    } else {
+        color_attr(c)
+    }
+}
+
+/// WCHAR(u16) → 속성값. 0(없음)은 빈 문자열, 그 외는 문자로 변환 후 XML 이스케이프.
+fn wchar_attr(wc: u16) -> String {
+    if wc == 0 {
+        return String::new();
+    }
+    match char::from_u32(u32::from(wc)) {
+        Some(c) => esc(&c.to_string()),
+        None => String::new(),
+    }
 }
 
 fn write_col_ctrl(out: &mut String, col: Option<&hwp_model::ColumnDef>) {
@@ -597,12 +900,11 @@ fn write_header_footer(
     let _ = write!(out, "</hp:{el}></hp:ctrl>");
 }
 
-/// 각주/미주(fn/en) — 한글 저장본 실측 형태로 방출한다:
-/// `<hp:ctrl><hp:footNote number="N" suffixChar="41" instId="…"><hp:subList>…</hp:subList></hp:footNote></hp:ctrl>`
-/// 노트 본문 첫 run의 autoNum도 `numType="FOOTNOTE|ENDNOTE" num="N"`(+autoNumFormat)으로 맞춘다
-/// (write_header_footer와 같은 subList 스캐폴드, 문단은 write_paragraph 재귀 방출).
+/// 각주/미주 — `<hp:footNote>`/`<hp:endNote>` + 본문 `<hp:subList>`.
+/// reader(section.rs)는 `footNote`/`endNote` 요소를 `fn `/`en ` GenericControl로
+/// 되읽고 subList 문단을 paragraph_lists로 수집한다 — 속성은 무시하므로 표준값을 쓴다.
 #[allow(clippy::too_many_arguments)]
-fn write_footnote(
+fn write_foot_end_note(
     out: &mut String,
     doc: &Document,
     g: &GenericControl,
@@ -611,6 +913,8 @@ fn write_footnote(
     preserve_linesegs: bool,
     warnings: &mut Vec<String>,
 ) {
+    // 한글 저장본 실측 형태(정답지=커밋 픽스처): number는 종류별 1-기반 수열,
+    // suffixChar="41", instId는 문서 고유값(정품도 임의 u32 — 큰 베이스로 합성).
     let foot = g.ctrl_id == *b"fn  ";
     let (el, num_type) = if foot {
         ids.footnote += 1;
@@ -620,7 +924,6 @@ fn write_footnote(
         ("endNote", "ENDNOTE")
     };
     let number = if foot { ids.footnote } else { ids.endnote };
-    // instId는 문서 고유값이면 된다(실측 정품도 임의 u32) — ids 카운터에 큰 베이스를 더해 합성.
     let inst_id = 0x4000_0000 + ids.next();
     let _ = write!(
         out,
@@ -1097,7 +1400,9 @@ fn write_table(
     table: &Table,
     ids: &mut IdSeq,
     bins: &mut BinCollector,
-    preserve_linesegs: bool,
+    // 표 셀 줄 배치는 전역 옵션과 무관하게 항상 방출한다(아래 참조). 시그니처는
+    // 다른 write_* 와 대칭 유지를 위해 남긴다.
+    _preserve_linesegs: bool,
     warnings: &mut Vec<String>,
 ) {
     let cols = table.cols.max(1) as usize;
@@ -1117,70 +1422,64 @@ fn write_table(
     let total_w: i64 = col_w.iter().sum();
     let total_h: i64 = row_h.iter().sum();
 
-    // 배치·표 속성: hwpx 출신 표(placement Some)는 IR 실측값을 그대로 방출한다 —
-    // 상수로 덮으면 zOrder/noAdjust/treatAsChar/outMargin이 원본과 달라져 한글이
-    // 재배치하며 겹침·빈 페이지가 생긴다(read 쪽 주석과 동일 근거, 정답지=픽스처).
-    // placement None(markdown 합성·hwp5 출신)은 실기 통과 이력이 있는 기존 상수 유지.
     let m = table.inner_margins;
-    if let Some(p) = &table.placement {
-        let a = table.attr;
-        let page_break = match a & 0x3 {
+    // 표 개체 속성(attr, 표 75): bits0-1=쪽 경계에서 나눔(NONE=0/TABLE=1/CELL=2),
+    // bit2=제목 줄 자동 반복, bit3=자동 너비 조정 안 함. 원본(hwp5/hwpx 출신)의 값을
+    // 그대로 방출한다 — 하드코딩(CELL/1/0)은 원본이 "나누지 않음(0)"인 표까지 CELL로
+    // 강제해 충실도를 깬다. 합성 표(md/synth 출신 — common_data·placement 모두 비어
+    // attr=0)만 정품 기본값(CELL+제목반복)으로 폴백한다.
+    let synthesized = table.common_data.is_empty() && table.placement.is_none();
+    let (page_break, repeat_header, no_adjust) = if synthesized {
+        ("CELL", 1u32, 0u32)
+    } else {
+        let pb = match table.attr & 0b11 {
             1 => "TABLE",
             2 => "CELL",
             _ => "NONE",
         };
-        let vert_rel = ["PAPER", "PAGE", "PARA", "PARA"][usize::from(p.vert_rel_to & 3)];
-        let horz_rel = ["PAPER", "PAGE", "COLUMN", "PARA"][usize::from(p.horz_rel_to & 3)];
-        let vert_align = ["TOP", "CENTER", "BOTTOM"][usize::from(p.vert_align.min(2))];
-        let horz_align = ["LEFT", "CENTER", "RIGHT"][usize::from(p.horz_align.min(2))];
-        // hp:sz — 원본 경계값이 있으면 사용(병합 셀 합산 추정보다 정확), 없으면 합산.
-        let (sz_w, sz_h) = if p.width > 0 && p.height > 0 {
-            (i64::from(p.width), i64::from(p.height))
-        } else {
-            (total_w, total_h)
-        };
-        let om = p.out_margins;
-        let _ = write!(
-            out,
-            r##"<hp:tbl id="{}" zOrder="{}" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="{page_break}" repeatHeader="{}" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="{}"><hp:sz width="{sz_w}" widthRelTo="ABSOLUTE" height="{sz_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="{}" affectLSpacing="{}" flowWithText="{}" allowOverlap="0" holdAnchorAndSO="{}" vertRelTo="{vert_rel}" horzRelTo="{horz_rel}" vertAlign="{vert_align}" horzAlign="{horz_align}" vertOffset="{}" horzOffset="{}"/><hp:outMargin left="{}" right="{}" top="{}" bottom="{}"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
-            ids.next(),
-            p.z_order,
-            (a >> 2) & 1,
-            table.rows,
-            table.cols,
-            table.cell_spacing,
-            table.border_fill.0.max(1),
-            (a >> 3) & 1,
-            u8::from(p.treat_as_char),
-            u8::from(p.affect_line_spacing),
-            u8::from(p.flow_with_text),
-            u8::from(p.hold_anchor),
-            p.vert_offset,
-            p.horz_offset,
-            om[0],
-            om[1],
-            om[2],
-            om[3],
-            m[0],
-            m[1],
-            m[2],
-            m[3],
-        );
-    } else {
-        let _ = write!(
-            out,
-            r##"<hp:tbl id="{}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="1" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="0"><hp:sz width="{total_w}" widthRelTo="ABSOLUTE" height="{total_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/><hp:outMargin left="283" right="283" top="283" bottom="283"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
-            ids.next(),
-            table.rows,
-            table.cols,
-            table.cell_spacing,
-            table.border_fill.0.max(1),
-            m[0],
-            m[1],
-            m[2],
-            m[3],
-        );
-    }
+        (pb, (table.attr >> 2) & 1, (table.attr >> 3) & 1)
+    };
+    // 배치 승계(GsoPlacement): hwp5/hwpx 출신은 원본 개체 공통 속성이 담겨 있다.
+    // treatAsChar=0(부유) 표만 페이지에 걸쳐 분할되고, treatAsChar=1(글자처럼)은
+    // "한 글자"로 배치돼 분할 불가라 하단을 관통한다(정답지 직대조 확정 — GE-8 진범).
+    // sz도 원본 개체 폭/높이를 유지한다(행높이 합산 재계산은 페이지 걸침 표에서 과다).
+    // 합성 표(md/synth — placement=None)만 인라인 기본값·재계산으로 폴백한다.
+    let pl = table.placement.as_ref();
+    let sz_w = pl.map(|p| p.width).filter(|&w| w > 0).map_or(total_w, i64::from);
+    let sz_h = pl
+        .map(|p| p.height)
+        .filter(|&h| h > 0)
+        .map_or(total_h, i64::from);
+    let treat_as_char = pl.map_or(1, |p| u32::from(p.treat_as_char));
+    let affect_lspacing = pl.map_or(0, |p| u32::from(p.affect_line_spacing));
+    let flow_with_text = pl.map_or(1, |p| u32::from(p.flow_with_text));
+    let vert_rel = pl.map_or("PARA", |p| vert_rel_to_name(p.vert_rel_to));
+    let horz_rel = pl.map_or("PARA", |p| horz_rel_to_name(p.horz_rel_to));
+    let vert_align = pl.map_or("TOP", |p| vert_align_name(p.vert_align));
+    let horz_align = pl.map_or("LEFT", |p| horz_align_name(p.horz_align));
+    let vert_offset = pl.map_or(0, |p| p.vert_offset);
+    let horz_offset = pl.map_or(0, |p| p.horz_offset);
+    // zOrder·outMargin도 원본 값 승계(픽스처 실측: zOrder 0~10, outMargin 141 —
+    // 상수로 뭉개면 도형 겹침 순서·바깥 여백이 원본과 어긋난다). 합성 표는 기존 기본값.
+    let z_order = pl.map_or(0, |p| p.z_order);
+    let om = pl.map_or([283u16; 4], |p| p.out_margins);
+    let _ = write!(
+        out,
+        r##"<hp:tbl id="{}" zOrder="{z_order}" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="{page_break}" repeatHeader="{repeat_header}" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="{no_adjust}"><hp:sz width="{sz_w}" widthRelTo="ABSOLUTE" height="{sz_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="{treat_as_char}" affectLSpacing="{affect_lspacing}" flowWithText="{flow_with_text}" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="{vert_rel}" horzRelTo="{horz_rel}" vertAlign="{vert_align}" horzAlign="{horz_align}" vertOffset="{vert_offset}" horzOffset="{horz_offset}"/><hp:outMargin left="{}" right="{}" top="{}" bottom="{}"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
+        ids.next(),
+        table.rows,
+        table.cols,
+        table.cell_spacing,
+        table.border_fill.0.max(1),
+        om[0],
+        om[1],
+        om[2],
+        om[3],
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+    );
 
     // 행별 그룹화 (셀은 행 우선 순서로 보존되어 있음)
     let mut by_row: BTreeMap<u16, Vec<&Cell>> = BTreeMap::new();
@@ -1196,16 +1495,14 @@ fn write_table(
                 cell.border_fill.0.max(1),
             );
             for para in &cell.paragraphs {
-                write_paragraph(
-                    out,
-                    doc,
-                    para,
-                    ids,
-                    bins,
-                    false,
-                    preserve_linesegs,
-                    warnings,
-                );
+                // 표 셀 문단은 항상 linesegarray를 방출한다(정품 실측 — 한글 자신의
+                // hwp→hwpx 변환·정품 hwpx 모두 표 셀에 줄 배치를 100% 담는다). 쪽에
+                // 걸치는 긴 표를 한글이 셀 안에서 나누려면 각 줄의 세로 위치(vertpos)가
+                // 필요하다. 이게 없으면 셀이 통째로 원자 취급돼 페이지 하단을 넘쳐
+                // 잘린다(GE-8 실기 결함). write_paragraph 내부 가드가 line_segs가 있을
+                // 때만 방출하므로, 편집으로 줄 배치를 지운 문단(edit.rs가 clear)·md
+                // 출신(줄 배치 없음)은 자동으로 비게 돼 "변조" 경고 위험이 없다.
+                write_paragraph(out, doc, para, ids, bins, false, true, warnings);
             }
             let cm = cell.margins;
             let _ = write!(
@@ -1245,11 +1542,27 @@ fn write_picture(
     };
     let (w, h) = (pic.width.0.max(1), pic.height.0.max(1));
     let id = ids.next();
-    let _ = write!(
-        out,
-        r##"<hp:pic id="{id}" zOrder="0" numberingType="PICTURE" textWrap="SQUARE" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="{id}" reverse="0"><hp:offset x="0" y="0"/><hp:orgSz width="{w}" height="{h}"/><hp:curSz width="{w}" height="{h}"/><hp:flip horizontal="0" vertical="0"/><hp:rotationInfo angle="0" centerX="{}" centerY="{}" rotateimage="1"/><hp:renderingInfo><hc:transMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:scaMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/></hp:renderingInfo><hc:img binaryItemIDRef="{item}" bright="0" contrast="0" effect="REAL_PIC" alpha="0"/><hp:imgRect><hc:pt0 x="0" y="0"/><hc:pt1 x="{w}" y="0"/><hc:pt2 x="{w}" y="{h}"/><hc:pt3 x="0" y="{h}"/></hp:imgRect><hp:imgClip left="0" right="{w}" top="0" bottom="{h}"/><hp:inMargin left="0" right="0" top="0" bottom="0"/><hp:imgDim dimwidth="{w}" dimheight="{h}"/><hp:sz width="{w}" widthRelTo="ABSOLUTE" height="{h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="{}" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/><hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:pic>"##,
-        w / 2,
-        h / 2,
-        u8::from(pic.treat_as_char),
-    );
+    // 부유(글 앞) 그림 — 도장 등 본문 위에 겹쳐야 하는 개체(treatAsChar=0).
+    // 인라인(treatAsChar=1)은 정품 실측(A1_work_report의 로고 hp:pic) 그대로 두고,
+    // 부유일 때만 겹침이 되도록 속성을 바꾼다: textWrap=IN_FRONT_OF_TEXT +
+    // flowWithText=0 + allowOverlap=1 (테스트2·도형정답지2 정품 부유 도형 실측 조합).
+    // SQUARE+allowOverlap=0(구 동작)은 한글이 본문을 밀어내 겹치지 못한다(D1 결함).
+    // 위치는 문단 기준(vertRelTo/horzRelTo=PARA)이며 pic의 세로/가로 오프셋과
+    // z-순서를 반영한다(insert_seal이 앵커 위로 계산한 값을 그대로 방출).
+    if pic.treat_as_char {
+        let _ = write!(
+            out,
+            r##"<hp:pic id="{id}" zOrder="0" numberingType="PICTURE" textWrap="SQUARE" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="{id}" reverse="0"><hp:offset x="0" y="0"/><hp:orgSz width="{w}" height="{h}"/><hp:curSz width="{w}" height="{h}"/><hp:flip horizontal="0" vertical="0"/><hp:rotationInfo angle="0" centerX="{}" centerY="{}" rotateimage="1"/><hp:renderingInfo><hc:transMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:scaMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/></hp:renderingInfo><hc:img binaryItemIDRef="{item}" bright="0" contrast="0" effect="REAL_PIC" alpha="0"/><hp:imgRect><hc:pt0 x="0" y="0"/><hc:pt1 x="{w}" y="0"/><hc:pt2 x="{w}" y="{h}"/><hc:pt3 x="0" y="{h}"/></hp:imgRect><hp:imgClip left="0" right="{w}" top="0" bottom="{h}"/><hp:inMargin left="0" right="0" top="0" bottom="0"/><hp:imgDim dimwidth="{w}" dimheight="{h}"/><hp:sz width="{w}" widthRelTo="ABSOLUTE" height="{h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/><hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:pic>"##,
+            w / 2,
+            h / 2,
+        );
+    } else {
+        let (voff, hoff, zorder) = (pic.vert_offset, pic.horz_offset, pic.z_order);
+        let _ = write!(
+            out,
+            r##"<hp:pic id="{id}" zOrder="{zorder}" numberingType="PICTURE" textWrap="IN_FRONT_OF_TEXT" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" href="" groupLevel="0" instid="{id}" reverse="0"><hp:offset x="0" y="0"/><hp:orgSz width="{w}" height="{h}"/><hp:curSz width="{w}" height="{h}"/><hp:flip horizontal="0" vertical="0"/><hp:rotationInfo angle="0" centerX="{}" centerY="{}" rotateimage="1"/><hp:renderingInfo><hc:transMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:scaMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/><hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/></hp:renderingInfo><hc:img binaryItemIDRef="{item}" bright="0" contrast="0" effect="REAL_PIC" alpha="0"/><hp:imgRect><hc:pt0 x="0" y="0"/><hc:pt1 x="{w}" y="0"/><hc:pt2 x="{w}" y="{h}"/><hc:pt3 x="0" y="{h}"/></hp:imgRect><hp:imgClip left="0" right="{w}" top="0" bottom="{h}"/><hp:inMargin left="0" right="0" top="0" bottom="0"/><hp:imgDim dimwidth="{w}" dimheight="{h}"/><hp:sz width="{w}" widthRelTo="ABSOLUTE" height="{h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="0" allowOverlap="1" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="{voff}" horzOffset="{hoff}"/><hp:outMargin left="0" right="0" top="0" bottom="0"/></hp:pic>"##,
+            w / 2,
+            h / 2,
+        );
+    }
 }

@@ -109,7 +109,12 @@ fn parse_id_mapping_child(
                 header.extras.push(to_opaque(node));
             }
         },
-        tag::TAB_DEF => header.tab_defs.push(raw_entry(node)),
+        tag::TAB_DEF => {
+            // raw 보존은 그대로(hwp5 identity 재직렬화 경로가 이 raw를 재방출).
+            header.tab_defs.push(raw_entry(node));
+            // 병렬 의미 파싱(§4.2.7). 실패해도 빈 정의를 밀어 tab_defs와 길이를 맞춘다.
+            header.tab_stops.push(parse_tab_def(&node.data));
+        }
         tag::NUMBERING => {
             header.numberings.push(raw_entry(node));
             // 렌더 전용: 수준별 형식 템플릿("^1." "(^5)" "제^1조")을 파싱한다.
@@ -118,10 +123,12 @@ fn parse_id_mapping_child(
                 .push(parse_numbering_levels(&node.data));
         }
         tag::BULLET => {
-            // 글머리 문자 = BULLET offset+8의 WCHAR(UTF-16LE).
+            // 글머리 문자 = BULLET **offset 12**의 WCHAR(UTF-16LE) — 정품 실측(사업계획서
+            // 전수). [0..8]=문단 머리 정보, [8..12]=번호 글자모양 id(0xFFFFFFFF), [12..14]=문자.
+            // (스펙 md 표42의 오프셋 8은 오답 — 그 위치는 글자모양 id의 하위 워드다.)
             let ch = node
                 .data
-                .get(8..10)
+                .get(12..14)
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .and_then(|u| char::from_u32(u32::from(u)))
                 .filter(|c| !c.is_control())
@@ -269,7 +276,17 @@ fn parse_para_shape(data: &[u8]) -> Result<ParaShape> {
     let spacing_bottom = r.read_i32()?;
     let line_spacing_old = r.read_i32()?;
     let tab_def_id = r.read_u16()?;
-    let numbering_id = r.read_u16()?;
+    // 번호/글머리 머리(head_type 2/3)의 on-disk id는 1-기반(스펙 §4.2.10, 0=none).
+    // IR 규약은 0-기반(numbering_levels/bullet_chars 인덱스)이므로 경계에서 -1 정규화한다.
+    // 개요(1)·머리없음(0)은 다른 참조 체계라 그대로 둔다. emit_para_shape가 쓰기 시 +1로
+    // 복원하므로 hwp5 왕복은 무손실이다(정품 문단모양은 head 2/3면 항상 id≥1).
+    let numbering_id_raw = r.read_u16()?;
+    let head_type = ((attr1 >> 23) & 0x3) as u8;
+    let numbering_id = if matches!(head_type, 2 | 3) {
+        numbering_id_raw.saturating_sub(1)
+    } else {
+        numbering_id_raw
+    };
     let border_fill_id = r.read_u16()?;
     let mut border_offsets = [0i16; 4];
     for v in &mut border_offsets {
@@ -396,6 +413,38 @@ fn raw_entry(node: &RecordNode) -> RawEntry {
     }
 }
 
+/// TAB_DEF(§4.2.7) 의미 파싱 — 관용 파싱. 구조가 어긋나면 지금까지 읽은 만큼만 담는다.
+///
+/// 레이아웃: 헤더 8바이트 `[속성 UINT32, count UINT16, 예약 UINT16]` +
+/// 항목 8바이트 × count `[위치 HWPUNIT(i32), 종류 UINT8, 채움 UINT8, 예약 UINT16]`.
+/// raw 보존(`tab_defs`)이 별도로 있으므로 여기서 실패해도 데이터 손실이 아니다.
+fn parse_tab_def(data: &[u8]) -> hwp_model::TabDef {
+    let mut td = hwp_model::TabDef::default();
+    let mut r = ByteReader::new(data);
+    let Ok(attr) = r.read_u32() else {
+        return td;
+    };
+    td.attr = attr;
+    let Ok(count) = r.read_u16() else {
+        return td;
+    };
+    // 8바이트 헤더 정렬용 예약 2바이트.
+    if r.read_u16().is_err() {
+        return td;
+    }
+    for _ in 0..count {
+        let (Ok(pos), Ok(kind), Ok(fill)) = (r.read_i32(), r.read_u8(), r.read_u8()) else {
+            break;
+        };
+        // 8바이트 항목 정렬용 예약 2바이트(모자라면 그 항목만 누락).
+        if r.read_u16().is_err() {
+            break;
+        }
+        td.items.push(hwp_model::TabItem { pos, kind, fill });
+    }
+    td
+}
+
 /// NUMBERING 레코드에서 7수준 형식 템플릿을 파싱한다(렌더 전용).
 /// 수준마다 `[속성 u32, 너비보정 u16, 본문거리 u16, 글자모양ref u32(=0xFFFFFFFF), 템플릿(HWP string)]`.
 /// 구조가 어긋나면 그 수준부터 기본값(빈 템플릿)으로 폴백한다(회귀 없음). 시작번호(대개 1)는
@@ -464,5 +513,67 @@ mod numbering_tests {
         let levels = parse_numbering_levels(data);
         assert_eq!(levels.len(), 7);
         assert!(levels.iter().all(|l| l.template.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod tab_def_tests {
+    use super::parse_tab_def;
+
+    #[test]
+    fn 탭정의_스펙레이아웃_파싱() {
+        // §4.2.7: 헤더 8바이트[속성=1(자동왼탭), count=2, 예약0] +
+        // 항목 8바이트 ×2 [위치, 종류, 채움, 예약].
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // 속성: bit0 자동왼탭
+        data.extend_from_slice(&2u16.to_le_bytes()); // count=2
+        data.extend_from_slice(&0u16.to_le_bytes()); // 예약
+        // 항목1: 위치 4000, 오른쪽(1), 채움 DASH(2)
+        data.extend_from_slice(&4000i32.to_le_bytes());
+        data.push(1);
+        data.push(2);
+        data.extend_from_slice(&0u16.to_le_bytes());
+        // 항목2: 위치 8000, 소수점(3), 채움 DOT(3)
+        data.extend_from_slice(&8000i32.to_le_bytes());
+        data.push(3);
+        data.push(3);
+        data.extend_from_slice(&0u16.to_le_bytes());
+
+        let td = parse_tab_def(&data);
+        assert!(td.auto_tab_left() && !td.auto_tab_right());
+        assert_eq!(td.items.len(), 2);
+        assert_eq!(td.items[0].pos, 4000);
+        assert_eq!(td.items[0].kind, 1);
+        assert_eq!(td.items[0].fill, 2);
+        assert_eq!(td.items[1].pos, 8000);
+        assert_eq!(td.items[1].kind, 3);
+        assert_eq!(td.items[1].fill, 3);
+    }
+
+    #[test]
+    fn 항목없는_탭정의() {
+        // hello_world 기본 탭 raw: 속성만(자동오른탭), count=0.
+        let data = [2u8, 0, 0, 0, 0, 0, 0, 0];
+        let td = parse_tab_def(&data);
+        assert!(!td.auto_tab_left() && td.auto_tab_right());
+        assert!(td.items.is_empty());
+    }
+
+    #[test]
+    fn 잘린_바이트는_관용파싱() {
+        // count=5라 주장하지만 항목 1개 분량만 존재 → 읽은 만큼만(1개) 담고 중단.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&5u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&100i32.to_le_bytes());
+        data.push(0);
+        data.push(1);
+        data.extend_from_slice(&0u16.to_le_bytes());
+        let td = parse_tab_def(&data);
+        assert_eq!(td.items.len(), 1);
+        assert_eq!(td.items[0].pos, 100);
+        // 헤더조차 모자라면 빈 정의(패닉 없음).
+        assert!(parse_tab_def(&[1, 2]).items.is_empty());
     }
 }

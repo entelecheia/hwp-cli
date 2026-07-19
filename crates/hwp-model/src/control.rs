@@ -67,6 +67,13 @@ pub enum BinRef {
     ItemRef(String),
 }
 
+/// hwpx `<hp:secPr>`의 미해석 자식이 저장될 [`SectionDef::secpr_raw_children`]에서
+/// `<hp:pagePr>`(의미 파싱되어 페이지 정의로 재방출됨)가 자식 순서상 놓일 자리를
+/// 표시하는 센티넬. 실제 XML엔 나타날 수 없는 제어문자 조합이라 원문과 충돌하지 않는다.
+/// reader가 이 마커를 삽입하고, writer가 이 자리에서 페이지 정의로부터 생성한 pagePr을
+/// 방출한다(원본 자식 순서 보존).
+pub const SECPR_PAGEPR_SLOT: &str = "\u{0}pagePr\u{0}";
+
 /// 구역 정의 컨트롤.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SectionDef {
@@ -77,10 +84,26 @@ pub struct SectionDef {
     pub page: Option<PageDef>,
     /// FOOTNOTE_SHAPE, PAGE_BORDER_FILL 등 미해석 자식
     pub extras: Vec<OpaqueRecord>,
-    /// hwpx 출신이면 원본 `<hp:secPr>` XML 전문 — 비-기본 secPr(각주 모양·쪽
-    /// 테두리 커스텀 등)의 무손실 왕복용. 있으면 hwpx writer가 템플릿 대신 verbatim 방출.
+    /// hwpx `<hp:secPr>`의 미해석 자식(grid/startNum/visibility/lineNumberShape/
+    /// footNotePr/endNotePr/pageBorderFill 등)의 원문 XML을 등장 순서대로 보존한다.
+    /// pagePr 자리는 [`SECPR_PAGEPR_SLOT`] 마커로 표시된다(페이지 정의에서 재생성).
+    /// 비어 있으면(hwp5 출신·구형 IR) writer가 기존 상수 템플릿을 방출한다.
+    #[serde(default)]
+    pub secpr_raw_children: Vec<String>,
+    /// hwp5 출신 구역의 각주 모양(FOOTNOTE_SHAPE, 28B) 원본 바이트 — 교차 변환(→hwpx)
+    /// 시 상수 대신 실측 footNotePr을 재구성하는 데 쓰는 **병행 사본**이다.
+    /// 무손실 identity 게이트의 정본은 여전히 [`SectionDef::extras`]의 Opaque이며,
+    /// 이 필드는 그 사본일 뿐 hwp5 재직렬화 경로엔 관여하지 않는다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hwpx_raw: Option<String>,
+    pub footnote_shape_raw: Option<Vec<u8>>,
+    /// hwp5 출신 구역의 미주 모양(FOOTNOTE_SHAPE 태그 공유, 28B) 원본 바이트.
+    /// secd 자식 중 **둘째** FOOTNOTE_SHAPE가 미주다(정품 실측 순서: 각주→미주).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endnote_shape_raw: Option<Vec<u8>>,
+    /// hwp5 출신 구역의 쪽 테두리/배경(PAGE_BORDER_FILL, 14B) 원본 바이트.
+    /// 등장 순서가 곧 BOTH/EVEN/ODD다(구역당 최대 3개, 정품 실측).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub page_border_fills_raw: Vec<Vec<u8>>,
 }
 
 /// PAGE_DEF (40바이트) — 용지 정의.

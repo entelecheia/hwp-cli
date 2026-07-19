@@ -15,7 +15,7 @@
 //!   겹침만 아래로 밀어낸다.
 //! - lineseg가 아예 없는 문단은 본문 폭 기준 폴백 배치.
 
-use hwp_model::{Control, Document, HwpUnit, PageDef, Paragraph, Table};
+use hwp_model::{BorderFill, Control, Document, HwpUnit, PageDef, Paragraph, Section, Table};
 
 use crate::display::{DisplayList, Item, PageList, PathCmd};
 use crate::fonts::FontStore;
@@ -87,6 +87,131 @@ fn default_page() -> PageDef {
     }
 }
 
+/// 쪽 테두리 정의(PAGE_BORDER_FILL 14바이트, gc23 실측으로 확정한 레이아웃).
+/// 속성 u32(위치기준 bit0·머리말 bit1·꼬리말 bit2·채울영역 bit3-4) + gap u16×4
+/// (왼/오/위/아래, HWPUNIT16) + 테두리ID u16(1-기반, BORDER_FILL 참조).
+struct PageBorderFill {
+    /// 위치기준 bit0: false=쪽(본문) 기준, true=종이 기준. 정품 실측 기본값=종이.
+    paper_relative: bool,
+    /// gap 왼/오/위/아래 (HWPUNIT — 정품 기본 1417 ≈ 5mm).
+    gap: [u16; 4],
+    /// BORDER_FILL 참조 id(1-기반). 1 = 전 변 무테두리 관례.
+    border_fill_id: u16,
+}
+
+/// PAGE_BORDER_FILL 14바이트 원문을 해석한다. 길이 부족이면 None.
+fn parse_page_border_fill(raw: &[u8]) -> Option<PageBorderFill> {
+    if raw.len() < 14 {
+        return None;
+    }
+    let attr = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let g = |o: usize| u16::from_le_bytes([raw[o], raw[o + 1]]);
+    Some(PageBorderFill {
+        paper_relative: attr & 1 != 0,
+        gap: [g(4), g(6), g(8), g(10)],
+        border_fill_id: g(12),
+    })
+}
+
+/// 구역의 PAGE_BORDER_FILL 중 BOTH를 찾는다.
+///
+/// 데이터 소스: `SectionDef.page_border_fills_raw`(과제 1)를 소비한다. 등장 순서가
+/// 곧 BOTH/EVEN/ODD이므로 BOTH = 첫 원소다. EVEN/ODD 분기는 범위 밖(정품 표본 부재).
+fn section_page_border_fill(section: &Section) -> Option<PageBorderFill> {
+    let sd = section.section_def()?;
+    let raw = sd.page_border_fills_raw.first()?;
+    parse_page_border_fill(raw)
+}
+
+/// 쪽 테두리 한 변(페이지 좌표, pt).
+struct PageBorderEdge {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    color: u32,
+    width: f32,
+}
+
+/// 쪽 테두리 사각형의 4변 중 그릴 변(line_type≠0)만 계산한다.
+/// 테두리ID 유효범위 밖(0 포함)이거나 참조 BorderFill이 전 변 무테두리면 빈 벡터.
+#[allow(clippy::too_many_arguments)]
+fn build_page_border_edges(
+    pbf: &PageBorderFill,
+    border_fills: &[BorderFill],
+    paper_w: f32,
+    paper_h: f32,
+    body_left: f32,
+    body_top: f32,
+    body_right: f32,
+    body_bottom: f32,
+) -> Vec<PageBorderEdge> {
+    // id는 1-기반. 0이거나 범위 밖이면 무출력(기본 문서 불변).
+    let Some(bf) = (pbf.border_fill_id as usize)
+        .checked_sub(1)
+        .and_then(|i| border_fills.get(i))
+    else {
+        return Vec::new();
+    };
+    // gap HWPUNIT → pt (/100). 순서: 왼/오/위/아래.
+    let (gl, gr, gt, gb) = (
+        pbf.gap[0] as f32 / 100.0,
+        pbf.gap[1] as f32 / 100.0,
+        pbf.gap[2] as f32 / 100.0,
+        pbf.gap[3] as f32 / 100.0,
+    );
+    let (x1, y1, x2, y2) = if pbf.paper_relative {
+        // 종이 기준: 용지 가장자리에서 gap만큼 안쪽 사각형(정품 실측 경로).
+        (gl, gt, paper_w - gr, paper_h - gb)
+    } else {
+        // 쪽(본문) 기준: 본문 영역 가장자리에서 gap만큼 바깥(여백 쪽). 정품 표본
+        // 부재 — 근사 구현(EVEN/ODD와 함께 후속 실측으로 정밀화).
+        (body_left - gl, body_top - gt, body_right + gr, body_bottom + gb)
+    };
+    // sides: [왼, 오른, 위, 아래]. 각 변을 해당 line_type≠0일 때만 긋는다.
+    let seg = [
+        (x1, y1, x1, y2), // 왼
+        (x2, y1, x2, y2), // 오른
+        (x1, y1, x2, y1), // 위
+        (x1, y2, x2, y2), // 아래
+    ];
+    let mut edges = Vec::new();
+    for (side, (sx1, sy1, sx2, sy2)) in bf.sides.iter().zip(seg) {
+        if side.is_visible() {
+            edges.push(PageBorderEdge {
+                x1: sx1,
+                y1: sy1,
+                x2: sx2,
+                y2: sy2,
+                color: side.color,
+                width: side.width_mm() * 72.0 / 25.4, // mm → pt
+            });
+        }
+    }
+    edges
+}
+
+/// 계산된 쪽 테두리 변들을 페이지 아이템 맨 앞에 삽입한다(텍스트/개체 뒤 = 뒤에 그림).
+/// 변 기하는 구역당 1회 계산하고, Item::Line은 페이지마다 새로 만든다(Item는 Clone 불가).
+fn prepend_page_borders(page: &mut PageList, edges: &[PageBorderEdge]) {
+    if edges.is_empty() {
+        return;
+    }
+    let mut items: Vec<Item> = edges
+        .iter()
+        .map(|e| Item::Line {
+            x1: e.x1,
+            y1: e.y1,
+            x2: e.x2,
+            y2: e.y2,
+            color: e.color,
+            width: e.width,
+        })
+        .collect();
+    items.append(&mut page.items);
+    page.items = items;
+}
+
 pub fn layout_document(
     doc: &Document,
     store: &mut FontStore,
@@ -95,6 +220,8 @@ pub fn layout_document(
     let mut pages = Vec::new();
 
     for section in &doc.sections {
+        // 이 구역의 첫 페이지 인덱스 — 구역 끝에서 쪽 테두리를 전 페이지에 소급 삽입한다.
+        let section_first_page = pages.len();
         let page_def = section
             .section_def()
             .and_then(|d| d.page)
@@ -117,6 +244,23 @@ pub fn layout_document(
             (paper_w_hu - page_def.margin_left.0 - page_def.margin_right.0) as f32 / 100.0;
         // 본문 영역 하한 (넘침 분할 기준)
         let body_bottom = h - (page_def.margin_bottom.0 + page_def.margin_footer.0) as f32 / 100.0;
+
+        // 쪽 테두리(PAGE_BORDER_FILL BOTH): 변 기하를 구역당 1회 계산해 두고,
+        // 구역의 모든 페이지에 소급 삽입한다(테두리ID 무테두리·미존재면 빈 벡터).
+        let page_border_edges = section_page_border_fill(section)
+            .map(|pbf| {
+                build_page_border_edges(
+                    &pbf,
+                    &doc.header.border_fills,
+                    w,
+                    h,
+                    body_left,
+                    body_top,
+                    body_left + body_width,
+                    body_bottom,
+                )
+            })
+            .unwrap_or_default();
 
         let mut page = PageList {
             width_pt: w,
@@ -270,10 +414,16 @@ pub fn layout_document(
             // 이 문단의 첫 줄 상단 (표 앵커 위치)
             let mut para_top: Option<f32> = None;
 
-            // 문단 배경/테두리(border_fill) 패스용: 문단 시작 시점의 아이템 인덱스(배경
-            // Rect를 텍스트 뒤에 넣으려 삽입 지점으로 사용) + 문단 중 페이지 경계 발생 여부.
-            let bg_start_idx = page.items.len();
-            let mut bg_broke = false;
+            // 문단 배경/테두리(border_fill) 패스용. 문단이 페이지/단 경계를 걸치면 배경을
+            // 페이지별 조각으로 나눠 각 페이지에 그린다(GC-9). 조각 상태:
+            //  - bg_slice_top: 현재 페이지 조각의 상단 y(그 페이지 첫 줄 배치 시 설정)
+            //  - bg_slice_insert: 현재 페이지 items 삽입 지점(배경 Rect를 텍스트 뒤로)
+            //  - bg_slice_col_x: 현재 조각의 단 x-오프셋(다단)
+            //  - bg_first_slice: 첫 조각인가(진짜 문단 상단 → 상단 테두리 O)
+            let mut bg_slice_top: Option<f32> = None;
+            let mut bg_slice_insert = page.items.len();
+            let mut bg_slice_col_x = 0.0f32;
+            let mut bg_first_slice = true;
 
             if para.line_segs.is_empty() {
                 // 폴백: 본문 폭에서 그리디 줄바꿈
@@ -287,8 +437,11 @@ pub fn layout_document(
                     // 문단 들여쓰기/여백/위 간격(폴백 전용 — 캐시는 col_start에 반영됨).
                     let left = body_left + geom.left;
                     let avail = (body_width - geom.left - geom.right).max(4.0);
-                    // 첫 줄 들여쓰기는 시작 x에만 적용(wrap 폭 미차감), 비정상 큰 값 방어 캡.
-                    let x0 = left + geom.first_indent.min(avail * 0.8);
+                    // 첫 줄 들여쓰기/내어쓰기(음수 허용): 첫 줄 x = 좌여백 + indent를
+                    // 페이지 좌변(body_left) 밖으로 안 나가게 클램프한 뒤 그 오프셋만
+                    // 첫 줄에 준다(wrap 폭 미차감 — 좁은 셀 폭주 방지). 비정상 큰 양수는 캡.
+                    let indent = geom.first_indent.min(avail * 0.8);
+                    let first_x = (left + indent).max(body_left);
                     let baseline_y = content_bottom + geom.spacing_top + max_size * 1.2;
                     para_top = Some(content_bottom + geom.spacing_top);
                     // 한 줄에 들어가는 가운데/오른쪽 정렬은 폴백에서도 보정한다.
@@ -298,10 +451,14 @@ pub fn layout_document(
                         .para_shapes
                         .get(para.para_shape.0 as usize)
                         .map_or(1, |p| p.alignment());
-                    let x = if natural <= avail && (align == 2 || align == 3) {
-                        left + (avail - natural) * if align == 3 { 0.5 } else { 1.0 }
+                    // 정렬(가운데/오른쪽) 한 줄은 들여쓰기 무시; 그 외엔 x0=좌여백 + 첫 줄 오프셋.
+                    let (x0, first_delta) = if natural <= avail && (align == 2 || align == 3) {
+                        (
+                            left + (avail - natural) * if align == 3 { 0.5 } else { 1.0 },
+                            0.0,
+                        )
                     } else {
-                        x0
+                        (left, first_x - left)
                     };
                     if let Some(m) = &marker {
                         render_list_marker(&mut page, store, doc, m, left, baseline_y, max_size);
@@ -309,11 +466,12 @@ pub fn layout_document(
                     let last_y = place_wrapped(
                         &mut page,
                         items,
-                        x,
+                        x0,
                         baseline_y,
                         avail,
                         max_size * 1.6,
                         &tabs,
+                        first_delta,
                     );
                     content_bottom = last_y + max_size * 0.4 + geom.spacing_bottom;
                 }
@@ -328,17 +486,21 @@ pub fn layout_document(
                     body_width,
                     warnings,
                 );
-                draw_para_background(
-                    doc,
-                    &mut page,
-                    para,
-                    body_left + geom.left,
-                    (body_width - geom.left - geom.right).max(1.0),
-                    bg_start_idx,
-                    para_top,
-                    content_bottom,
-                    bg_broke,
-                );
+                // 폴백 문단은 페이지를 걸치지 않는다(단일 조각 — 상·하 테두리 모두).
+                if let Some(top) = para_top {
+                    draw_para_bg_slice(
+                        doc,
+                        &mut page,
+                        para,
+                        body_left + geom.left,
+                        (body_width - geom.left - geom.right).max(1.0),
+                        bg_slice_insert,
+                        top,
+                        content_bottom,
+                        true,
+                        true,
+                    );
+                }
                 continue;
             }
 
@@ -346,11 +508,27 @@ pub fn layout_document(
             for (i, seg) in para.line_segs.iter().enumerate() {
                 // v_pos 리셋: 다단이면 단 넘김(같은 페이지) vs 페이지 넘김을 밴드로 구분.
                 if seg.v_pos < prev_v_pos && !page.items.is_empty() {
+                    // 경계를 걸치기 전, 이 페이지/단에 쌓인 배경 조각을 먼저 그린다(GC-9).
+                    // 조각 하단 = 현 content_bottom, 걸친 경계쪽 테두리(하변)는 긋지 않는다.
+                    if let Some(top) = bg_slice_top {
+                        draw_para_bg_slice(
+                            doc,
+                            &mut page,
+                            para,
+                            body_left + bg_slice_col_x + geom.left,
+                            (col_width - geom.left - geom.right).max(1.0),
+                            bg_slice_insert,
+                            top,
+                            content_bottom,
+                            bg_first_slice,
+                            false,
+                        );
+                        bg_first_slice = false;
+                    }
                     col_band += 1;
                     if col_count > 1 && !col_band.is_multiple_of(col_count) {
                         // 단 넘김: 커서만 페이지 상단으로, 페이지는 유지(다음 단으로 x 이동).
                         content_bottom = body_top;
-                        bg_broke = true;
                     } else {
                         // 페이지 넘김(마지막 단 소진 또는 단일 단).
                         furniture.render(doc, store, &mut page, warnings);
@@ -364,8 +542,10 @@ pub fn layout_document(
                         ));
                         content_bottom = body_top;
                         paras_on_page = 0;
-                        bg_broke = true;
                     }
+                    // 새 조각: 다음 줄 배치 때 상단을 잡고, 삽입 지점은 (넘겨진) 현재 page 기준.
+                    bg_slice_top = None;
+                    bg_slice_insert = page.items.len();
                 }
                 prev_v_pos = seg.v_pos;
 
@@ -418,6 +598,11 @@ pub fn layout_document(
                 // 다단: 현재 밴드의 단 x-오프셋(col_start는 단 상대라 0). 단일 단이면 0.
                 let col_x = (col_band % col_count) as f32 * (col_width + col_gap);
                 let x = body_left + col_x + seg.col_start as f32 / 100.0 + shift;
+                // 배경 조각 상단: 이 페이지/단에서 처음 놓이는 줄의 윗변에서 잡는다(GC-9).
+                if bg_slice_top.is_none() {
+                    bg_slice_top = Some(baseline_y - baseline_gap_pt);
+                    bg_slice_col_x = col_x;
+                }
                 if i == 0 {
                     para_top = Some(baseline_y - baseline_gap_pt);
                     if let Some(m) = &marker {
@@ -433,6 +618,7 @@ pub fn layout_document(
                     wrap_width,
                     line_advance,
                     &tabs,
+                    0.0, // 캐시 줄은 col_start에 들여쓰기가 이미 반영됨.
                 );
                 content_bottom = last_y + (line_height_pt - baseline_gap_pt).max(0.0);
             }
@@ -448,17 +634,21 @@ pub fn layout_document(
                 body_width,
                 warnings,
             );
-            draw_para_background(
-                doc,
-                &mut page,
-                para,
-                body_left + geom.left,
-                (body_width - geom.left - geom.right).max(1.0),
-                bg_start_idx,
-                para_top,
-                content_bottom,
-                bg_broke,
-            );
+            // 마지막(또는 유일) 배경 조각: 하변 테두리 O, 상변은 첫 조각일 때만(=경계 안 걸침).
+            if let Some(top) = bg_slice_top {
+                draw_para_bg_slice(
+                    doc,
+                    &mut page,
+                    para,
+                    body_left + bg_slice_col_x + geom.left,
+                    (col_width - geom.left - geom.right).max(1.0),
+                    bg_slice_insert,
+                    top,
+                    content_bottom,
+                    bg_first_slice,
+                    true,
+                );
+            }
         }
         if skipped_controls > 0 {
             warnings.push(format!(
@@ -478,6 +668,13 @@ pub fn layout_document(
         page_notes.clear();
         furniture.render(doc, store, &mut page, warnings);
         pages.push(page);
+
+        // 쪽 테두리를 이 구역의 모든 페이지 맨 앞(뒤에 그림)에 소급 삽입한다.
+        if !page_border_edges.is_empty() {
+            for p in &mut pages[section_first_page..] {
+                prepend_page_borders(p, &page_border_edges);
+            }
+        }
     }
 
     DisplayList { pages }
@@ -1196,8 +1393,10 @@ fn layout_box_para_iter<'a>(
                 let geom = para_geometry(doc, para);
                 let left = origin_x + geom.left;
                 let avail = (width - geom.left - geom.right).max(4.0);
-                // 첫 줄 들여쓰기는 시작 x에만(wrap 폭 미차감 — 좁은 셀 폭주 방지), 방어 캡.
-                let x0 = left + geom.first_indent.min(avail * 0.8);
+                // 첫 줄 들여쓰기/내어쓰기(음수 허용): 셀 좌변(origin_x) 밖 클램프, 첫 줄에만
+                // (wrap 폭 미차감 — 좁은 셀 폭주 방지). 비정상 큰 양수는 방어 캡.
+                let indent = geom.first_indent.min(avail * 0.8);
+                let first_x = (left + indent).max(origin_x);
                 let baseline_y = content_bottom + geom.spacing_top + max_size * 1.2;
                 para_top = Some(content_bottom + geom.spacing_top);
                 if let Some(m) = &marker {
@@ -1209,13 +1408,24 @@ fn layout_box_para_iter<'a>(
                     .para_shapes
                     .get(para.para_shape.0 as usize)
                     .map_or(1, |p| p.alignment());
-                let x = if natural <= avail && (align == 2 || align == 3) {
-                    left + (avail - natural) * if align == 3 { 0.5 } else { 1.0 }
+                let (x0, first_delta) = if natural <= avail && (align == 2 || align == 3) {
+                    (
+                        left + (avail - natural) * if align == 3 { 0.5 } else { 1.0 },
+                        0.0,
+                    )
                 } else {
-                    x0
+                    (left, first_x - left)
                 };
-                let last_y =
-                    place_wrapped(page, items, x, baseline_y, avail, max_size * 1.6, &tabs);
+                let last_y = place_wrapped(
+                    page,
+                    items,
+                    x0,
+                    baseline_y,
+                    avail,
+                    max_size * 1.6,
+                    &tabs,
+                    first_delta,
+                );
                 content_bottom = last_y + max_size * 0.4 + geom.spacing_bottom;
             }
             // 폴백(캐시 없는) 문단은 흐름 배치 — 이후 캐시 문단이 넘지 않게 바닥을 올린다.
@@ -1283,6 +1493,7 @@ fn layout_box_para_iter<'a>(
                     wrap_width,
                     line_advance,
                     &tabs,
+                    0.0, // 캐시 줄은 col_start에 들여쓰기가 이미 반영됨.
                 );
                 content_bottom = last_y + (seg.line_height as f32 / 100.0 - gap_pt).max(0.0);
                 // 우리 줄바꿈이 캐시와 어긋나 이 줄이 캐시 자리 아래로 넘쳤다면(단일 seg
@@ -1490,35 +1701,32 @@ struct ParaGeom {
     /// 왼쪽 여백(margin_left만 — 들여쓰기는 first_indent로 분리).
     left: f32,
     right: f32,
-    /// 첫 줄 들여쓰기(양수만, 음수=내어쓰기 v1 무시). wrap 폭에선 빼지 않는다 —
-    /// 좁은 셀에서 avail이 붕괴해 글자마다 줄바꿈되는 폭주 방지(work_report 실측).
+    /// 첫 줄 들여쓰기(양수) / 내어쓰기(음수 허용 — 첫 줄이 나머지보다 왼쪽).
+    /// wrap 폭에선 빼지 않는다 — 좁은 셀에서 avail이 붕괴해 글자마다 줄바꿈되는
+    /// 폭주 방지(work_report 실측). 페이지 좌변 밖 클램프는 배치 지점에서 한다.
     first_indent: f32,
     spacing_top: f32,
     spacing_bottom: f32,
 }
 
-/// 문단 배경/테두리(ParaShape.border_fill_id → BorderFill) 그리기 — 셀 배경 패스의 문단판.
-/// 배경 Rect는 `insert_idx`(문단 텍스트 시작 지점)에 삽입해 글자 뒤로 보내고, 테두리 선은 위에
-/// 얹는다. 문단이 페이지를 걸쳤거나(`broke`) 상단 미상이면 생략(v1). `left`/`width`는 이미
-/// 들여쓰기(geom)를 반영한 문단 상자의 좌변/폭.
+/// 문단 배경/테두리(ParaShape.border_fill_id → BorderFill)의 한 페이지 조각을 그린다 —
+/// 셀 배경 패스의 문단판. 배경 Rect는 `insert_idx`(그 페이지의 문단 텍스트 시작 지점)에
+/// 삽입해 글자 뒤로 보내고, 테두리 선은 위에 얹는다. `left`/`width`는 이미 들여쓰기(geom)와
+/// 단 오프셋을 반영한 상자의 좌변/폭. 문단이 페이지를 걸치면 조각마다 이 함수가 호출되며,
+/// 걸친 경계쪽 상/하변 테두리는 `draw_top`/`draw_bottom`을 false로 주어 긋지 않는다(GC-9).
 #[allow(clippy::too_many_arguments)]
-fn draw_para_background(
+fn draw_para_bg_slice(
     doc: &Document,
     page: &mut PageList,
     para: &Paragraph,
     left: f32,
     width: f32,
     insert_idx: usize,
-    para_top: Option<f32>,
+    top: f32,
     bottom: f32,
-    broke: bool,
+    draw_top: bool,
+    draw_bottom: bool,
 ) {
-    if broke {
-        return;
-    }
-    let Some(top) = para_top else {
-        return;
-    };
     if bottom <= top || width <= 0.0 {
         return;
     }
@@ -1546,15 +1754,15 @@ fn draw_para_background(
             },
         );
     }
-    // 테두리(좌/우/위/아래 — 가장자리라 텍스트 위에 얹어도 무해).
+    // 테두리: 좌/우변은 항상, 상/하변은 페이지 경계에 걸치지 않은 쪽만(가장자리라 위에 얹어도 무해).
     let edges = [
-        (left, top, left, bottom),
-        (left + width, top, left + width, bottom),
-        (left, top, left + width, top),
-        (left, bottom, left + width, bottom),
+        (&bf.sides[0], (left, top, left, bottom), true),
+        (&bf.sides[1], (left + width, top, left + width, bottom), true),
+        (&bf.sides[2], (left, top, left + width, top), draw_top),
+        (&bf.sides[3], (left, bottom, left + width, bottom), draw_bottom),
     ];
-    for (side, (x1, y1, x2, y2)) in bf.sides.iter().zip(edges) {
-        if side.is_visible() {
+    for (side, (x1, y1, x2, y2), enabled) in edges {
+        if enabled && side.is_visible() {
             page.items.push(Item::Line {
                 x1,
                 y1,
@@ -1575,7 +1783,8 @@ fn para_geometry(doc: &Document, para: &Paragraph) -> ParaGeom {
         Some(p) => ParaGeom {
             left: (p.margin_left as f32 / 200.0).max(0.0),
             right: (p.margin_right as f32 / 200.0).max(0.0),
-            first_indent: (p.indent as f32 / 200.0).max(0.0),
+            // 내어쓰기(음수)를 보존한다 — 첫 줄 배치에서만 쓰고 페이지 좌변으로 클램프.
+            first_indent: p.indent as f32 / 200.0,
             spacing_top: (p.spacing_top as f32 / 200.0).max(0.0),
             spacing_bottom: (p.spacing_bottom as f32 / 200.0).max(0.0),
         },
@@ -1645,9 +1854,11 @@ fn place_wrapped(
     max_width: f32,
     line_advance: f32,
     tabs: &[f32],
+    first_indent: f32,
 ) -> f32 {
     let limit = x0 + max_width;
-    let mut x = x0;
+    // 첫 줄만 들여쓰기/내어쓰기(first_indent). 이후 줄·줄바꿈은 x0(문단 좌여백)로 복귀.
+    let mut x = x0 + first_indent;
     let mut y = first_baseline_y;
 
     if std::env::var_os("HWP_RENDER_TRACE").is_some() {
@@ -1740,9 +1951,9 @@ mod para_geom_tests {
         assert_eq!(g.right, 10.0);
         assert_eq!(g.spacing_top, 6.0);
         assert_eq!(g.spacing_bottom, 3.0);
-        // 음수 들여쓰기(내어쓰기)는 v1에서 0 처리.
+        // 음수 들여쓰기(내어쓰기)는 보존한다(첫 줄이 나머지보다 왼쪽). /200.
         doc.header.para_shapes[0].indent = -1000;
-        assert_eq!(para_geometry(&doc, &para).first_indent, 0.0);
+        assert_eq!(para_geometry(&doc, &para).first_indent, -5.0);
         assert_eq!(para_geometry(&doc, &para).left, 20.0);
         // para_shape 범위 밖이면 0.
         let p2 = Paragraph {

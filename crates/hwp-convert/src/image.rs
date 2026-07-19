@@ -109,7 +109,7 @@ fn ext_of(path: &Path) -> Result<String, String> {
 }
 
 /// 표시 크기(HWPUNIT)를 계산한다. 자연 크기는 본문 폭(max_w) 초과 시 비례 축소.
-fn display_size(data: &[u8], size: &ImageSize, max_w: i32) -> (i32, i32) {
+pub(crate) fn display_size(data: &[u8], size: &ImageSize, max_w: i32) -> (i32, i32) {
     match size {
         ImageSize::Mm(w, h) => (
             (*w * MM_TO_HWPUNIT).round() as i32,
@@ -229,6 +229,152 @@ pub fn insert_image(
     Ok(())
 }
 
+/// 도장(직인) 기본 크기 20mm — 공공 실무 관례.
+const DEFAULT_SEAL_MM: f32 = 20.0;
+/// 앵커 오프셋 근사용 평균 글자 advance(HWPUNIT). 10pt 전각 ≈ 1000.
+const AVG_CHAR_ADVANCE: i32 = 1000;
+/// 도장을 얹을 줄 높이 근사(HWPUNIT).
+const SEAL_LINE_HEIGHT: i32 = 1000;
+/// 도장 z-순서 — 본문·일반 개체 위(앞)에 겹치도록 크게 잡는다.
+const SEAL_Z_ORDER: u32 = 1000;
+
+/// 한 문단에서 앵커 문구 위에 도장을 **부유 배치**한다. 앵커 텍스트는 유지하고,
+/// gso 앵커 문자만 앵커 뒤에 삽입한다. 반환=삽입 여부.
+///
+/// 위치는 문단 기준(vertRelTo/horzRelTo=PARA)이며, 앵커 문구의 대략적 오프셋으로
+/// 도장 중심을 맞춘다 — 정밀 배치는 실기 레이아웃에 의존하므로 근사값이다.
+fn insert_seal_in_para(
+    para: &mut Paragraph,
+    anchor: &str,
+    seal_w: i32,
+    seal_h: i32,
+    name: &str,
+) -> bool {
+    let Some((cidx, wpos)) = find_match(&para.chars, anchor, 0) else {
+        return false;
+    };
+    // 가로 오프셋은 앵커 앞 **보이는 글자** 수로만 추정한다. wpos(wchar 위치)는 문단
+    // 선두의 구역/단 정의 컨트롤 문자(각 wchar_width=8, 화면 폭 0)를 포함해 값이 크게
+    // 부풀려지므로(D1 실측: 앵커가 좌측인데 horzOffset≈17666로 우측 이탈) 쓰지 않는다.
+    // Text 글자만 세어 대략적 advance로 환산한다(전각 10pt ≈ AVG_CHAR_ADVANCE).
+    let visible_before = para.chars[..cidx]
+        .iter()
+        .filter(|c| matches!(c, HwpChar::Text(_)))
+        .count() as i32;
+    let anchor_glyphs = anchor.chars().count() as i32;
+    // 앵커 문구 중앙에 도장 중심을 맞춘 문단 기준 오프셋(대략적).
+    let horz = visible_before * AVG_CHAR_ADVANCE + anchor_glyphs * AVG_CHAR_ADVANCE / 2 - seal_w / 2;
+    // 줄 높이보다 큰 도장은 위로 밀어 줄 중앙에 오게 한다(음수=위로).
+    let vert = (SEAL_LINE_HEIGHT - seal_h) / 2;
+    let pic = Picture {
+        common_data: Vec::new(),
+        width: HwpUnit(seal_w.max(1)),
+        height: HwpUnit(seal_h.max(1)),
+        treat_as_char: false, // 부유(글 앞) 배치 — writer가 floating 공통속성 합성
+        z_order: SEAL_Z_ORDER,
+        vert_offset: vert,
+        horz_offset: horz.max(0),
+        bin_ref: BinRef::ItemRef(name.to_string()),
+        extras: Vec::new(),
+    };
+    // 앵커 뒤에 gso 앵커 문자 삽입 — 앵커 텍스트 자체는 유지된다.
+    let ins = (cidx + anchor.chars().count()).min(para.chars.len());
+    let iw = wpos + utf16_len(anchor);
+    let ci = para.chars[..ins]
+        .iter()
+        .filter(|c| matches!(c, HwpChar::ExtCtrl { .. }))
+        .count()
+        .min(para.controls.len());
+    para.controls.insert(ci, Control::Picture(pic));
+    para.chars.insert(
+        ins,
+        HwpChar::ExtCtrl {
+            code: GSO_CODE,
+            ctrl_id: *b"gso ",
+            payload: rev_payload(b"gso "),
+            ctrl_index: None,
+        },
+    );
+    adjust_runs(&mut para.char_shape_runs, iw, 0, 8); // ExtCtrl wchar_width=8
+    relink_ctrl_index(para);
+    para.header.ctrl_mask = 0; // writer가 chars에서 재계산(gso bit11 포함)
+    para.line_segs.clear();
+    true
+}
+
+/// 본문/표 셀/글상자 문단을 재귀로 훑어 첫 매칭에 도장을 부유 배치한다.
+fn insert_seal_rec(para: &mut Paragraph, anchor: &str, seal_w: i32, seal_h: i32, name: &str) -> bool {
+    if insert_seal_in_para(para, anchor, seal_w, seal_h, name) {
+        return true;
+    }
+    for ctrl in &mut para.controls {
+        match ctrl {
+            Control::Table(t) => {
+                for cell in &mut t.cells {
+                    for p in &mut cell.paragraphs {
+                        if insert_seal_rec(p, anchor, seal_w, seal_h, name) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            Control::Generic(g) => {
+                for l in &mut g.paragraph_lists {
+                    for p in &mut l.paragraphs {
+                        if insert_seal_rec(p, anchor, seal_w, seal_h, name) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// 앵커 문구가 있는 첫 문단의 그 위치에 도장 이미지를 **부유(글 앞) 배치**로 겹친다.
+/// `insert_image`(앵커 뒤 인라인 삽입)와 달리 앵커 텍스트를 유지하고 그림을 떠 있는
+/// 개체로 만들어 앵커 문구 위에 겹치게 한다("(인)" 위 직인 날인 관례).
+///
+/// `size_mm`이 없으면 기본 20mm(도장 관례). 이미지 원본 비율을 유지한다(정사각 폴백).
+/// hwp5 writer가 빈-extras Picture에 floating 공통속성을 합성한다(검증된 경로 재사용).
+pub fn insert_seal(
+    doc: &mut Document,
+    anchor: &str,
+    path: &Path,
+    size_mm: Option<f32>,
+) -> Result<(), String> {
+    let ext = ext_of(path)?;
+    let data =
+        std::fs::read(path).map_err(|e| format!("이미지 읽기 실패 {}: {e}", path.display()))?;
+    if data.is_empty() {
+        return Err(format!("빈 이미지 파일: {}", path.display()));
+    }
+    let mm = size_mm.unwrap_or(DEFAULT_SEAL_MM);
+    if !(mm.is_finite() && mm > 0.0) {
+        return Err(format!("도장 크기(mm)는 양수여야 합니다: {mm}"));
+    }
+    let seal_w = ((mm * MM_TO_HWPUNIT).round() as i32).max(1);
+    // 원본 비율 유지(치수를 못 읽으면 정사각).
+    let seal_h = match image_pixel_size(&data) {
+        Some((pw, ph)) if pw > 0 => ((i64::from(seal_w) * i64::from(ph)) / i64::from(pw)) as i32,
+        _ => seal_w,
+    }
+    .max(1);
+    let name = format!("seal{}.{ext}", doc.bin_streams.len() + 1);
+    let inserted = doc
+        .sections
+        .iter_mut()
+        .flat_map(|s| &mut s.paragraphs)
+        .any(|p| insert_seal_rec(p, anchor, seal_w, seal_h, &name));
+    if !inserted {
+        return Err(format!("앵커 {anchor:?}를 찾을 수 없습니다"));
+    }
+    doc.bin_streams.push(BinStream { name, data });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +441,65 @@ mod tests {
 
         // 없는 앵커는 오류.
         assert!(insert_image(&mut doc, "없는앵커", &png_path, ImageSize::Natural).is_err());
+    }
+
+    /// insert_seal이 앵커 문단에 **부유** Picture를 만들고 앵커 텍스트를 유지한다.
+    #[test]
+    fn 도장_부유_삽입_구조() {
+        let mut doc = crate::from_markdown::from_markdown("결재란 (인) 끝");
+        let dir = std::env::temp_dir().join("hwp-seal-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_path = dir.join("s.png");
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend([0, 0, 0, 13]);
+        png.extend(b"IHDR");
+        png.extend(96u32.to_be_bytes());
+        png.extend(96u32.to_be_bytes());
+        png.extend([0u8; 8]);
+        std::fs::write(&png_path, &png).unwrap();
+
+        insert_seal(&mut doc, "(인)", &png_path, None).unwrap();
+
+        assert_eq!(doc.bin_streams.len(), 1);
+        let para = &doc.sections[0].paragraphs[0];
+        let pic = para
+            .controls
+            .iter()
+            .find_map(|c| match c {
+                Control::Picture(p) => Some(p),
+                _ => None,
+            })
+            .expect("Picture 존재");
+        // 부유 배치·writer 합성용 빈 extras·앞 z-order.
+        // hwpx writer(write_picture)는 treat_as_char=false일 때
+        // textWrap=IN_FRONT_OF_TEXT + flowWithText=0 + allowOverlap=1 + PARA 기준으로
+        // 이 오프셋/z-order를 방출하고, hwp5 writer는 attr=0x04aa4310(PARA·글앞·제한해제)로 합성한다.
+        assert!(!pic.treat_as_char, "도장은 부유(글 앞) 배치여야 한다");
+        assert!(pic.extras.is_empty(), "writer가 floating 속성 합성하도록 빈 extras");
+        assert_eq!(pic.z_order, SEAL_Z_ORDER, "앞(위) 배치용 z-order 상수");
+        // 도장이 줄 높이보다 크면 세로 오프셋이 음수(위로 올려 줄 중앙 정렬).
+        assert!(pic.vert_offset < 0, "큰 도장은 줄 위로 올려 겹친다(음수 세로 오프셋)");
+        assert!(doc.resolve_bin(&pic.bin_ref).is_some(), "bin_ref 해석");
+        // 기본 20mm·정사각(96x96)이므로 너비=높이.
+        assert_eq!(pic.width.0, (20.0 * MM_TO_HWPUNIT).round() as i32);
+        assert_eq!(pic.height.0, pic.width.0, "원본 비율(정사각) 유지");
+        // 앵커 문구를 지나며 오프셋이 양수(문단 안쪽으로 이동).
+        assert!(pic.horz_offset > 0, "앵커 뒤쪽 가로 오프셋");
+        // 앵커 텍스트는 유지되어야 한다.
+        assert!(doc.plain_text().contains("(인)"), "앵커 텍스트 유지");
+        // 앵커 ExtCtrl가 Picture를 가리킨다.
+        let ext = para.chars.iter().find_map(|c| match c {
+            HwpChar::ExtCtrl {
+                code, ctrl_index, ..
+            } if *code == GSO_CODE => *ctrl_index,
+            _ => None,
+        });
+        assert!(
+            matches!(para.controls[ext.unwrap() as usize], Control::Picture(_)),
+            "앵커 ExtCtrl가 Picture를 가리켜야 한다"
+        );
+        // 없는 앵커·잘못된 크기는 오류.
+        assert!(insert_seal(&mut doc, "없음", &png_path, Some(15.0)).is_err());
+        assert!(insert_seal(&mut doc, "(인)", &png_path, Some(0.0)).is_err());
     }
 }

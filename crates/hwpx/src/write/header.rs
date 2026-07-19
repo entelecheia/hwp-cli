@@ -297,27 +297,85 @@ fn write_char_properties(out: &mut String, header: &DocHeader) {
     out.push_str("</hh:charProperties>");
 }
 
-fn write_tab_properties(out: &mut String, header: &DocHeader) {
-    // hwpx 출신 원문 tabPr가 있으면 verbatim 방출 (탭 정의 무손실 왕복).
-    if !header.hwpx_tab_defs_raw.is_empty() {
-        let _ = write!(
-            out,
-            r##"<hh:tabProperties itemCnt="{}">"##,
-            header.hwpx_tab_defs_raw.len()
-        );
-        for raw in &header.hwpx_tab_defs_raw {
-            out.push_str(raw);
-        }
-        out.push_str("</hh:tabProperties>");
-        return;
+/// 탭 종류 코드 → OWPML tabItem type(읽기 tab_kind_code의 역).
+fn tab_kind_name(kind: u8) -> &'static str {
+    match kind {
+        1 => "RIGHT",
+        2 => "CENTER",
+        3 => "DECIMAL",
+        _ => "LEFT",
     }
-    let count = header.tab_defs.len().max(1);
+}
+
+/// 탭 리더(채움 선) 코드 → OWPML leader 값.
+///
+/// 정품 한글이 저장한 hwpx 2종에서 실제 관찰된 leader 값은 NONE/DASH뿐이다.
+/// 테두리선 종류(line_type_name)를 그대로 쓰면 한글이 tab leader로 허용하는지
+/// 확인되지 않은 값(DASH_DOT·CIRCLE·DOUBLE_SLIM 등)까지 방출하게 된다. 따라서
+/// tab 전용으로 분리해, 확신 가능한 근거값(NONE/SOLID/DASH/DOT)만 그대로 내고
+/// 그 밖의 코드는 가장 가까운 관찰값(DASH)으로 강등한다.
+fn tab_leader_name(fill: u8) -> &'static str {
+    match fill {
+        0 => "NONE",
+        1 => "SOLID",
+        3 => "DOT",
+        // 2(DASH) 및 확신 없는 그 밖의 코드(4~11 등)는 관찰값 DASH로 방출/강등.
+        _ => "DASH",
+    }
+}
+
+fn write_tab_properties(out: &mut String, header: &DocHeader) {
+    // 의미 탭 정의(tab_stops)가 있으면 그 개수를, 없으면 기존 raw 개수를 따른다.
+    let count = header.tab_stops.len().max(header.tab_defs.len()).max(1);
     let _ = write!(out, r##"<hh:tabProperties itemCnt="{count}">"##);
     for i in 0..count {
-        let _ = write!(
-            out,
-            r##"<hh:tabPr id="{i}" autoTabLeft="0" autoTabRight="0"/>"##
-        );
+        match header.tab_stops.get(i) {
+            // 보존된 탭 정의: 자동탭 속성 + 항목을 그대로 방출.
+            Some(td) => {
+                let left = u8::from(td.auto_tab_left());
+                let right = u8::from(td.auto_tab_right());
+                if td.items.is_empty() {
+                    let _ = write!(
+                        out,
+                        r##"<hh:tabPr id="{i}" autoTabLeft="{left}" autoTabRight="{right}"/>"##
+                    );
+                } else {
+                    let _ = write!(
+                        out,
+                        r##"<hh:tabPr id="{i}" autoTabLeft="{left}" autoTabRight="{right}">"##
+                    );
+                    // 정품 한글 구조: 항목마다 hp:switch로 감싸고, case(HwpUnitChar
+                    // 네임스페이스)는 unit="HWPUNIT" + pos=X, default는 unit 없이 pos=2X
+                    // (정확히 2배)를 낸다. naked tabItem을 직접 방출하면 한글이 먹통이 된다.
+                    for item in &td.items {
+                        let ty = tab_kind_name(item.kind);
+                        let leader = tab_leader_name(item.fill);
+                        let pos = item.pos;
+                        let pos2 = pos.saturating_mul(2);
+                        let _ = write!(
+                            out,
+                            concat!(
+                                r##"<hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar">"##,
+                                r##"<hh:tabItem pos="{pos}" type="{ty}" leader="{leader}" unit="HWPUNIT"/></hp:case>"##,
+                                r##"<hp:default><hh:tabItem pos="{pos2}" type="{ty}" leader="{leader}"/></hp:default></hp:switch>"##,
+                            ),
+                            pos = pos,
+                            ty = ty,
+                            leader = leader,
+                            pos2 = pos2,
+                        );
+                    }
+                    out.push_str("</hh:tabPr>");
+                }
+            }
+            // 값 없음: 기존 빈 상수(바이트 동일).
+            None => {
+                let _ = write!(
+                    out,
+                    r##"<hh:tabPr id="{i}" autoTabLeft="0" autoTabRight="0"/>"##
+                );
+            }
+        }
     }
     out.push_str("</hh:tabProperties>");
 }
@@ -339,7 +397,9 @@ fn num_format_name(fmt: hwp_model::NumFmt) -> &'static str {
 
 fn write_numberings(out: &mut String, header: &DocHeader) {
     // hwpx 읽기는 수준 형식을 numbering_levels에 담는다(numberings는 hwp5 raw 전용).
-    // 둘 중 큰 개수를 방출해 hwpx→hwpx 왕복에서 번호 정의 수를 잃지 않는다.
+    // 둘 중 큰 개수를 방출해 hwpx→hwpx 왕복에서 번호 정의 수를 잃지 않는다. IR의
+    // numbering_id는 0-기반이라(포맷 경계에서 정규화됨) idRef=numbering_id+1이 항상
+    // 정의 범위 안에 든다 — 정의 수만큼 방출하면 dangling이 없다.
     let count = header
         .numbering_levels
         .len()
@@ -369,6 +429,8 @@ fn write_numberings(out: &mut String, header: &DocHeader) {
 }
 
 fn write_bullets(out: &mut String, header: &DocHeader) {
+    // IR의 글머리 참조(numbering_id)는 0-기반이라 idRef=numbering_id+1이 정의 범위 안에
+    // 든다(포맷 경계에서 정규화됨). 정의 수만큼 방출하면 dangling이 없다.
     let count = header.bullet_chars.len().max(header.bullets.len());
     if count == 0 {
         return;
@@ -390,11 +452,7 @@ fn write_para_properties(out: &mut String, header: &DocHeader) {
     let count = header.para_shapes.len().max(1);
     let _ = write!(out, r##"<hh:paraProperties itemCnt="{count}">"##);
     let default_ps = ParaShape::default();
-    let tab_count = header
-        .tab_defs
-        .len()
-        .max(header.hwpx_tab_defs_raw.len())
-        .max(1);
+    let tab_count = header.tab_stops.len().max(header.tab_defs.len()).max(1);
     for i in 0..count {
         let ps = header.para_shapes.get(i).unwrap_or(&default_ps);
         let align = match ps.alignment() {

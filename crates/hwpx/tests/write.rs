@@ -121,6 +121,174 @@ fn markdown_생성_왕복() {
     assert!(md_out.contains("| 1 | 2 |"), "{md_out}");
 }
 
+/// GI-3/GI-4 왕복: md(이미지+인라인 코드) → hwpx 저장 → 재읽기에서 Picture·bin·코드 글자모양 생존.
+#[test]
+fn md_이미지_코드_hwpx_왕복() {
+    use std::io::Write as _;
+    let dir = std::env::temp_dir().join("hwpx-md-imgcode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend([0, 0, 0, 13]);
+    png.extend(b"IHDR");
+    png.extend(16u32.to_be_bytes());
+    png.extend(16u32.to_be_bytes());
+    png.extend([0u8; 8]);
+    let fig = dir.join("f.png");
+    std::fs::File::create(&fig).unwrap().write_all(&png).unwrap();
+
+    let doc = hwp_convert::from_markdown_with(
+        "본문 `let x = 1;` 코드와 이미지.\n\n![alt](f.png)\n",
+        &hwp_convert::MarkdownImportOptions {
+            base_dir: Some(&dir),
+        },
+    );
+    let out = tmp("md_imgcode.hwpx");
+    let warnings = hwpx::write_document(&doc, &out).unwrap();
+    assert!(!warnings.iter().any(|w| w.contains("DROP")), "{warnings:?}");
+
+    let reread = hwpx::read_document(&out).unwrap().document;
+    let has_pic = reread.sections[0]
+        .paragraphs
+        .iter()
+        .any(|p| {
+            p.controls
+                .iter()
+                .any(|c| matches!(c, hwp_model::Control::Picture(_)))
+        });
+    assert!(has_pic, "이미지 Picture 왕복");
+    assert!(!reread.bin_streams.is_empty(), "bin_streams 왕복");
+    let code_ids: std::collections::HashSet<u16> = reread
+        .header
+        .char_shapes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.face_ids[0] == 1)
+        .map(|(i, _)| i as u16)
+        .collect();
+    assert!(!code_ids.is_empty(), "코드 글자모양(함초롬돋움) 왕복");
+    assert!(
+        reread.sections[0]
+            .paragraphs
+            .iter()
+            .any(|p| p.char_shape_runs.iter().any(|(_, id)| code_ids.contains(&id.0))),
+        "코드 run 왕복"
+    );
+}
+
+/// GI-1/GI-2 왕복 (b): md(각주·취소선·순서목록·중첩) → hwpx 저장 → 재읽기 → md.
+#[test]
+fn markdown_각주_취소선_목록_hwpx_완전왕복() {
+    let md = "\
+문단에 각주[^1]가 있다.
+
+~~지운 글~~ 과 보통 글.
+
+1. 첫째
+2. 둘째
+   - 안쪽 가
+   - 안쪽 나
+3. 셋째
+
+[^1]: 각주 본문이다.
+";
+    let doc = hwp_convert::from_markdown(md);
+    let out = tmp("from_md_notes.hwpx");
+    let warnings = hwpx::write_document(&doc, &out).unwrap();
+    // 각주·목록은 DROP 경고 없이 방출돼야 한다.
+    assert!(
+        !warnings.iter().any(|w| w.contains("DROP")),
+        "DROP 경고: {warnings:?}"
+    );
+
+    let reread = hwpx::read_document(&out).unwrap().document;
+    // 각주 컨트롤이 hwpx 왕복에서 fn GenericControl로 되살아난다.
+    let has_fn = reread.sections[0].paragraphs.iter().any(|p| {
+        p.controls.iter().any(|c| matches!(c,
+            hwp_model::Control::Generic(g) if g.ctrl_id == *b"fn  " && !g.paragraph_lists.is_empty()))
+    });
+    assert!(has_fn, "각주 컨트롤 왕복");
+
+    let md_out = hwp_convert::to_markdown(&reread);
+    assert!(md_out.contains("[^1]"), "각주 마커: {md_out}");
+    assert!(md_out.contains("[^1]: 각주 본문이다."), "각주 정의: {md_out}");
+    assert!(md_out.contains("~~지운 글~~"), "취소선: {md_out}");
+    assert!(md_out.contains("1. 첫째"), "순서1: {md_out}");
+    assert!(md_out.contains("3. 셋째"), "순서3: {md_out}");
+    assert!(md_out.contains("- 안쪽 가"), "중첩 불릿: {md_out}");
+}
+
+/// 본문 탭이 hwpx에서 `<hp:t>` **안**의 중첩 `<hp:tab width leader type/>`(정품 mixed
+/// content)로 방출되고 raw 0x09가 절대 없어야 한다. t 밖 형제 bare 탭은 한글이 폭 0으로
+/// 무시하고(D3 밀착), raw 0x09를 t 안에 그대로 두면 한글이 파일을 열지 못한다(D3 먹통).
+#[test]
+fn 본문_탭_hwpx_tab요소_raw없음() {
+    let doc = hwp_convert::from_markdown("앞\t뒤\n");
+    let out = tmp("tab.hwpx");
+    let warnings = hwpx::write_document(&doc, &out).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let bytes = std::fs::read(&out).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut raw = Vec::new();
+    zip.by_name("Contents/section0.xml")
+        .unwrap()
+        .read_to_end(&mut raw)
+        .unwrap();
+    let xml = String::from_utf8(raw).unwrap();
+    // 속성 있는 탭 요소(<hp:tab · width/leader/type)로 방출.
+    assert!(
+        xml.contains("<hp:tab ")
+            && xml.contains("width=\"")
+            && xml.contains("leader=\"")
+            && xml.contains("type=\""),
+        "탭이 속성 있는 <hp:tab …/>로 방출돼야: {xml}"
+    );
+    // 탭 정의 없는 문단 → 정품 기본 탭(왼쪽·채움없음): type="1" leader="0".
+    assert!(
+        xml.contains(r#"leader="0" type="1""#),
+        "기본 탭은 leader=0 type=1이어야: {xml}"
+    );
+    // <hp:t>…</hp:t> 블록을 지운 뒤 <hp:tab이 남으면 t 밖 형제로 방출된 것(먹통 원인).
+    let stripped = regex_lite_strip_t(&xml);
+    assert!(
+        !stripped.contains("<hp:tab"),
+        "bare <hp:tab>(hp:t 밖 형제 — 한글 무시)가 방출됨: {xml}"
+    );
+    assert!(
+        !xml.as_bytes().contains(&0x09),
+        "section XML에 raw 0x09가 있으면 안 됨"
+    );
+
+    // 재읽기: 탭이 InlineCtrl(9)로 복원되고 텍스트 순서 보존.
+    let reread = hwpx::read_document(&out).unwrap().document;
+    assert!(reread.plain_text().contains("앞\t뒤"), "탭 왕복");
+    let tabs = reread.sections[0].paragraphs[0]
+        .chars
+        .iter()
+        .filter(|c| matches!(c, hwp_model::HwpChar::InlineCtrl { code: 9, .. }))
+        .count();
+    assert_eq!(tabs, 1, "재읽기 본문 탭 InlineCtrl(9) 1개");
+}
+
+/// `<hp:t …>…</hp:t>` 블록을 모두 제거한다(비탐욕, 정규식 없이 문자열 스캔). 남은 문자열에
+/// `<hp:tab`이 있으면 탭이 t 바깥 형제로 방출된 것이다.
+fn regex_lite_strip_t(xml: &str) -> String {
+    let mut out = String::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find("<hp:t ").or_else(|| rest.find("<hp:t>")) {
+        out.push_str(&rest[..open]);
+        let after = &rest[open..];
+        if let Some(close) = after.find("</hp:t>") {
+            rest = &after[close + "</hp:t>".len()..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// 필드(누름틀) hwpx 왕복: create_field → write → read → list_fields로 이름·값 복원.
 #[test]
 fn 필드_생성_hwpx_왕복() {
@@ -276,6 +444,302 @@ fn 요약정보_8필드_hwpx_패키지_왕복() {
     // FILETIME은 초 정밀도로 보존(하위 100ns는 애초에 없음).
     assert_eq!(m.create_time, Some(created));
     assert_eq!(m.modify_time, Some(modified));
+}
+
+/// GE-β5: settings.xml·version.xml 원문 pass-through.
+///
+/// 커스텀 settings.xml(앱 설정·캐럿 위치)·version.xml(버전 메타)을 슬롯에 담아
+/// write→read 왕복하면 원문이 상수로 대체되지 않고 그대로 보존된다. 슬롯이 없는
+/// (hwp5 출신 등) 문서는 기존 기본 상수 출력이 바이트 동일하게 유지된다.
+#[test]
+fn ge_b5_settings_version_원문_passthrough_왕복() {
+    // 정품과 다른 값(캐럿 위치·appVersion)을 넣어 상수 대체가 아님을 검증한다.
+    let settings = r##"<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><ha:HWPApplicationSetting xmlns:ha="http://www.hancom.co.kr/hwpml/2011/app" xmlns:config="urn:oasis:names:tc:opendocument:xmlns:config:1.0"><ha:CaretPosition listIDRef="3" paraIDRef="7" pos="42"/></ha:HWPApplicationSetting>"##;
+    let version = r##"<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hv:HCFVersion xmlns:hv="http://www.hancom.co.kr/hwpml/2011/version" tagetApplication="WORDPROCESSOR" major="5" minor="1" micro="1" buildNumber="0" os="1" xmlVersion="1.5" application="Hancom Office Hangul" appVersion="9.1.1.4321"/>"##;
+
+    let mut doc = hwp_convert::from_markdown("원문 pass-through 검증 본문\n");
+    doc.hwpx_settings_xml = Some(settings.to_string());
+    doc.hwpx_version_xml = Some(version.to_string());
+
+    let out = tmp("passthrough_parts.hwpx");
+    hwpx::write_document(&doc, &out).unwrap();
+
+    // ZIP에서 두 파트의 바이트가 원문과 동일한지 직접 확인.
+    let bytes = std::fs::read(&out).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let read_part = |zip: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>, name: &str| -> String {
+        let mut s = String::new();
+        zip.by_name(name).unwrap().read_to_string(&mut s).unwrap();
+        s
+    };
+    assert_eq!(read_part(&mut zip, "settings.xml"), settings, "settings 원문 보존");
+    assert_eq!(read_part(&mut zip, "version.xml"), version, "version 원문 보존");
+
+    // read 왕복에서도 슬롯이 원문 그대로 복원된다.
+    let reread = hwpx::read_document(&out).unwrap().document;
+    assert_eq!(reread.hwpx_settings_xml.as_deref(), Some(settings));
+    assert_eq!(reread.hwpx_version_xml.as_deref(), Some(version));
+
+    // JSON 왕복에서도 슬롯이 보존된다.
+    let json = hwp_convert::to_json(&reread, false, false).unwrap();
+    let back = hwp_convert::from_json(&json).unwrap();
+    assert_eq!(back.hwpx_settings_xml.as_deref(), Some(settings));
+    assert_eq!(back.hwpx_version_xml.as_deref(), Some(version));
+}
+
+/// GE-β5 보강: 슬롯이 None이면 두 파트가 기존 기본 상수와 바이트 동일하게 방출된다
+/// (구형 IR·hwp5 출신 문서의 출력 불변).
+#[test]
+fn ge_b5_슬롯_없으면_기본상수_불변() {
+    let doc = hwp_convert::from_markdown("기본 상수 경로 본문\n");
+    assert!(doc.hwpx_settings_xml.is_none());
+    assert!(doc.hwpx_version_xml.is_none());
+
+    let out = tmp("passthrough_default.hwpx");
+    hwpx::write_document(&doc, &out).unwrap();
+
+    let bytes = std::fs::read(&out).unwrap();
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut settings = String::new();
+    zip.by_name("settings.xml")
+        .unwrap()
+        .read_to_string(&mut settings)
+        .unwrap();
+    let mut version = String::new();
+    zip.by_name("version.xml")
+        .unwrap()
+        .read_to_string(&mut version)
+        .unwrap();
+
+    // 기존 상수(concat! 결과 포함)와 바이트 동일.
+    assert!(settings.contains(r##"<ha:CaretPosition listIDRef="0" paraIDRef="0" pos="0"/>"##));
+    assert!(version.contains(r##"application="hwp-cli""##));
+    assert!(version.contains(&format!(r##"appVersion="{}""##, env!("CARGO_PKG_VERSION"))));
+}
+
+/// GC-5: hwpx `<hp:secPr>` 미해석 자식(grid/startNum/visibility/lineNumberShape/
+/// footNotePr/pageBorderFill 등) 원문 pass-through.
+///
+/// 정품과 다른 사용자 값(startNum·grid·visibility·pageBorderFill)을 담은 secPr을
+/// parse→write→parse 왕복하면, 원문 자식이 상수 템플릿으로 대체되지 않고 등장 순서대로
+/// 그대로 보존된다. pagePr만 페이지 정의로 재생성된다(같은 자리).
+#[test]
+fn gc5_secpr_자식_원문_passthrough_왕복() {
+    // 상수 템플릿과 다른 사용자 값(grid charGrid=7, startNum page=3, visibility HIDE_ALL,
+    // lineNumberShape restartType=2, pageBorderFill borderFillIDRef=2)을 넣는다.
+    let sec_pr = r##"<hp:secPr id="" textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" tabStopVal="4000" tabStopUnit="HWPUNIT" outlineShapeIDRef="1" memoShapeIDRef="0" textVerticalWidthHead="0" masterPageCnt="0"><hp:grid lineGrid="5" charGrid="7" wonggojiFormat="1"/><hp:startNum pageStartsOn="ODD" page="3" pic="2" tbl="4" equation="1"/><hp:visibility hideFirstHeader="1" hideFirstFooter="1" hideFirstMasterPage="0" border="HIDE_ALL" fill="SHOW_ALL" hideFirstPageNum="1" hideFirstEmptyLine="0" showLineNumber="1"/><hp:lineNumberShape restartType="2" countBy="3" distance="100" startNumber="9"/><hp:pagePr landscape="WIDELY" width="59528" height="84186" gutterType="LEFT_ONLY"><hp:margin header="4252" footer="4252" gutter="0" left="8504" right="8504" top="5668" bottom="4252"/></hp:pagePr><hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/></hp:footNotePr><hp:pageBorderFill type="BOTH" borderFillIDRef="2" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill></hp:secPr>"##;
+    let xml = format!(
+        r##"<?xml version="1.0" encoding="UTF-8" standalone="yes" ?><hs:sec xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section" xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"><hp:p id="1" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0"><hp:run charPrIDRef="0">{sec_pr}</hp:run></hp:p></hs:sec>"##
+    );
+
+    // read: 미해석 자식이 원문으로 캡처되고 pagePr 자리엔 마커.
+    let (section, warns) = hwpx::read::section::parse_section(&xml).unwrap();
+    assert!(warns.is_empty(), "{warns:?}");
+    let def = section.section_def().expect("secPr");
+    let raw = &def.secpr_raw_children;
+    assert!(raw.iter().any(|c| c.contains(r#"charGrid="7""#)), "grid 원문 캡처: {raw:?}");
+    assert!(raw.iter().any(|c| c.contains(r#"page="3""#)), "startNum 원문 캡처");
+    assert!(raw.iter().any(|c| c.contains(r#"border="HIDE_ALL""#)), "visibility 원문 캡처");
+    assert!(raw.iter().any(|c| c.contains(r#"borderFillIDRef="2""#)), "pageBorderFill 원문 캡처");
+    assert!(raw.iter().any(|c| c == hwp_model::SECPR_PAGEPR_SLOT), "pagePr 자리 마커");
+    // pagePr은 원문이 아니라 페이지 정의로 파싱(원문 목록에 pagePr 태그가 없어야 함).
+    assert!(!raw.iter().any(|c| c.contains("<hp:pagePr")), "pagePr는 원문 아닌 페이지 정의");
+    assert_eq!(def.page.expect("페이지 정의").width.0, 59528);
+
+    // write: 원문 자식이 순서대로 그대로, pagePr만 페이지 정의로 재생성.
+    let doc = hwp_model::Document::default();
+    let mut bins = hwpx::write::section::BinCollector::default();
+    let mut wwarn = Vec::new();
+    let out = hwpx::write::section::write_section(&doc, &section, false, &mut bins, &mut wwarn);
+    assert!(out.contains(r##"<hp:grid lineGrid="5" charGrid="7" wonggojiFormat="1"/>"##), "grid 원문 방출");
+    assert!(
+        out.contains(r##"<hp:startNum pageStartsOn="ODD" page="3" pic="2" tbl="4" equation="1"/>"##),
+        "startNum 원문 방출"
+    );
+    assert!(out.contains(r##"border="HIDE_ALL""##), "visibility 원문 방출");
+    assert!(
+        out.contains(r##"<hp:lineNumberShape restartType="2" countBy="3" distance="100" startNumber="9"/>"##),
+        "lineNumberShape 원문 방출"
+    );
+    assert!(out.contains(r##"borderFillIDRef="2""##), "pageBorderFill 원문 방출");
+    assert!(out.contains(r##"<hp:pagePr landscape="WIDELY" width="59528" height="84186""##), "pagePr 재생성");
+    // 상수 템플릿 값(charGrid="0", page="0")으로 덮이지 않았다.
+    assert!(!out.contains(r##"charGrid="0""##), "상수 grid로 대체되지 않음");
+    assert!(!out.contains(r##"pageStartsOn="BOTH""##), "상수 startNum으로 대체되지 않음");
+
+    // 순서 보존: grid < startNum < pagePr < footNotePr < pageBorderFill.
+    let pos = |needle: &str| out.find(needle).unwrap_or_else(|| panic!("미발견: {needle}"));
+    assert!(pos("<hp:grid ") < pos("<hp:startNum "), "grid→startNum 순서");
+    assert!(pos("<hp:startNum ") < pos("<hp:pagePr "), "startNum→pagePr 순서");
+    assert!(pos("<hp:pagePr ") < pos("<hp:footNotePr>"), "pagePr→footNotePr 순서");
+    assert!(pos("<hp:footNotePr>") < pos(r#"<hp:pageBorderFill type="BOTH""#), "footNotePr→pageBorderFill 순서");
+
+    // 재파싱 왕복: 원문 보존과 페이지 정의가 유지된다.
+    let (section2, _) = hwpx::read::section::parse_section(&out).unwrap();
+    let def2 = section2.section_def().expect("secPr 2회차");
+    assert!(
+        def2.secpr_raw_children.iter().any(|c| c.contains(r#"charGrid="7""#)),
+        "왕복 후 grid 원문 유지"
+    );
+    assert!(
+        def2.secpr_raw_children.iter().any(|c| c.contains(r#"borderFillIDRef="2""#)),
+        "왕복 후 pageBorderFill 원문 유지"
+    );
+    assert_eq!(def2.page.unwrap().width.0, 59528);
+}
+
+/// GC-5 보강: secpr_raw_children가 비면(hwp5 출신·구형 IR) 기존 상수 템플릿이
+/// 방출된다 — 출력 불변(hwp5→hwpx 합성 경로 회귀 방지).
+#[test]
+fn gc5_슬롯_없으면_기본상수_불변() {
+    use hwp_model::{Control, HwpChar, HwpUnit, PageDef, Paragraph, Section, SectionDef};
+    let page = PageDef {
+        width: HwpUnit(59528),
+        height: HwpUnit(84186),
+        margin_left: HwpUnit(8504),
+        margin_right: HwpUnit(8504),
+        margin_top: HwpUnit(5668),
+        margin_bottom: HwpUnit(4252),
+        margin_header: HwpUnit(4252),
+        margin_footer: HwpUnit(4252),
+        gutter: HwpUnit(0),
+        attr: 0,
+    };
+    let mut para = Paragraph::default();
+    para.chars.push(HwpChar::ExtCtrl {
+        code: 2,
+        ctrl_id: *b"secd",
+        payload: vec![0u8; 12],
+        ctrl_index: Some(0),
+    });
+    para.controls.push(Control::SectionDef(SectionDef {
+        data: Vec::new(),
+        page: Some(page),
+        extras: Vec::new(),
+        secpr_raw_children: Vec::new(), // 슬롯 없음(hwp5 출신)
+        footnote_shape_raw: None,
+        endnote_shape_raw: None,
+        page_border_fills_raw: Vec::new(),
+    }));
+    let section = Section {
+        paragraphs: vec![para],
+        extras: Vec::new(),
+    };
+
+    let doc = hwp_model::Document::default();
+    let mut bins = hwpx::write::section::BinCollector::default();
+    let mut warns = Vec::new();
+    let out = hwpx::write::section::write_section(&doc, &section, false, &mut bins, &mut warns);
+
+    // 상수 템플릿의 표준 자식이 그대로 방출된다.
+    assert!(out.contains(r##"<hp:grid lineGrid="0" charGrid="0" wonggojiFormat="0"/>"##), "상수 grid");
+    assert!(
+        out.contains(r##"<hp:startNum pageStartsOn="BOTH" page="0" pic="0" tbl="0" equation="0"/>"##),
+        "상수 startNum"
+    );
+    assert!(out.contains(r##"<hp:pageBorderFill type="BOTH""##), "상수 pageBorderFill BOTH");
+    assert!(out.contains(r##"<hp:pageBorderFill type="EVEN""##), "상수 pageBorderFill EVEN");
+    assert!(out.contains(r##"<hp:pageBorderFill type="ODD""##), "상수 pageBorderFill ODD");
+    // 페이지 정의는 반영된다.
+    assert!(out.contains(r##"<hp:pagePr landscape="WIDELY" width="59528" height="84186""##), "pagePr 반영");
+}
+
+/// GI-XC(교차변환 손실 차단): hwp5 출신 구역의 FOOTNOTE_SHAPE/PAGE_BORDER_FILL raw가
+/// 있으면 hwpx writer가 상수 대신 실측 값을 재구성한다.
+///
+/// raw 바이트는 **정답지 실측**이다(11.19 제안요청서 hwp, gc23 조사 보고서 확정 레이아웃):
+/// PAGE_BORDER_FILL 3종이 순서로 BOTH(테두리ID=7 실선)/EVEN(1)/ODD(1)이고, FOOTNOTE_SHAPE
+/// 2개가 각주/미주다. BOTH의 borderFillIDRef가 실테두리(BF#7)를 승계하는지 단언한다.
+#[test]
+fn gixc_hwp5_raw_secpr_실측값_방출_정답지대조() {
+    use hwp_model::{Control, HwpChar, HwpUnit, PageDef, Paragraph, Section, SectionDef};
+    let page = PageDef {
+        width: HwpUnit(59528),
+        height: HwpUnit(84186),
+        margin_left: HwpUnit(8504),
+        margin_right: HwpUnit(8504),
+        margin_top: HwpUnit(5668),
+        margin_bottom: HwpUnit(4252),
+        margin_header: HwpUnit(4252),
+        margin_footer: HwpUnit(4252),
+        gutter: HwpUnit(0),
+        attr: 0,
+    };
+    // 정답지 실측 raw (dump BodyText/Section0 --raw).
+    let foot: Vec<u8> = vec![
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x00, 0x01, 0x00, 0xff, 0xff, 0xff,
+        0xff, 0x52, 0x03, 0x37, 0x02, 0x1b, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let end: Vec<u8> = vec![
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x29, 0x00, 0x01, 0x00, 0xf8, 0x2f, 0xe0,
+        0x00, 0x52, 0x03, 0x37, 0x02, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+    ];
+    // BOTH=테두리ID 7(실선), EVEN/ODD=1(무테두리). gap 0x0589=1417.
+    let pbf_both: Vec<u8> = vec![
+        0x01, 0x00, 0x00, 0x00, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x07, 0x00,
+    ];
+    let pbf_even: Vec<u8> = vec![
+        0x01, 0x00, 0x00, 0x00, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x89, 0x05, 0x01, 0x00,
+    ];
+    let pbf_odd = pbf_even.clone();
+
+    let mut para = Paragraph::default();
+    para.chars.push(HwpChar::ExtCtrl {
+        code: 2,
+        ctrl_id: *b"secd",
+        payload: vec![0u8; 12],
+        ctrl_index: Some(0),
+    });
+    para.controls.push(Control::SectionDef(SectionDef {
+        data: Vec::new(),
+        page: Some(page),
+        extras: Vec::new(),
+        secpr_raw_children: Vec::new(),
+        footnote_shape_raw: Some(foot),
+        endnote_shape_raw: Some(end),
+        page_border_fills_raw: vec![pbf_both, pbf_even, pbf_odd],
+    }));
+    let section = Section {
+        paragraphs: vec![para],
+        extras: Vec::new(),
+    };
+
+    let doc = hwp_model::Document::default();
+    let mut bins = hwpx::write::section::BinCollector::default();
+    let mut warns = Vec::new();
+    let out = hwpx::write::section::write_section(&doc, &section, false, &mut bins, &mut warns);
+
+    // 핵심: BOTH가 실테두리(BF#7)를 승계한다 — 상수 "1"로 대체되지 않았다.
+    assert!(
+        out.contains(
+            r##"<hp:pageBorderFill type="BOTH" borderFillIDRef="7" textBorder="PAPER" headerInside="0" footerInside="0" fillArea="PAPER"><hp:offset left="1417" right="1417" top="1417" bottom="1417"/></hp:pageBorderFill>"##
+        ),
+        "BOTH가 실테두리 id=7 승계: {out}"
+    );
+    assert!(
+        out.contains(r##"<hp:pageBorderFill type="EVEN" borderFillIDRef="1""##),
+        "EVEN=무테두리 id=1"
+    );
+    assert!(
+        out.contains(r##"<hp:pageBorderFill type="ODD" borderFillIDRef="1""##),
+        "ODD=무테두리 id=1"
+    );
+
+    // 각주/미주 실측값 재구성(구분선 길이가 각주 -1, 미주 14692344로 구분됨).
+    assert!(
+        out.contains(
+            r##"<hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="283" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="EACH_COLUMN" beneathText="0"/></hp:footNotePr>"##
+        ),
+        "footNotePr 실측 재구성: {out}"
+    );
+    assert!(
+        out.contains(r##"<hp:endNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="14692344" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="END_OF_DOCUMENT" beneathText="0"/></hp:endNotePr>"##),
+        "endNotePr 실측 재구성: {out}"
+    );
+    // secPr 유효성: 파싱 왕복이 성공하고 페이지 정의가 유지된다.
+    let (section2, w2) = hwpx::read::section::parse_section(&out).unwrap();
+    assert!(w2.is_empty(), "{w2:?}");
+    assert_eq!(section2.section_def().unwrap().page.unwrap().width.0, 59528);
 }
 
 /// 문단 끝에 gso 컨트롤(ExtCtrl 코드 11 + Generic)을 부착한다.
@@ -721,6 +1185,96 @@ fn ge_a8_기본문단_heading_none_유지() {
     );
 }
 
+/// GC-4 탭 정의: tabPr/tabItem(위치·종류·채움)이 hwpx read→write→re-read 왕복에서
+/// 보존된다(이전엔 read가 tabPrIDRef만 읽고 tabItem을 버렸으며 write는 빈 상수만 냈다).
+#[test]
+fn gc4_탭정의_hwpx_왕복() {
+    // 탭 2개 정의: 자동왼탭 + 항목 2개(오른/소수점, 채움 DASH/DOT), 그리고 자동오른탭 빈 정의.
+    let xml = r#"<hh:head><hh:tabProperties itemCnt="2"><hh:tabPr id="0" autoTabLeft="1" autoTabRight="0"><hh:tabItem pos="4000" type="RIGHT" leader="DASH"/><hh:tabItem pos="8000" type="DECIMAL" leader="DOT"/></hh:tabPr><hh:tabPr id="1" autoTabLeft="0" autoTabRight="1"/></hh:tabProperties></hh:head>"#;
+    let (h1, _) = hwpx::read::header::parse_header(xml).unwrap();
+
+    // read 파싱 확인.
+    assert_eq!(h1.tab_stops.len(), 2, "탭 정의 2개");
+    let t0 = &h1.tab_stops[0];
+    assert!(t0.auto_tab_left() && !t0.auto_tab_right(), "0번 자동왼탭");
+    assert_eq!(t0.items.len(), 2, "0번 항목 2개");
+    assert_eq!(t0.items[0].pos, 4000);
+    assert_eq!(t0.items[0].kind, 1, "오른쪽 탭");
+    assert_eq!(t0.items[0].fill, 2, "DASH 채움");
+    assert_eq!(t0.items[1].pos, 8000);
+    assert_eq!(t0.items[1].kind, 3, "소수점 탭");
+    assert_eq!(t0.items[1].fill, 3, "DOT 채움");
+    let t1 = &h1.tab_stops[1];
+    assert!(!t1.auto_tab_left() && t1.auto_tab_right(), "1번 자동오른탭");
+    assert!(t1.items.is_empty(), "1번은 항목 없음");
+
+    // write → 방출 XML에 항목이 정품 구조(hp:switch/case[unit=HWPUNIT,pos=X]/
+    // default[pos=2X])로 실린다. naked tabItem은 한글 먹통 원인이므로 금지.
+    let out = hwpx::write::header::write_header(&h1, 1);
+    assert!(
+        out.contains(
+            r#"<hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"><hh:tabItem pos="4000" type="RIGHT" leader="DASH" unit="HWPUNIT"/></hp:case><hp:default><hh:tabItem pos="8000" type="RIGHT" leader="DASH"/></hp:default>"#
+        ),
+        "방출 XML에 switch로 감싼 탭 항목(case pos=X·default pos=2X): {out}"
+    );
+    assert!(
+        !out.contains(r#"<hh:tabItem pos="4000" type="RIGHT" leader="DASH"/>"#),
+        "naked tabItem(먹통 원인) 방출 금지: {out}"
+    );
+    assert!(
+        out.contains(r#"<hh:tabPr id="1" autoTabLeft="0" autoTabRight="1"/>"#),
+        "자동오른탭 빈 정의 보존: {out}"
+    );
+
+    // re-read → case값만 취하고 default는 무시해 중복 없이 동일 값 보존.
+    let (h2, _) = hwpx::read::header::parse_header(&out).unwrap();
+    assert_eq!(h2.tab_stops[0].items.len(), 2, "재읽기 항목 중복 수집 없음");
+    assert_eq!(h2.tab_stops, h1.tab_stops, "왕복 후 탭 정의 완전 보존");
+}
+
+/// GC-4 하위호환: 정품 hp:switch 구조를 읽을 때 case(HwpUnitChar, pos=X)만 취하고
+/// default(pos=2X)는 버려 항목이 중복 수집되지 않는다.
+#[test]
+fn gc4_정품_switch_구조_case만_읽음() {
+    let xml = r#"<hh:head><hh:tabProperties itemCnt="1"><hh:tabPr id="0" autoTabLeft="0" autoTabRight="0"><hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"><hh:tabItem pos="2900" type="LEFT" leader="NONE" unit="HWPUNIT"/></hp:case><hp:default><hh:tabItem pos="5800" type="LEFT" leader="NONE"/></hp:default></hp:switch><hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"><hh:tabItem pos="44026" type="RIGHT" leader="DASH" unit="HWPUNIT"/></hp:case><hp:default><hh:tabItem pos="88052" type="RIGHT" leader="DASH"/></hp:default></hp:switch></hh:tabPr></hh:tabProperties></hh:head>"#;
+    let (h, _) = hwpx::read::header::parse_header(xml).unwrap();
+    assert_eq!(h.tab_stops.len(), 1, "탭 정의 1개");
+    let t = &h.tab_stops[0];
+    assert_eq!(t.items.len(), 2, "switch 항목 2개(default 중복 배제)");
+    // case의 HWPUNIT pos(X)만 취한다 — default의 2X가 아니어야.
+    assert_eq!(t.items[0].pos, 2900, "첫 항목 case pos=X");
+    assert_eq!(t.items[0].kind, 0, "LEFT 탭");
+    assert_eq!(t.items[0].fill, 0, "NONE 채움");
+    assert_eq!(t.items[1].pos, 44026, "둘째 항목 case pos=X");
+    assert_eq!(t.items[1].kind, 1, "RIGHT 탭");
+    assert_eq!(t.items[1].fill, 2, "DASH 채움");
+}
+
+/// GC-4 하위호환: switch 없는 naked tabItem(구형 출력·타 구현체)도 그대로 읽는다.
+#[test]
+fn gc4_naked_tabitem_하위호환_읽기() {
+    let xml = r#"<hh:head><hh:tabProperties itemCnt="1"><hh:tabPr id="0" autoTabLeft="0" autoTabRight="0"><hh:tabItem pos="8504" type="LEFT" leader="DASH"/></hh:tabPr></hh:tabProperties></hh:head>"#;
+    let (h, _) = hwpx::read::header::parse_header(xml).unwrap();
+    assert_eq!(h.tab_stops.len(), 1);
+    let t = &h.tab_stops[0];
+    assert_eq!(t.items.len(), 1, "naked 항목 1개");
+    assert_eq!(t.items[0].pos, 8504);
+    assert_eq!(t.items[0].fill, 2, "DASH 채움");
+}
+
+/// GC-4 회귀 방어: 탭 정의가 없으면 write_tab_properties 출력이 기존 빈 상수와 바이트 동일.
+#[test]
+fn gc4_탭정의_없으면_기본상수_불변() {
+    let h = hwp_model::DocHeader::default();
+    let out = hwpx::write::header::write_header(&h, 1);
+    assert!(
+        out.contains(
+            r#"<hh:tabProperties itemCnt="1"><hh:tabPr id="0" autoTabLeft="0" autoTabRight="0"/></hh:tabProperties>"#
+        ),
+        "빈 탭 상수 불변: {out}"
+    );
+}
+
 /// 쪽 컨트롤(쪽번호/감추기/새번호/자동번호)이 hwpx 왕복에서 hwp5 페이로드를 바이트
 /// 동일하게 복원한다 — writer(속성 방출)와 reader(build_*)가 정확한 역쌍임을 단정.
 /// 이전엔 writer가 전부 드롭(코퍼스 87건).
@@ -817,8 +1371,8 @@ fn 쪽_컨트롤_hwpx_페이로드_왕복() {
     }
 }
 
-/// 스타일 사다리(목록/절번호 전용 paraShape) hwpx 왕복: 리터럴 마커 텍스트와
-/// 전용 문단 모양(들여쓰기)이 보존되고, 네이티브 번호 정의는 없어야 한다.
+/// 스타일 사다리 hwpx 왕복: H1~H3 절 번호 접두와 H2/H3 SECTION 들여쓰기 모양이
+/// 보존되고, 목록은 네이티브 번호/글머리 정의(head_type)로 왕복된다.
 #[test]
 fn 왕복_스타일_사다리() {
     let doc = hwp_convert::from_markdown("# 제목\n\n## 절\n\n- 항목\n  - 하위\n\n1. 첫\n");
@@ -827,29 +1381,41 @@ fn 왕복_스타일_사다리() {
     assert!(warnings.is_empty(), "{warnings:?}");
     let reread = hwpx::read_document(&out).unwrap().document;
 
-    // 리터럴 마커 텍스트 보존.
+    // 텍스트 보존(절 번호 접두 포함).
     assert_eq!(reread.plain_text(), doc.plain_text());
-    // 전용 문단 모양 5~8 왕복 (들여쓰기 값 포함).
-    assert!(reread.header.para_shapes.len() >= 9);
-    assert_eq!(reread.header.para_shapes[6].margin_left, 8000, "❍ 들여쓰기");
-    // 리터럴 방식 — head_type 비트는 전부 0, 네이티브 불릿 정의 없음.
+    assert!(reread.plain_text().contains("1. 제목"));
+    assert!(reread.plain_text().contains("1-1. 절"));
+    // 네이티브 목록 정의 왕복: 글머리 정의 + 머리(head_type) 문단모양.
+    assert!(!reread.header.bullet_chars.is_empty(), "글머리 정의 왕복");
     assert!(
         reread
             .header
             .para_shapes
             .iter()
-            .all(|ps| ps.head_type() == 0)
+            .any(|ps| ps.head_type() == 3),
+        "BULLET 머리 문단모양"
     );
-    assert!(reread.header.bullet_chars.is_empty(), "불릿 정의 0건");
-    // 번호 정의는 writer가 빈 경우 기본 1개를 방출한다(기존 동작) — 사용자 정의는 없어야.
     assert!(
-        reread.header.numbering_levels.len() <= 1,
-        "번호 정의는 기본 안전망 최대 1개: {:?}",
-        reread.header.numbering_levels.len()
+        reread
+            .header
+            .para_shapes
+            .iter()
+            .any(|ps| ps.head_type() == 2),
+        "NUMBER 머리 문단모양"
+    );
+    // H2/H3 SECTION 들여쓰기(margin_left 2000, 머리 없음) 모양 왕복.
+    assert!(
+        reread
+            .header
+            .para_shapes
+            .iter()
+            .any(|ps| ps.margin_left == 2000 && ps.head_type() == 0),
+        "SECTION 문단모양(margin_left 2000)"
     );
 }
 
-/// secPr/tabPr 원문 에코 왕복: hwpx read → write에서 verbatim 보존 (Gap B/C).
+/// secPr/tabPr 왕복: secPr 자식 pass-through(`secpr_raw_children`) + 의미 탭 정의
+/// (`tab_stops`)로 hwpx read → write가 원문과 슬라이스 수준 동등해야 한다 (Gap B/C).
 #[test]
 fn 왕복_secpr_tabpr_raw() {
     use hwp_model::Control;
@@ -858,32 +1424,25 @@ fn 왕복_secpr_tabpr_raw() {
     assert!(src.exists(), "커밋된 픽스처 없음: {}", src.display());
     let doc = hwpx::read_document(&src).unwrap().document;
 
-    // 읽기 단계에서 원문이 캡처돼야 한다.
-    assert_eq!(
-        doc.header.hwpx_tab_defs_raw.len(),
-        5,
-        "tabPr 5종 에코 캡처"
-    );
-    let secpr_raw_of = |d: &hwp_model::Document| {
-        d.sections[0]
-            .paragraphs
-            .iter()
-            .flat_map(|p| &p.controls)
-            .find_map(|c| match c {
-                Control::SectionDef(def) => def.hwpx_raw.clone(),
-                _ => None,
-            })
-    };
-    let raw = secpr_raw_of(&doc).expect("secPr 에코 캡처");
-    assert!(raw.starts_with("<hp:secPr"), "secPr 전문: {}", &raw[..80]);
+    // 읽기 단계 캡처: 탭 정의 의미 파싱 + secPr 자식 원문 보존.
+    assert_eq!(doc.header.tab_stops.len(), 5, "tabPr 5종 의미 파싱");
+    let secpr_children = doc.sections[0]
+        .paragraphs
+        .iter()
+        .flat_map(|p| &p.controls)
+        .find_map(|c| match c {
+            Control::SectionDef(def) => Some(def.secpr_raw_children.clone()),
+            _ => None,
+        })
+        .expect("SectionDef");
+    assert!(!secpr_children.is_empty(), "secPr 자식 pass-through 캡처");
 
-    // 쓰기 → 재읽기: 원문 그대로 보존.
+    // 쓰기 → 재읽기 자기일관.
     let out = tmp("secpr_tabpr_raw.hwpx");
     let warnings = hwpx::write_document(&doc, &out).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     let reread = hwpx::read_document(&out).unwrap().document;
-    assert_eq!(reread.header.hwpx_tab_defs_raw, doc.header.hwpx_tab_defs_raw);
-    assert_eq!(secpr_raw_of(&reread), Some(raw));
+    assert_eq!(reread.header.tab_stops, doc.header.tab_stops);
 
     // zip 슬라이스 수준: 입력과 출력의 secPr/tabProperties가 바이트 동일.
     let slice = |path: &PathBuf, entry: &str, open: &str, close: &str| {

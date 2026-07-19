@@ -69,6 +69,12 @@ pub fn read_document(path: &Path) -> Result<ReadResult> {
         .map(|xml| parse_content_meta(&xml))
         .unwrap_or_default();
 
+    // 부속 파트 원문 pass-through 슬롯: settings.xml(앱 설정·캐럿)·version.xml(버전
+    // 메타)을 통째로 보존한다. 없으면 None → 쓰기 시 기본 상수. "모르는 데이터는
+    // 버리지 않는다".
+    let hwpx_settings_xml = pkg.read_entry_string("settings.xml").ok();
+    let hwpx_version_xml = pkg.read_entry_string("version.xml").ok();
+
     Ok(ReadResult {
         document: Document {
             meta: DocMeta {
@@ -79,6 +85,8 @@ pub fn read_document(path: &Path) -> Result<ReadResult> {
             header: doc_header,
             sections,
             bin_streams,
+            hwpx_settings_xml,
+            hwpx_version_xml,
         },
         warnings,
     })

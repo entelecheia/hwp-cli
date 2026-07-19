@@ -18,6 +18,10 @@ pub struct DocHeader {
     pub border_fills: Vec<BorderFill>,
     pub char_shapes: Vec<CharShape>,
     pub tab_defs: Vec<RawEntry>,
+    /// `tab_defs`와 병렬인 탭 정의 의미 파싱(위치·종류·채움). 없으면 비어 있음.
+    /// hwp5 raw 왕복(identity)에는 관여하지 않고 hwpx 왕복·렌더 참고용이다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tab_stops: Vec<TabDef>,
     pub numberings: Vec<RawEntry>,
     pub bullets: Vec<RawEntry>,
     /// 렌더 전용: `bullets`와 병렬인 글머리 문자(없으면 비어 있음 — 기본 `•`).
@@ -28,10 +32,6 @@ pub struct DocHeader {
     pub numbering_levels: Vec<Vec<NumLevel>>,
     pub para_shapes: Vec<ParaShape>,
     pub styles: Vec<Style>,
-    /// hwpx 출신 `<hh:tabPr>` 요소 전문 목록 — 탭 정의 무손실 왕복용(reader는
-    /// tabPr를 의미 파싱하지 않으므로 원문 보존). 있으면 hwpx writer가 상수 대신 방출.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hwpx_tab_defs_raw: Vec<String>,
     /// ID_MAPPINGS 원본 카운트 배열 (버전별 길이 보존 — 쓰기 시 유도값과 대조)
     #[serde(default)]
     pub id_mappings_counts: Vec<u32>,
@@ -194,6 +194,11 @@ pub struct ParaShape {
     /// 줄간격 (5.0.2.5 미만에서 사용)
     pub line_spacing_old: i32,
     pub tab_def_id: u16,
+    /// 번호(head_type 2)·글머리(3) 정의 참조 — **IR 규약: 0-기반 인덱스**
+    /// (`numbering_levels`/`bullet_chars`의 인덱스). 포맷 경계에서 ±1로 변환한다:
+    /// hwp5는 on-disk가 1-기반이라 read에서 -1(`doc_info.rs`), write에서 +1(`write.rs`);
+    /// hwpx는 idRef=numbering_id+1로 방출하고 read가 다시 0-기반으로 정규화한다.
+    /// (head_type 0 없음·1 개요는 다른 참조 체계라 변환하지 않는다.)
     pub numbering_id: u16,
     pub border_fill_id: u16,
     /// 테두리 여백 (좌/우/위/아래)
@@ -302,6 +307,43 @@ impl BinDataItem {
     pub fn kind(&self) -> u16 {
         self.attr & 0xF
     }
+}
+
+/// TAB_DEF 한 정의(HWPTAG_TAB_DEF §4.2.7 / OWPML `hh:tabPr`).
+///
+/// hwp5 raw(`DocHeader::tab_defs`)와 병렬로 보존되는 의미 표현이다. hwp5 재직렬화는
+/// 여전히 raw를 그대로 쓰므로(무손실 identity) 이 타입은 hwpx 왕복·렌더에만 쓰인다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabDef {
+    /// 속성 비트(§4.2.7 표37): bit0 문단 왼쪽 끝 자동 탭, bit1 오른쪽 끝 자동 탭.
+    #[serde(default)]
+    pub attr: u32,
+    /// 사용자 탭 항목(위치 오름차순 관례).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<TabItem>,
+}
+
+impl TabDef {
+    /// 문단 왼쪽 끝 자동 탭(내어쓰기용) 유무.
+    pub fn auto_tab_left(&self) -> bool {
+        self.attr & 0x1 != 0
+    }
+
+    /// 문단 오른쪽 끝 자동 탭 유무.
+    pub fn auto_tab_right(&self) -> bool {
+        self.attr & 0x2 != 0
+    }
+}
+
+/// 탭 항목 하나(§4.2.7 탭 정보 8바이트 / OWPML `hh:tabItem`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabItem {
+    /// 탭 위치 (HWPUNIT).
+    pub pos: i32,
+    /// 탭 종류: 0 왼쪽, 1 오른쪽, 2 가운데, 3 소수점.
+    pub kind: u8,
+    /// 채움(리더) 선 종류 코드(테두리선 종류계: 0=없음, 1=실선, 2=DASH …).
+    pub fill: u8,
 }
 
 /// 의미 파싱 전의 ID 테이블 항목 — 원시 페이로드 보존.
