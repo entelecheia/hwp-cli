@@ -1,14 +1,18 @@
 //! 신규 생성 동등성 테스트 — fixtures/samples/report-tables.hwpx를 JSON IR 경로로
 //! 재생성(convert → json → new --from json)해 원본과 동등한지 검증한다(픽스처 하드 의존).
 //!
-//! 게이트: ① convert/new/validate 정상 종료 ② `hwp cat` stdout 전문 동일 ③ 표 지도
-//! (개수·rows/cols·span 멀티셋·셀 width) 동일 ④ secPr 슬라이스 바이트 동일(Gap B)
-//! ⑤ tabProperties 슬라이스 바이트 동일(Gap C). linesegarray·PrvImage·settings는
-//! 설계상 재생성 차이(한글 재계산/범위 외)로 검증하지 않는다.
+//! 동등성 계약: ① convert/new/validate 정상 종료 ② `hwp cat` stdout 전문 동일(텍스트)
+//! ③ 표 지도 동일 — 표별 rows/cols/attr/배치(placement)/안여백/행별 셀 수 + 셀별
+//! (row,col) 키의 span·크기·여백·테두리 (구조) ④ secPr 슬라이스 바이트 동일(Gap B)
+//! ⑤ tabProperties 슬라이스 바이트 동일(Gap C) ⑥ 각주/미주 정품 형태(Gap A).
+//! 범위 외(의도된 차이): linesegarray(한글 재계산), PrvImage/settings(패키지 보조
+//! 엔트리 — JSON IR 무손실 범위 밖). 렌더 픽셀 대조는 lineseg 재계산 리플로우로
+//! 결정적이지 않아 수동 실기 게이트에 맡긴다.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 fn hwp() -> Command {
     Command::new(env!("CARGO_BIN_EXE_hwp"))
@@ -22,13 +26,15 @@ fn fixture() -> PathBuf {
 }
 
 fn tmp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("hwp-cli-regen");
+    // 프로세스별 고유 디렉토리 — 병렬 test runner 간 산출물 경합 방지.
+    let dir = std::env::temp_dir().join(format!("hwp-cli-regen-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
 }
 
 fn cat(path: &PathBuf) -> String {
     let out = hwp().arg("cat").arg(path).output().unwrap();
+    assert!(out.status.success(), "cat 실패: {}", path.display());
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -46,33 +52,38 @@ fn zip_slice(path: &PathBuf, entry: &str, open: &str, close: &str) -> String {
     s[i..j].to_string()
 }
 
-/// 재생성 경로의 최종 산출물을 만든다 (fixture → json → regen.hwpx).
-fn regen() -> (PathBuf, PathBuf) {
-    let json = tmp("fixture.json");
-    let c = hwp()
-        .arg("convert")
-        .arg(fixture())
-        .arg("-o")
-        .arg(&json)
-        .status()
-        .unwrap();
-    assert!(c.success(), "convert → json");
-    let regen = tmp("regen.hwpx");
-    let n = hwp()
-        .arg("new")
-        .arg("--from")
-        .arg(&json)
-        .arg("-o")
-        .arg(&regen)
-        .status()
-        .unwrap();
-    assert!(n.success(), "new --from json");
-    (json, regen)
+/// 재생성 경로의 최종 산출물 (fixture → json → regen.hwpx). 한 번만 생성해 공유한다.
+fn regen() -> &'static (PathBuf, PathBuf) {
+    static REGEN: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+    REGEN.get_or_init(|| {
+        let json = tmp("fixture.json");
+        // --embed-bin: 본문 BinData(이미지)까지 JSON에 실어 일반 문서에서도 무손실.
+        let c = hwp()
+            .arg("convert")
+            .arg(fixture())
+            .arg("--embed-bin")
+            .arg("-o")
+            .arg(&json)
+            .status()
+            .unwrap();
+        assert!(c.success(), "convert → json");
+        let regen = tmp("regen.hwpx");
+        let n = hwp()
+            .arg("new")
+            .arg("--from")
+            .arg(&json)
+            .arg("-o")
+            .arg(&regen)
+            .status()
+            .unwrap();
+        assert!(n.success(), "new --from json");
+        (json, regen)
+    })
 }
 
 #[test]
 fn regen_validate_and_cat_identical() {
-    let (_, regen) = regen();
+    let regen = &regen().1;
     let v = hwp().arg("validate").arg(&regen).output().unwrap();
     assert!(
         v.status.success(),
@@ -86,13 +97,27 @@ fn regen_validate_and_cat_identical() {
     );
 }
 
-/// 표 하나의 지도 항목: (rows, cols, span 멀티셋, 셀 width 나열).
-type TableMapEntry = (u16, u16, Vec<(u16, u16)>, Vec<i32>);
+/// 표 하나의 지도 항목 — 구조·배치의 동등성 대상 필드 전부.
+/// 셀은 (row,col) 키로 정렬해 위치별 span·크기·여백·테두리까지 비교한다
+/// (멀티셋 비교는 배치가 뒤바뀌어도 통과하는 사각지대가 있었다).
+#[derive(Debug, PartialEq)]
+struct TableMapEntry {
+    rows: u16,
+    cols: u16,
+    attr: u32,
+    cell_spacing: u16,
+    inner_margins: [u16; 4],
+    row_cell_counts: Vec<u16>,
+    border_fill: u16,
+    placement: Option<hwp_model::GsoPlacement>,
+    /// (row, col, col_span, row_span, width, height, margins, borderFill)
+    cells: Vec<(u16, u16, u16, u16, i32, i32, [u16; 4], u16)>,
+}
 
 /// 표 지도: 재귀 순서로 TableMapEntry가 동일해야 한다.
 #[test]
 fn regen_table_map_identical() {
-    let (_, regen) = regen();
+    let regen = &regen().1;
     fn table_map(path: &Path) -> Vec<TableMapEntry> {
         let doc = hwpx::read_document(path).unwrap().document;
         fn walk<'a>(paras: &'a [hwp_model::Paragraph], out: &mut Vec<&'a hwp_model::Table>) {
@@ -120,24 +145,49 @@ fn regen_table_map_identical() {
         tables
             .iter()
             .map(|t| {
-                let mut spans: Vec<(u16, u16)> =
-                    t.cells.iter().map(|c| (c.col_span, c.row_span)).collect();
-                spans.sort_unstable();
-                let mut widths: Vec<i32> = t.cells.iter().map(|c| c.width.0).collect();
-                widths.sort_unstable();
-                (t.rows, t.cols, spans, widths)
+                let mut cells: Vec<_> = t
+                    .cells
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.row,
+                            c.col,
+                            c.col_span,
+                            c.row_span,
+                            c.width.0,
+                            c.height.0,
+                            c.margins,
+                            c.border_fill.0,
+                        )
+                    })
+                    .collect();
+                cells.sort_unstable();
+                TableMapEntry {
+                    rows: t.rows,
+                    cols: t.cols,
+                    attr: t.attr,
+                    cell_spacing: t.cell_spacing,
+                    inner_margins: t.inner_margins,
+                    row_cell_counts: t.row_cell_counts.clone(),
+                    border_fill: t.border_fill.0,
+                    placement: t.placement.clone(),
+                    cells,
+                }
             })
             .collect()
     }
     let src_map = table_map(&fixture());
     let regen_map = table_map(&regen);
     assert_eq!(src_map.len(), regen_map.len(), "표 개수 동일");
-    assert_eq!(src_map, regen_map, "표 지도(rows/cols·span·width) 동일");
+    assert_eq!(
+        src_map, regen_map,
+        "표 지도(rows/cols·attr·배치·셀 좌표별 구조) 동일"
+    );
 }
 
 #[test]
 fn regen_secpr_and_tabpr_byte_identical() {
-    let (_, regen) = regen();
+    let regen = &regen().1;
     // Gap B 게이트: secPr 슬라이스 바이트 동일.
     assert_eq!(
         zip_slice(
@@ -167,11 +217,54 @@ fn regen_secpr_and_tabpr_byte_identical() {
     );
 }
 
+/// secPr raw 보존 가드: JSON에서 PageDef를 수정하면 raw가 수정값을 조용히 무시하지 않고
+/// 의미 경로(write_default_sec_pr)로 폴백해 수정값이 반영돼야 한다.
+#[test]
+fn regen_pagedef_edit_overrides_raw() {
+    let json_path = &regen().0;
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(json_path).unwrap()).unwrap();
+    let mut patched = false;
+    for para in doc["sections"][0]["paragraphs"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+    {
+        for ctl in para["controls"].as_array_mut().unwrap().iter_mut() {
+            if let Some(sd) = ctl.get_mut("SectionDef")
+                && let Some(w) = sd.get_mut("page").and_then(|p| p.get_mut("width"))
+            {
+                *w = serde_json::json!(50000);
+                patched = true;
+            }
+        }
+    }
+    assert!(patched, "SectionDef.page.width 패치 실패");
+    let edited = tmp("edited.json");
+    std::fs::write(&edited, serde_json::to_string(&doc).unwrap()).unwrap();
+    let out = tmp("edited.hwpx");
+    let n = hwp()
+        .arg("new")
+        .arg("--from")
+        .arg(&edited)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(n.success(), "new --from edited.json");
+    let secpr = zip_slice(&out, "Contents/section0.xml", "<hp:secPr", "</hp:secPr>");
+    assert!(
+        secpr.contains(r#"width="50000""#),
+        "수정된 페이지 폭이 반영돼야 (raw 무시 금지): {}",
+        &secpr[..secpr.len().min(300)]
+    );
+}
+
 /// Gap A 게이트: 각주/미주가 한글 정품 형태(number/suffixChar/instId + 본문 autoNum)로
 /// 재생성돼야 한다 — 이 픽스처는 각주 2·미주 1을 포함한다.
 #[test]
 fn regen_footnotes_reference_shape() {
-    let (_, regen) = regen();
+    let regen = &regen().1;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(&regen).unwrap()).unwrap();
     let mut xml = String::new();
     zip.by_name("Contents/section0.xml")

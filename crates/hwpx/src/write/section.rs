@@ -233,11 +233,21 @@ fn write_paragraph(
                     Control::SectionDef(def) => {
                         open_run!(cur_shape);
                         flush_text(out, &mut text_buf);
-                        if let Some(raw) = &def.hwpx_raw {
+                        match &def.hwpx_raw {
                             // 원문 secPr verbatim 방출 (비-기본 secPr 왕복 보존).
-                            out.push_str(raw);
-                        } else {
-                            write_default_sec_pr(out, def.page.as_ref());
+                            // 단 IR PageDef가 raw와 어긋나면(JSON에서 페이지 수정)
+                            // 수정값이 조용히 무시되지 않게 의미 경로로 폴백한다.
+                            Some(raw) if raw_matches_page(raw, def.page.as_ref()) => {
+                                out.push_str(raw);
+                            }
+                            Some(_) => {
+                                warnings.push(
+                                    "secPr 원문 보존 해제: PageDef가 수정되어 의미값으로 재생성"
+                                        .into(),
+                                );
+                                write_default_sec_pr(out, def.page.as_ref());
+                            }
+                            None => write_default_sec_pr(out, def.page.as_ref()),
                         }
                     }
                     Control::Generic(g) if g.ctrl_id == *b"cold" => {
@@ -463,6 +473,38 @@ fn default_page() -> PageDef {
         gutter: hwp_model::HwpUnit(0),
         attr: 0,
     }
+}
+
+/// raw secPr 안의 pagePr/margin 값이 IR PageDef와 일치하는가.
+/// JSON에서 PageDef만 고치고 hwpx_raw를 남겨둔 경우를 감지한다(불일치 → 의미 경로 폴백).
+fn raw_matches_page(raw: &str, page: Option<&PageDef>) -> bool {
+    let Some(p) = page else { return true };
+    fn attr_val(scope: &str, name: &str) -> Option<i64> {
+        let pat = format!("{name}=\"");
+        let i = scope.find(&pat)? + pat.len();
+        scope[i..].split('"').next()?.parse().ok()
+    }
+    fn tag_scope<'a>(raw: &'a str, tag: &str) -> Option<&'a str> {
+        let i = raw.find(tag)?;
+        let j = raw[i..].find('>')? + i;
+        Some(&raw[i..j])
+    }
+    let Some(pg) = tag_scope(raw, "<hp:pagePr") else {
+        return true; // pagePr 없는 raw는 비교 불가 — 보존 우선
+    };
+    let mg = tag_scope(raw, "<hp:margin").unwrap_or("");
+    [
+        (pg, "width", i64::from(p.width.0)),
+        (pg, "height", i64::from(p.height.0)),
+        (mg, "left", i64::from(p.margin_left.0)),
+        (mg, "right", i64::from(p.margin_right.0)),
+        (mg, "top", i64::from(p.margin_top.0)),
+        (mg, "bottom", i64::from(p.margin_bottom.0)),
+        (mg, "header", i64::from(p.margin_header.0)),
+        (mg, "footer", i64::from(p.margin_footer.0)),
+    ]
+    .iter()
+    .all(|(scope, name, want)| attr_val(scope, name).is_none_or(|got| got == *want))
 }
 
 fn write_default_sec_pr(out: &mut String, page: Option<&PageDef>) {
@@ -1075,20 +1117,70 @@ fn write_table(
     let total_w: i64 = col_w.iter().sum();
     let total_h: i64 = row_h.iter().sum();
 
+    // 배치·표 속성: hwpx 출신 표(placement Some)는 IR 실측값을 그대로 방출한다 —
+    // 상수로 덮으면 zOrder/noAdjust/treatAsChar/outMargin이 원본과 달라져 한글이
+    // 재배치하며 겹침·빈 페이지가 생긴다(read 쪽 주석과 동일 근거, 정답지=픽스처).
+    // placement None(markdown 합성·hwp5 출신)은 실기 통과 이력이 있는 기존 상수 유지.
     let m = table.inner_margins;
-    let _ = write!(
-        out,
-        r##"<hp:tbl id="{}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="1" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="0"><hp:sz width="{total_w}" widthRelTo="ABSOLUTE" height="{total_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/><hp:outMargin left="283" right="283" top="283" bottom="283"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
-        ids.next(),
-        table.rows,
-        table.cols,
-        table.cell_spacing,
-        table.border_fill.0.max(1),
-        m[0],
-        m[1],
-        m[2],
-        m[3],
-    );
+    if let Some(p) = &table.placement {
+        let a = table.attr;
+        let page_break = match a & 0x3 {
+            1 => "TABLE",
+            2 => "CELL",
+            _ => "NONE",
+        };
+        let vert_rel = ["PAPER", "PAGE", "PARA", "PARA"][usize::from(p.vert_rel_to & 3)];
+        let horz_rel = ["PAPER", "PAGE", "COLUMN", "PARA"][usize::from(p.horz_rel_to & 3)];
+        let vert_align = ["TOP", "CENTER", "BOTTOM"][usize::from(p.vert_align.min(2))];
+        let horz_align = ["LEFT", "CENTER", "RIGHT"][usize::from(p.horz_align.min(2))];
+        // hp:sz — 원본 경계값이 있으면 사용(병합 셀 합산 추정보다 정확), 없으면 합산.
+        let (sz_w, sz_h) = if p.width > 0 && p.height > 0 {
+            (i64::from(p.width), i64::from(p.height))
+        } else {
+            (total_w, total_h)
+        };
+        let om = p.out_margins;
+        let _ = write!(
+            out,
+            r##"<hp:tbl id="{}" zOrder="{}" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="{page_break}" repeatHeader="{}" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="{}"><hp:sz width="{sz_w}" widthRelTo="ABSOLUTE" height="{sz_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="{}" affectLSpacing="{}" flowWithText="{}" allowOverlap="0" holdAnchorAndSO="{}" vertRelTo="{vert_rel}" horzRelTo="{horz_rel}" vertAlign="{vert_align}" horzAlign="{horz_align}" vertOffset="{}" horzOffset="{}"/><hp:outMargin left="{}" right="{}" top="{}" bottom="{}"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
+            ids.next(),
+            p.z_order,
+            (a >> 2) & 1,
+            table.rows,
+            table.cols,
+            table.cell_spacing,
+            table.border_fill.0.max(1),
+            (a >> 3) & 1,
+            u8::from(p.treat_as_char),
+            u8::from(p.affect_line_spacing),
+            u8::from(p.flow_with_text),
+            u8::from(p.hold_anchor),
+            p.vert_offset,
+            p.horz_offset,
+            om[0],
+            om[1],
+            om[2],
+            om[3],
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+        );
+    } else {
+        let _ = write!(
+            out,
+            r##"<hp:tbl id="{}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="1" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="0"><hp:sz width="{total_w}" widthRelTo="ABSOLUTE" height="{total_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/><hp:outMargin left="283" right="283" top="283" bottom="283"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
+            ids.next(),
+            table.rows,
+            table.cols,
+            table.cell_spacing,
+            table.border_fill.0.max(1),
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+        );
+    }
 
     // 행별 그룹화 (셀은 행 우선 순서로 보존되어 있음)
     let mut by_row: BTreeMap<u16, Vec<&Cell>> = BTreeMap::new();

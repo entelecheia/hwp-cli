@@ -47,8 +47,12 @@ pub fn parse_color(s: &str) -> u32 {
 }
 
 /// 원문에서 `<{prefix}:{local}…>` 요소 전문을 문서 순서로 추출한다(raw 에코 보존용).
-/// 자체닫힘(`<hh:tabPr …/>`)은 그 태그만, 컨테이너는同名 중첩을 깊이 카운트로 처리한다.
+/// 자체닫힘(`<hh:tabPr …/>`)은 그 태그만, 컨테이너는 같은 이름 중첩을 깊이 카운트로 처리한다.
 /// 파서가 의미 해석하지 않는 요소(secPr, tabPr 등)의 무손실 왕복에 쓴다.
+///
+/// 주의: 이 함수는 원문 UTF-8 substring을 그대로 복사하므로 바이트 정확이 보장된다.
+/// quick-xml 이벤트 재직렬화로 "개선"하지 말 것 — 속성 순서·인용부호·이스케이프가
+/// 재구성되며 regen 테스트의 바이트 동일 게이트가 깨진다.
 pub fn echo_elements(src: &str, prefix: &str, local: &str) -> Vec<String> {
     let open = format!("<{prefix}:{local}");
     let close = format!("</{prefix}:{local}>");
