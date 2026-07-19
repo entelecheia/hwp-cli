@@ -161,7 +161,11 @@ fn 왕복_각주_목록_hwp5_규격() {
     assert!(!bullets.is_empty(), "BULLET 레코드 존재");
     for b in &bullets {
         assert_eq!(b.len(), 25, "BULLET 레코드 25B(정품 실측)");
-        assert_eq!(&b[8..12], &[0xFF, 0xFF, 0xFF, 0xFF], "번호 글자모양 id 없음");
+        assert_eq!(
+            &b[8..12],
+            &[0xFF, 0xFF, 0xFF, 0xFF],
+            "번호 글자모양 id 없음"
+        );
         assert_eq!(
             u16::from_le_bytes([b[12], b[13]]),
             0x2022,
@@ -203,11 +207,13 @@ fn hwp5_numbering_id_0기반_경계왕복() {
     let di = c.read_record_stream("/DocInfo").unwrap();
     let raw_ids: Vec<u16> = all_records(&di, 0x19)
         .iter()
-        .filter(|d| d.len() >= 32 && ((u32::from_le_bytes([d[0], d[1], d[2], d[3]]) >> 23) & 3) != 0)
+        .filter(|d| {
+            d.len() >= 32 && ((u32::from_le_bytes([d[0], d[1], d[2], d[3]]) >> 23) & 3) != 0
+        })
         .map(|d| u16::from_le_bytes([d[30], d[31]]))
         .collect();
     assert!(
-        raw_ids.iter().any(|&id| id == 1),
+        raw_ids.contains(&1),
         "머리 문단모양 on-disk numbering_id가 1-기반(=1)이어야: {raw_ids:?}"
     );
 
@@ -234,7 +240,10 @@ fn md_이미지_코드_hwp5_왕복() {
     png.extend(16u32.to_be_bytes());
     png.extend([0u8; 8]);
     let fig = dir.join("f.png");
-    std::fs::File::create(&fig).unwrap().write_all(&png).unwrap();
+    std::fs::File::create(&fig)
+        .unwrap()
+        .write_all(&png)
+        .unwrap();
 
     let doc = hwp_convert::from_markdown_with(
         "본문 `let x = 1;` 코드와 이미지.\n\n![alt](f.png)\n",
@@ -251,14 +260,11 @@ fn md_이미지_코드_hwp5_왕복() {
     let reread = hwp5::read_document(&out).unwrap().document;
 
     // 이미지 Picture + bin 데이터 생존.
-    let has_pic = reread.sections[0]
-        .paragraphs
-        .iter()
-        .any(|p| {
-            p.controls
-                .iter()
-                .any(|c| matches!(c, hwp_model::Control::Picture(_)))
-        });
+    let has_pic = reread.sections[0].paragraphs.iter().any(|p| {
+        p.controls
+            .iter()
+            .any(|c| matches!(c, hwp_model::Control::Picture(_)))
+    });
     assert!(has_pic, "이미지 Picture 왕복");
     assert!(!reread.bin_streams.is_empty(), "bin_streams 왕복");
 
@@ -272,10 +278,11 @@ fn md_이미지_코드_hwp5_왕복() {
         .map(|(i, _)| i as u16)
         .collect();
     assert!(!code_ids.is_empty(), "코드 글자모양(함초롬돋움) 왕복");
-    let has_run = reread.sections[0]
-        .paragraphs
-        .iter()
-        .any(|p| p.char_shape_runs.iter().any(|(_, id)| code_ids.contains(&id.0)));
+    let has_run = reread.sections[0].paragraphs.iter().any(|p| {
+        p.char_shape_runs
+            .iter()
+            .any(|(_, id)| code_ids.contains(&id.0))
+    });
     assert!(has_run, "코드 run 왕복");
 }
 
@@ -745,4 +752,30 @@ fn 글상자_hwpx출신_안전저하_텍스트보존() {
     assert!(!has_gso, "gso 래퍼는 저하로 제거돼야");
     // 손상 원인이던 "페이로드가 없는 컨트롤 드롭"은 없다(텍스트 hoist로 대체).
     assert!(!reread.plain_text().is_empty(), "유효 문서(빈 본문 아님)");
+}
+
+/// 스타일 사다리(from_markdown): 목록은 네이티브 BULLET/NUMBERING 정의(B7 25B 정답지,
+/// 실기 확정)로, H1~H3 절 번호는 리터럴 접두로 방출된다 — hwp5 출력에서 BULLET
+/// 레코드 수가 IR 글머리 정의 수와 일치하고 절 번호 텍스트가 왕복되는지 단언한다.
+#[test]
+fn 스타일_사다리_hwp5_정의_왕복() {
+    let doc = hwp_convert::from_markdown("# 제목\n\n- 항목\n  - 하위\n\n1. 첫\n2. 둘\n");
+    assert!(!doc.header.bullet_chars.is_empty(), "글머리 정의 생성");
+    let out = tmp("synth_ladder.hwp");
+    hwp5::write_document(&doc, &out, &hwp5::WriteOptions::default()).unwrap();
+    let mut c = hwp5::Hwp5Container::open(&out).unwrap();
+    let di = c.read_record_stream("/DocInfo").unwrap();
+    let bullets = all_records(&di, 0x18);
+    assert_eq!(
+        bullets.len(),
+        doc.header.bullet_chars.len(),
+        "BULLET 레코드 수 == IR 글머리 정의 수"
+    );
+
+    // 절 번호는 리터럴 접두로, 목록 텍스트는 마커 없는 본문으로 왕복된다.
+    let reread = hwp5::read_document(&out).unwrap().document;
+    let text = reread.plain_text();
+    assert!(text.contains("1. 제목"), "{text}");
+    assert!(text.contains("항목"), "{text}");
+    assert!(!text.contains("❍"), "리터럴 마커는 더 쓰지 않는다: {text}");
 }

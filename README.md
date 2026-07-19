@@ -138,12 +138,12 @@ hwp edit form.hwp -o filled.hwp \
     --set-cell "0:1:2=12,300원" \
     --set-field "수신처=홍길동" --verify
 
-# 구조 편집 (문단 삽입/삭제·표 행 추가/삭제 — 모양 상속)
+# 구조 편집 (문단 삽입/삭제·표 행/열 추가, 행 삭제 — 모양 상속; 병합 표는 거부)
 hwp edit report.hwp -o out.hwp \
     --insert-para "개요=>추가 설명 문단입니다." \
     --insert-para-before "결론=>결론 직전에 삽입." \
     --delete-para "임시 메모" \
-    --add-row "0" --delete-row "1:3" --verify
+    --add-row "0" --add-col "1" --delete-row "1:3" --verify
 
 # 누름틀 생성 + 채우기 (앵커 텍스트 뒤에 %clk 필드 삽입 후 이름으로 채움)
 # 출력이 .hwp든 .hwpx든 필드가 보존된다(hwpx는 OWPML fieldBegin/fieldEnd로 왕복).
@@ -170,8 +170,8 @@ hwp mcp --font-dir ./fonts
 | `cat <file>` | `--format plain\|markdown\|json` (기본 `plain`), `--preview`, `--with-header-footer`, `--with-hidden` | 본문 추출. `--preview`는 본문 파싱 없이 PrvText만 출력. `--with-*`는 머리말/꼬리말·숨은 설명 포함(기본 제외) |
 | `convert <input> -o <output>` | `--to hwp\|hwpx\|md\|json`(생략 시 확장자 추론), `--strict`(예약 — 현재 미동작), `--preserve-layout`, `--embed-bin`, `--media-dir <dir>`(md), `--with-header-footer`(md), `--with-hidden`(md) | 포맷 변환. 출력이 `.pdf`이면 렌더 경로로 위임(시스템 글꼴 사용 — 정밀 글꼴은 `render --font-dir` 권장). `--preserve-layout`는 무수정 왕복 전용 줄 배치 보존. `--embed-bin`은 JSON에 이미지 base64 임베드. md 출력은 `--media-dir figs`처럼 이미지 추출 디렉터리 지정 가능(기본 `<스템>.media`, 상대경로는 출력 파일 기준·링크는 Markdown에 안전하게 직렬화). `--strict`는 향후 보존 불가 데이터 발견 시 실패 처리 예정(현재는 동작하지 않음) |
 | `render <input> -o <output>` | `--pages "1"\|"1-3"\|"all"`(기본 `all`), `--dpi <f64>`(기본 96, 래스터 전용), `--format png\|svg\|pdf`(생략 시 확장자 추론), `--font-dir <dir>`(반복) | 페이지를 PNG/SVG(페이지별 파일)·PDF(단일 멀티페이지)로 렌더. 번호 목록은 형식 템플릿(`^1.`→"1.", `(^5)`→"(5)", `제^1조`→"제1조")을 적용 |
-| `new -o <output>` | `--from <md\|json>`(생략 시 빈 문서) | markdown/JSON IR에서 새 문서 생성 |
-| `edit <input> -o <output>` | `--replace "찾기=>바꾸기"`, `--set-cell "표:행:열=값"`(0-기반), `--set-field "이름=값"`, `--create-field "앵커=>이름"`(또는 `"앵커=>이름=값"`, %clk 누름틀 생성), `--insert-image "앵커=>경로"`(또는 `"앵커=>경로@너비x높이"`mm, png/jpg/bmp/gif 삽입), `--seal "앵커=>경로"`(또는 `"앵커=>경로@크기mm"`, 도장 이미지를 앵커 문구 위에 글 앞 부유 배치 — 기본 20mm), `--set-format "찾기:bold=on,size=16,color=#RRGGBB"`, `--set-align "찾기=left\|right\|center\|justify\|distribute\|divide"`, `--insert-para "앵커=>텍스트"`(앵커 문단 뒤), `--insert-para-before "앵커=>텍스트"`(앞), `--delete-para "텍스트"`, `--add-row "표"`, `--delete-row "표:행"`, `--verify` (모두 반복 가능) | 기존 문서 편집. 텍스트·서식·구조(문단/표 행) 편집. 삽입 문단·행은 앵커/템플릿 모양을 상속하고 합성 경로로 저장(불변식 적용). `--verify`는 쓰기 후 재읽기로 검증 |
+| `new -o <output>` | `--from <md\|json>`(생략 시 빈 문서) | markdown/JSON IR에서 새 문서 생성. markdown 목록은 진짜 번호(NUMBER)/글머리(BULLET) 머리 문단으로 들여오고(중첩=수준), H1~H3 제목엔 절 번호(`1.`/`1-1.`/`1-1-1.`, 숫자 시작 제목은 생략)를 접두한다 |
+| `edit <input> -o <output>` | `--replace "찾기=>바꾸기"`, `--set-cell "표:행:열=값"`(0-기반), `--set-field "이름=값"`, `--create-field "앵커=>이름"`(또는 `"앵커=>이름=값"`, %clk 누름틀 생성), `--insert-image "앵커=>경로"`(또는 `"앵커=>경로@너비x높이"`mm, png/jpg/bmp/gif 삽입), `--seal "앵커=>경로"`(또는 `"앵커=>경로@크기mm"`, 도장 이미지를 앵커 문구 위에 글 앞 부유 배치 — 기본 20mm), `--set-format "찾기:bold=on,size=16,color=#RRGGBB"`, `--set-align "찾기=left\|right\|center\|justify\|distribute\|divide"`, `--insert-para "앵커=>텍스트"`(앵커 문단 뒤), `--insert-para-before "앵커=>텍스트"`(앞), `--delete-para "텍스트"`, `--add-row "표"`, `--add-col "표"`, `--delete-row "표:행"`, `--verify` (모두 반복 가능) | 기존 문서 편집. 텍스트·서식·구조(문단/표 행/열) 편집. 삽입 문단·행은 앵커/템플릿 모양을 상속하고 합성 경로로 저장(불변식 적용). 표 인덱스는 **재귀 깊이 우선**(중첩 표 포함, --set-cell과 동일). `--add-col`은 전체 표 폭을 유지하며 기존 열을 균등 축소(잔차는 행 마지막 기존 셀). 병합 셀·중첩 등 복잡 표의 행/열 추가·삭제는 거부. `--replace`만 있고 hwpx→hwpx이면 **패키지 보존 고속 경로**(미리보기·호환 블록 바이트 유지, 런 분절 교차 매칭 미지원). `--verify`는 쓰기 후 재읽기로 검증 |
 | `fields <file>` | `--json` | 필드/누름틀 목록(이름·종류·값·명령) |
 | `diff <input> --ref <png>` | `--page <n>`(기본 1), `--dpi <f64>`(기본 96), `-o/--out <png>`, `--font-dir <dir>`(반복), `--tolerance <u8>`(기본 16) | 렌더 결과를 한글 기준 PNG와 비교(잉크 적용률·dx/dy 오프셋·픽셀 차이율·MAE) |
 | `mcp` | `--font-dir <dir>`(반복) | MCP stdio 서버 실행 |
@@ -214,6 +214,22 @@ HWP 요소 → markdown 매핑:
 
 한계: 헤딩 인식은 `개요 N` 스타일뿐이고(사용자 정의 제목 스타일은 본문 취급), 떠 있는(floating)
 개체의 위치·z-order는 반영하지 않으며, 역방향(md → hwp)은 표·굵게 등 기본 구문만 복원된다.
+
+## JSON IR로 문서 재생성 (regen)
+
+기존 문서를 편집하지 않고 **처음부터 똑같이 신규 생성**할 수 있다 — JSON IR이 무손실
+왕복을 보장하고, hwpx read/write 경계의 손실(secPr·tabPr·각주/미주)은 원문 보존으로 해소됐다.
+
+```sh
+hwp convert report.hwpx -o report.json   # hwp/hwpx → JSON IR (--embed-bin: 이미지까지 임베드)
+hwp new --from report.json -o regen.hwpx # JSON IR → 신규 문서
+```
+
+재생성 검증(자동, `crates/hwp-cli/tests/regen.rs`): validate 통과, `hwp cat` 출력 전문 동일,
+표 지도(개수·행/열·병합·셀 폭) 동일, secPr·tabProperties 슬라이스 바이트 동일.
+차이가 남는 것은 설계상 재생성 대상인 줄 배치 캐시(linesegarray — 한글이 열 때 재계산),
+미리보기 이미지, settings.xml뿐이다. markdown 경로(`hwp new --from md`)는 병합 표·폰트·
+글자 색 같은 표현력 밖 요소를 재현하지 않는다(RISE 스타일 veneer까지).
 
 ## MCP 서버 (AI 에이전트 연동)
 

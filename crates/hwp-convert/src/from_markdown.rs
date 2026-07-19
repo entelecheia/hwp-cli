@@ -442,6 +442,11 @@ struct Builder {
     in_blockquote: u32,        // 인용문 중첩 깊이(>0이면 인용 문단)
     in_codeblock: bool,        // 코드블록 구간(회색 배경 문단)
     heading: Option<u16>,      // 1..=6
+    // H1~H3 절 번호 사다리(1. / 1-1. / 1-1-1.) — 보고서 표준. 제목이 숫자로
+    // 시작하면 접두를 생략한다(이중 번호 방지).
+    h_counters: [u32; 3],
+    pending_heading_num: Option<String>,
+    section_para_shape: Option<u16>, // H2/H3 들여쓰기(left 2000) 문단모양 인덱스
     // 표 수집 상태
     table: Option<TableBuilder>,
     // 목록 상태 — 수준별 프레임 스택(중첩), 항목 문단에 머리 문단모양을 부여.
@@ -577,8 +582,13 @@ impl Builder {
             4
         } else if self.in_blockquote > 0 {
             3
-        } else if self.heading.is_some() {
-            1
+        } else if let Some(h) = self.heading {
+            // H2/H3는 들여쓰기(SECTION) 문단모양, 그 외 제목은 기본 제목 모양.
+            if (2..=3).contains(&h) {
+                self.section_para_shape.unwrap_or(1)
+            } else {
+                1
+            }
         } else if self.table.is_some() {
             0
         } else {
@@ -744,7 +754,9 @@ impl Builder {
     fn load_image(&self, dest_url: &str) -> Result<(Vec<u8>, String, i32, i32), String> {
         let lower = dest_url.to_ascii_lowercase();
         if lower.starts_with("http://") || lower.starts_with("https://") {
-            return Err(format!("원격 이미지 URL은 지원하지 않습니다(alt 보존): {dest_url}"));
+            return Err(format!(
+                "원격 이미지 URL은 지원하지 않습니다(alt 보존): {dest_url}"
+            ));
         }
         // file: 스킴 접두는 벗겨서 로컬 경로로 다룬다.
         let raw = dest_url.strip_prefix("file://").unwrap_or(dest_url);
@@ -774,7 +786,8 @@ impl Builder {
                 resolved.display()
             ));
         }
-        let (w, h) = crate::image::display_size(&data, &crate::image::ImageSize::Natural, BODY_WIDTH);
+        let (w, h) =
+            crate::image::display_size(&data, &crate::image::ImageSize::Natural, BODY_WIDTH);
         let name = format!("md_image{}.{ext}", self.bin_streams.len() + 1);
         Ok((data, name, w, h))
     }
@@ -799,11 +812,43 @@ impl Builder {
                 let n = heading_level(level);
                 self.heading = Some(n);
                 self.style = n; // 개요 N 스타일
+                // H1~H3 절 번호 계산: 해당 수준 +1, 하위 0 리셋, 0인 상위는 1로 승격.
+                self.pending_heading_num = if n <= 3 {
+                    let i = (n - 1) as usize;
+                    self.h_counters[i] += 1;
+                    for c in &mut self.h_counters[i + 1..] {
+                        *c = 0;
+                    }
+                    for c in &mut self.h_counters[..i] {
+                        if *c == 0 {
+                            *c = 1;
+                        }
+                    }
+                    let nums: Vec<String> =
+                        self.h_counters[..=i].iter().map(u32::to_string).collect();
+                    Some(format!("{}. ", nums.join("-")))
+                } else {
+                    None
+                };
+                // H2/H3 들여쓰기 문단모양(1회 할당).
+                if (2..=3).contains(&n) && self.section_para_shape.is_none() {
+                    let idx = BASE_PARA_SHAPES + self.extra_para_shapes.len() as u16;
+                    self.extra_para_shapes.push(ParaShape {
+                        attr1: 0x180 | (1 << 2),
+                        margin_left: 2000,
+                        line_spacing_old: 160,
+                        line_spacing: 160,
+                        border_fill_id: 2,
+                        ..ParaShape::default()
+                    });
+                    self.section_para_shape = Some(idx);
+                }
             }
             Event::End(TagEnd::Heading(_)) => {
                 self.flush_paragraph();
                 self.heading = None;
                 self.style = 0;
+                self.pending_heading_num = None;
             }
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => self.flush_paragraph(),
@@ -814,6 +859,13 @@ impl Builder {
             Event::Start(Tag::Strikethrough) => self.strike = true,
             Event::End(TagEnd::Strikethrough) => self.strike = false,
             Event::Text(t) => {
+                // 절 번호 접두: 제목 첫 텍스트 앞에 삽입(숫자 시작 제목은 생략).
+                if self.heading.is_some()
+                    && let Some(num) = self.pending_heading_num.take()
+                    && !t.starts_with(|c: char| c.is_ascii_digit())
+                {
+                    self.push_text(&num);
+                }
                 if self.in_image_suppress {
                     // 이미지 임베드 성공 → alt 텍스트 억제(그림이 대체한다).
                 } else if self.in_codeblock {
@@ -1183,8 +1235,10 @@ mod tests {
                 if *code == hwp_model::ctrl_char::FOOTNOTE_ENDNOTE && ctrl_id == b"fn  ")
         });
         assert!(has_anchor, "각주 앵커 존재");
-        let has_ctrl = para.controls.iter().any(|c| matches!(c,
-            Control::Generic(g) if g.ctrl_id == *b"fn  " && !g.paragraph_lists.is_empty()));
+        let has_ctrl = para.controls.iter().any(|c| {
+            matches!(c,
+            Control::Generic(g) if g.ctrl_id == *b"fn  " && !g.paragraph_lists.is_empty())
+        });
         assert!(has_ctrl, "각주 컨트롤+본문 존재");
     }
 
@@ -1305,7 +1359,7 @@ mod tests {
     fn push_text_탭_인라인컨트롤_제어문자_드롭() {
         let mut b = Builder::default();
         b.push_text("A\tB\u{0001}C");
-        let kinds: Vec<_> = b.chars.iter().cloned().collect();
+        let kinds: Vec<_> = b.chars.to_vec();
         assert_eq!(kinds.len(), 4, "A, 탭, B, C (0x01 드롭): {kinds:?}");
         assert!(matches!(kinds[0], HwpChar::Text('A')));
         assert!(matches!(kinds[1], HwpChar::InlineCtrl { code: 9, .. }));
@@ -1313,5 +1367,59 @@ mod tests {
         assert!(matches!(kinds[3], HwpChar::Text('C')));
         // wchar_pos = 1 + 8 + 1 + 1 (0x01은 소비 안 함).
         assert_eq!(b.wchar_pos, 11);
+    }
+
+    /// H1~H3 절 번호 사다리: 카운터 증가·하위 리셋·상위 0 승격 + H2/H3 들여쓰기 모양.
+    #[test]
+    fn 헤딩_절번호_카운터() {
+        let doc = from_markdown("# 서론\n## 배경\n## 목적\n# 본론\n### 세부\n");
+        let text = doc.plain_text();
+        for want in [
+            "1. 서론",
+            "1-1. 배경",
+            "1-2. 목적",
+            "2. 본론",
+            "2-1-1. 세부",
+        ] {
+            assert!(text.contains(want), "{want} 없음: {text}");
+        }
+        // H2/H3 문단은 SECTION 문단모양(margin_left 2000)을 쓴다.
+        let ps_of = |needle: &str| {
+            let p = doc.sections[0]
+                .paragraphs
+                .iter()
+                .find(|p| {
+                    p.chars.iter().any(|c| matches!(c, HwpChar::Text(_)))
+                        && plain_of(p).contains(needle)
+                })
+                .unwrap();
+            p.para_shape.0
+        };
+        fn plain_of(p: &Paragraph) -> String {
+            p.chars
+                .iter()
+                .filter_map(|c| match c {
+                    HwpChar::Text(ch) => Some(*ch),
+                    _ => None,
+                })
+                .collect()
+        }
+        let section_ps = ps_of("1-1. 배경");
+        assert!(section_ps >= BASE_PARA_SHAPES, "SECTION은 확장 모양");
+        assert_eq!(ps_of("2-1-1. 세부"), section_ps, "H2/H3 동일 모양");
+        assert_eq!(
+            doc.header.para_shapes[section_ps as usize].margin_left,
+            2000
+        );
+        assert_eq!(ps_of("1. 서론"), 1, "H1은 기본 제목 모양");
+    }
+
+    /// 숫자로 시작하는 제목은 절 번호 접두를 생략한다(이중 번호 방지).
+    #[test]
+    fn 헤딩_이중번호_방지() {
+        let doc = from_markdown("# 1. 서론\n");
+        let text = doc.plain_text();
+        assert!(text.contains("1. 서론"), "{text}");
+        assert!(!text.contains("1. 1. 서론"), "이중 번호 금지: {text}");
     }
 }

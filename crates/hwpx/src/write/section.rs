@@ -82,12 +82,17 @@ pub fn write_section(
 }
 
 #[derive(Default)]
-struct IdSeq(u32);
+struct IdSeq {
+    next: u32,
+    /// 각주/미주 번호(종류별 1부터 — footNote@number·autoNum@num에 사용).
+    footnote: u32,
+    endnote: u32,
+}
 
 impl IdSeq {
     fn next(&mut self) -> u32 {
-        self.0 += 1;
-        self.0
+        self.next += 1;
+        self.next
     }
 }
 
@@ -908,23 +913,32 @@ fn write_foot_end_note(
     preserve_linesegs: bool,
     warnings: &mut Vec<String>,
 ) {
-    let el = if g.ctrl_id == *b"fn  " {
-        "footNote"
+    // 한글 저장본 실측 형태(정답지=커밋 픽스처): number는 종류별 1-기반 수열,
+    // suffixChar="41", instId는 문서 고유값(정품도 임의 u32 — 큰 베이스로 합성).
+    let foot = g.ctrl_id == *b"fn  ";
+    let (el, num_type) = if foot {
+        ids.footnote += 1;
+        ("footNote", "FOOTNOTE")
     } else {
-        "endNote"
+        ids.endnote += 1;
+        ("endNote", "ENDNOTE")
     };
+    let number = if foot { ids.footnote } else { ids.endnote };
+    let inst_id = 0x4000_0000 + ids.next();
     let _ = write!(
         out,
-        r##"<hp:ctrl><hp:{el} number="0" suffixChar="" prefixChar="" instId="{}">"##,
-        ids.next()
+        r##"<hp:ctrl><hp:{el} number="{number}" suffixChar="41" instId="{inst_id}">"##
     );
     for list in &g.paragraph_lists {
         out.push_str(
             r##"<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">"##,
         );
         for para in &list.paragraphs {
+            // 노트 본문의 autoNum은 atno arm이 numType="PAGE" 상수로 쓰므로, 여기서
+            // 종류·번호로 교체한다(정품: 노트 첫 run의 번호 필드).
+            let mut buf = String::new();
             write_paragraph(
-                out,
+                &mut buf,
                 doc,
                 para,
                 ids,
@@ -933,6 +947,14 @@ fn write_foot_end_note(
                 preserve_linesegs,
                 warnings,
             );
+            const PAGE_SNIP: &str = r##"<hp:ctrl><hp:autoNum numType="PAGE"/></hp:ctrl>"##;
+            if buf.contains(PAGE_SNIP) {
+                let note_snip = format!(
+                    r##"<hp:ctrl><hp:autoNum num="{number}" numType="{num_type}"><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/></hp:autoNum></hp:ctrl>"##
+                );
+                buf = buf.replacen(PAGE_SNIP, &note_snip, 1);
+            }
+            out.push_str(&buf);
         }
         out.push_str("</hp:subList>");
     }
@@ -1423,7 +1445,10 @@ fn write_table(
     // sz도 원본 개체 폭/높이를 유지한다(행높이 합산 재계산은 페이지 걸침 표에서 과다).
     // 합성 표(md/synth — placement=None)만 인라인 기본값·재계산으로 폴백한다.
     let pl = table.placement.as_ref();
-    let sz_w = pl.map(|p| p.width).filter(|&w| w > 0).map_or(total_w, i64::from);
+    let sz_w = pl
+        .map(|p| p.width)
+        .filter(|&w| w > 0)
+        .map_or(total_w, i64::from);
     let sz_h = pl
         .map(|p| p.height)
         .filter(|&h| h > 0)
@@ -1437,14 +1462,22 @@ fn write_table(
     let horz_align = pl.map_or("LEFT", |p| horz_align_name(p.horz_align));
     let vert_offset = pl.map_or(0, |p| p.vert_offset);
     let horz_offset = pl.map_or(0, |p| p.horz_offset);
+    // zOrder·outMargin도 원본 값 승계(픽스처 실측: zOrder 0~10, outMargin 141 —
+    // 상수로 뭉개면 도형 겹침 순서·바깥 여백이 원본과 어긋난다). 합성 표는 기존 기본값.
+    let z_order = pl.map_or(0, |p| p.z_order);
+    let om = pl.map_or([283u16; 4], |p| p.out_margins);
     let _ = write!(
         out,
-        r##"<hp:tbl id="{}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="{page_break}" repeatHeader="{repeat_header}" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="{no_adjust}"><hp:sz width="{sz_w}" widthRelTo="ABSOLUTE" height="{sz_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="{treat_as_char}" affectLSpacing="{affect_lspacing}" flowWithText="{flow_with_text}" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="{vert_rel}" horzRelTo="{horz_rel}" vertAlign="{vert_align}" horzAlign="{horz_align}" vertOffset="{vert_offset}" horzOffset="{horz_offset}"/><hp:outMargin left="283" right="283" top="283" bottom="283"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
+        r##"<hp:tbl id="{}" zOrder="{z_order}" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="{page_break}" repeatHeader="{repeat_header}" rowCnt="{}" colCnt="{}" cellSpacing="{}" borderFillIDRef="{}" noAdjust="{no_adjust}"><hp:sz width="{sz_w}" widthRelTo="ABSOLUTE" height="{sz_h}" heightRelTo="ABSOLUTE" protect="0"/><hp:pos treatAsChar="{treat_as_char}" affectLSpacing="{affect_lspacing}" flowWithText="{flow_with_text}" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="{vert_rel}" horzRelTo="{horz_rel}" vertAlign="{vert_align}" horzAlign="{horz_align}" vertOffset="{vert_offset}" horzOffset="{horz_offset}"/><hp:outMargin left="{}" right="{}" top="{}" bottom="{}"/><hp:inMargin left="{}" right="{}" top="{}" bottom="{}"/>"##,
         ids.next(),
         table.rows,
         table.cols,
         table.cell_spacing,
         table.border_fill.0.max(1),
+        om[0],
+        om[1],
+        om[2],
+        om[3],
         m[0],
         m[1],
         m[2],
