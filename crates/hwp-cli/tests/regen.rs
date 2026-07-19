@@ -166,3 +166,31 @@ fn regen_secpr_and_tabpr_byte_identical() {
         "tabProperties 바이트 동일"
     );
 }
+
+/// Gap A 게이트: 각주/미주가 한글 정품 형태(number/suffixChar/instId + 본문 autoNum)로
+/// 재생성돼야 한다 — 이 픽스처는 각주 2·미주 1을 포함한다.
+#[test]
+fn regen_footnotes_reference_shape() {
+    let (_, regen) = regen();
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&regen).unwrap()).unwrap();
+    let mut xml = String::new();
+    zip.by_name("Contents/section0.xml")
+        .unwrap()
+        .read_to_string(&mut xml)
+        .unwrap();
+    for needle in [
+        r##"<hp:footNote number="1" suffixChar="41" instId="##,
+        r##"<hp:footNote number="2" suffixChar="41" instId="##,
+        r##"<hp:endNote number="1" suffixChar="41" instId="##,
+        r##"<hp:autoNum num="1" numType="FOOTNOTE">"##,
+        r##"<hp:autoNum num="2" numType="FOOTNOTE">"##,
+        r##"<hp:autoNum num="1" numType="ENDNOTE">"##,
+    ] {
+        assert!(xml.contains(needle), "각주/미주 정품 형태: {needle}");
+    }
+    // 노트 본문 텍스트 왕복.
+    let text = cat(&regen);
+    for t in ["각주 예시 1", "각주 예시 2", "미주 예시 1"] {
+        assert!(text.contains(t), "노트 본문: {t}");
+    }
+}

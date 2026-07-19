@@ -913,16 +913,37 @@ fn 각주_미주_왕복() {
     use hwp_model::{Control, GenericControl, HwpChar, Paragraph, ParagraphList};
     let mut doc = hwp_convert::from_markdown("본문 문장입니다.\n");
     let note = |id: &[u8; 4], txt: &str| {
+        // 정품 IR 형태: 노트 본문 첫 run에 자동 번호(atno) 컨트롤 + 텍스트.
+        let mut chars = vec![HwpChar::ExtCtrl {
+            code: 18,
+            ctrl_id: *b"atno",
+            payload: vec![],
+            ctrl_index: Some(0),
+        }];
+        chars.push(HwpChar::Text(' '));
+        chars.extend(txt.chars().map(HwpChar::Text));
         Control::Generic(GenericControl {
             ctrl_id: *id,
             data: vec![],
-            paragraph_lists: vec![ParagraphList {
-                header_data: vec![],
-                paragraphs: vec![Paragraph {
-                    chars: txt.chars().map(HwpChar::Text).collect(),
-                    ..Paragraph::default()
-                }],
-            }],
+            paragraph_lists: vec![
+                ParagraphList {
+                    header_data: vec![],
+                    paragraphs: vec![Paragraph {
+                        chars,
+                        controls: vec![Control::Generic(GenericControl {
+                            ctrl_id: *b"atno",
+                            data: vec![],
+                            paragraph_lists: vec![],
+                            extras: vec![],
+                            raw_children: vec![],
+                            gso_shapes: vec![],
+                            equation: None,
+                            column_def: None,
+                        })],
+                        ..Paragraph::default()
+                    }],
+                },
+            ],
             extras: vec![],
             raw_children: vec![],
             gso_shapes: vec![],
@@ -957,6 +978,23 @@ fn 각주_미주_왕복() {
         .unwrap();
     assert!(xml.contains("<hp:footNote"), "footNote 방출: {xml}");
     assert!(xml.contains("<hp:endNote"), "endNote 방출: {xml}");
+    // 한글 저장본 실측 형태: number/suffixChar/instId 속성 + 본문 autoNum(종류·번호).
+    assert!(
+        xml.contains(r##"<hp:footNote number="1" suffixChar="41" instId="##),
+        "footNote 속성 형태: {xml}"
+    );
+    assert!(
+        xml.contains(r##"<hp:endNote number="1" suffixChar="41" instId="##),
+        "endNote 속성 형태: {xml}"
+    );
+    assert!(
+        xml.contains(r##"<hp:autoNum num="1" numType="FOOTNOTE"><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/></hp:autoNum>"##),
+        "각주 본문 autoNum: {xml}"
+    );
+    assert!(
+        xml.contains(r##"<hp:autoNum num="1" numType="ENDNOTE"><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/></hp:autoNum>"##),
+        "미주 본문 autoNum: {xml}"
+    );
 
     // 재읽기 — 노트 문단이 paragraph_lists로 복원되고 plain_text에 포함.
     let reread = hwpx::read_document(&out).unwrap().document;

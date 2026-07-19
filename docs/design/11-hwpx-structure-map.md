@@ -379,7 +379,7 @@ IR엔 값이 있으나(hwp5로는 나감) hwpx write가 상수/근사로 눌러 
 | colPr `colSz`/`colLine`(단별폭·구분선) | 미수집(등폭 가정) | 값 방출하나 단별폭 없음 | 불균등 단·구분선 손실 | `parse_col_pr :377` ↔ `write_col_ctrl :473` |
 | `hc:gradation angle`·중심·step | angle만(라디안 근사) | angle round + centerX/Y/step 상수 | 그러데이션 중심·단계 근사 | `parse_gradation :1217` ↔ `:764` |
 | `hp:pagePr landscape` | attr bit0 | default_sec_pr에서 재방출 | 보존(단 secPr 다른 상수와 함께 — raw 우선) | `:340` ↔ `:453` |
-| `hp:footNote`/`hp:endNote` | fn/en + subList 수집 | ✅ **해소(2026-07-19)** — `write_footnote`로 subList 스캐폴드 방출(기존 DROP). 한컴 저장 정답지 부재 — OWPML 스펙 형태, 실기 게이트 필요 | `:589` ↔ `write/section.rs::write_footnote` |
+| `hp:footNote`/`hp:endNote` | fn/en + subList 수집 | ✅ **해소(2026-07-19)** — `write_footnote`로 subList 스캐폴드 방출(기존 DROP). 한글 저장본 실측 정합(2026-07-19): number/suffixChar/instId 속성 + 본문 autoNum(num/numType/autoNumFormat) | `:589` ↔ `write/section.rs::write_footnote` |
 | numbering `paraHead` 형식 | template/start/numFormat 수집 | ✅ `numbering_levels` 기반(없으면 기존 상수) | **해소(2026-07-15)** — 다중 번호정의 itemCnt 뭉개짐도 함께 수정 | `:333` ↔ `write_numberings` |
 | tab `tabPr`(위치·채움) | tabPrIDRef만 | ✅ **해소(2026-07-19)** — `DocHeader.hwpx_tab_defs_raw`로 `<hh:tabPr>` 전문 보존·verbatim 방출(없으면 기존 상수 폴림, tab-count 클램프 반영) | `read/header.rs`(에코) ↔ `write_tab_properties` |
 | paraPr `heading`(문단↔번호 연결) | attr1 bits23‑27 + numbering_id | ✅ OUTLINE/NUMBER/BULLET 역방출 | **해소(2026-07-15 2차)** — [12](12-feature-gaps.md) GE-α8 | `:309` ↔ `write_para_properties` |

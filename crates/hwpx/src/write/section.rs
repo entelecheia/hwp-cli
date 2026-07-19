@@ -82,12 +82,17 @@ pub fn write_section(
 }
 
 #[derive(Default)]
-struct IdSeq(u32);
+struct IdSeq {
+    next: u32,
+    /// 각주/미주 번호(종류별 1부터 — footNote@number·autoNum@num에 사용).
+    footnote: u32,
+    endnote: u32,
+}
 
 impl IdSeq {
     fn next(&mut self) -> u32 {
-        self.0 += 1;
-        self.0
+        self.next += 1;
+        self.next
     }
 }
 
@@ -550,8 +555,10 @@ fn write_header_footer(
     let _ = write!(out, "</hp:{el}></hp:ctrl>");
 }
 
-/// 각주/미주(fn/en) — `<hp:ctrl><hp:footNote|endNote><hp:subList>문단</…></…></hp:ctrl>`.
-/// write_header_footer와 같은 subList 스캐폴드(문단은 write_paragraph 재귀 방출).
+/// 각주/미주(fn/en) — 한글 저장본 실측 형태로 방출한다:
+/// `<hp:ctrl><hp:footNote number="N" suffixChar="41" instId="…"><hp:subList>…</hp:subList></hp:footNote></hp:ctrl>`
+/// 노트 본문 첫 run의 autoNum도 `numType="FOOTNOTE|ENDNOTE" num="N"`(+autoNumFormat)으로 맞춘다
+/// (write_header_footer와 같은 subList 스캐폴드, 문단은 write_paragraph 재귀 방출).
 #[allow(clippy::too_many_arguments)]
 fn write_footnote(
     out: &mut String,
@@ -562,19 +569,31 @@ fn write_footnote(
     preserve_linesegs: bool,
     warnings: &mut Vec<String>,
 ) {
-    let el = if g.ctrl_id == *b"fn  " {
-        "footNote"
+    let foot = g.ctrl_id == *b"fn  ";
+    let (el, num_type) = if foot {
+        ids.footnote += 1;
+        ("footNote", "FOOTNOTE")
     } else {
-        "endNote"
+        ids.endnote += 1;
+        ("endNote", "ENDNOTE")
     };
-    let _ = write!(out, r##"<hp:ctrl><hp:{el} id="{}">"##, ids.next());
+    let number = if foot { ids.footnote } else { ids.endnote };
+    // instId는 문서 고유값이면 된다(실측 정품도 임의 u32) — ids 카운터에 큰 베이스를 더해 합성.
+    let inst_id = 0x4000_0000 + ids.next();
+    let _ = write!(
+        out,
+        r##"<hp:ctrl><hp:{el} number="{number}" suffixChar="41" instId="{inst_id}">"##
+    );
     for list in &g.paragraph_lists {
         out.push_str(
             r##"<hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">"##,
         );
         for para in &list.paragraphs {
+            // 노트 본문의 autoNum은 atno arm이 numType="PAGE" 상수로 쓰므로, 여기서
+            // 종류·번호로 교체한다(정품: 노트 첫 run의 번호 필드).
+            let mut buf = String::new();
             write_paragraph(
-                out,
+                &mut buf,
                 doc,
                 para,
                 ids,
@@ -583,6 +602,14 @@ fn write_footnote(
                 preserve_linesegs,
                 warnings,
             );
+            const PAGE_SNIP: &str = r##"<hp:ctrl><hp:autoNum numType="PAGE"/></hp:ctrl>"##;
+            if buf.contains(PAGE_SNIP) {
+                let note_snip = format!(
+                    r##"<hp:ctrl><hp:autoNum num="{number}" numType="{num_type}"><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/></hp:autoNum></hp:ctrl>"##
+                );
+                buf = buf.replacen(PAGE_SNIP, &note_snip, 1);
+            }
+            out.push_str(&buf);
         }
         out.push_str("</hp:subList>");
     }
